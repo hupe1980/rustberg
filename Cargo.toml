@@ -2,5 +2,12 @@
 name = "rustberg"
 version = "0.0.1"
 edition = "2021"
+authors = ["hupe1980"]
+description = "A rust iceberg catalog"
+readme = "README.md"
+keywords = ["rustberg", "iceberg", "catalog"]
+license = "MIT"
+repository = "https://github.com/hupe1980/rustberg"
+homepage = "https://github.com/hupe1980/rustberg"
 
 [dependencies]
