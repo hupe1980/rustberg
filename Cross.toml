@@ -1,0 +1,6 @@
+# Cross-compilation configuration
+# https://github.com/cross-rs/cross
+
+[target.aarch64-unknown-linux-musl]
+# Use edge image for musl cross-compilation
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:edge"

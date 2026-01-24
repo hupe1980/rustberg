@@ -27,13 +27,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install cross-compilation tools for arm64 if building on amd64
+# We use a pre-built musl cross-compiler for aarch64
 RUN if [ "$TARGETARCH" = "arm64" ] && [ "$BUILDPLATFORM" = "linux/amd64" ]; then \
         apt-get update && apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu \
-            libc6-dev-arm64-cross \
+            wget \
         && rm -rf /var/lib/apt/lists/* \
+        && wget -qO- https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /opt \
+        && ln -s /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc /usr/local/bin/ \
+        && ln -s /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-ar /usr/local/bin/ \
         && mkdir -p ~/.cargo \
-        && printf '[target.aarch64-unknown-linux-musl]\nlinker = "aarch64-linux-gnu-gcc"\n' >> ~/.cargo/config.toml; \
+        && printf '[target.aarch64-unknown-linux-musl]\nlinker = "aarch64-linux-musl-gcc"\n' >> ~/.cargo/config.toml; \
     fi
 
 # Set up Rust target based on architecture

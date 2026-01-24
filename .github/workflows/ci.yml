@@ -53,7 +53,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         # Exclude tests requiring Docker (not available on macOS runners)
-        run: cargo test --all-features --verbose -- --skip aws_kms_tests --skip vault_kms_tests
+        run: cargo test --all-features --verbose -- --skip test_aws_kms_ --skip test_vault_kms_
 
   test-windows:
     name: Test (Windows)
@@ -64,7 +64,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         # Exclude tests requiring Docker (not available on Windows runners)
-        run: cargo test --all-features --verbose -- --skip aws_kms_tests --skip vault_kms_tests
+        run: cargo test --all-features --verbose -- --skip test_aws_kms_ --skip test_vault_kms_
 
   test-pyiceberg:
     name: PyIceberg Integration
@@ -132,10 +132,10 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             artifact: rustberg
           - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             artifact: rustberg
             cross: true
           - os: macos-latest

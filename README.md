@@ -91,6 +91,8 @@ helm install rustberg charts/rustberg -f my-values.yaml
 
 ### Option 4: Build from Source
 
+Requires **Rust 1.89+** ([install](https://rustup.rs/))
+
 ```bash
 # Clone and build
 git clone https://github.com/hupe1980/rustberg
