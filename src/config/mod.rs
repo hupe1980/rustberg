@@ -1,5 +1,5 @@
-mod v1;
 pub mod server_config;
+mod v1;
 
 use axum::Router;
 

@@ -33,7 +33,7 @@ pub use jwt_authn::{JwtAuthenticator, JwtConfig};
 
 // Re-export authorization
 pub use authz::{
-    Action, AllowAllAuthorizer, AuthzContext, AuthzDecision, Authorizer, ChainAuthorizer,
+    Action, AllowAllAuthorizer, Authorizer, AuthzContext, AuthzDecision, ChainAuthorizer,
     DenyAllAuthorizer, RbacAuthorizer, Resource, ResourceType, TenantIsolationAuthorizer,
 };
 
@@ -44,9 +44,8 @@ pub use cedar_authz::{
 
 // Re-export audit logging
 pub use audit::{
-    AuditAction, AuditCategory, AuditEvent, AuditOutcome, AuditSeverity,
-    log_auth_failure, log_auth_success, log_authz_denied, log_namespace_operation,
-    log_rate_limit, log_table_operation,
+    log_auth_failure, log_auth_success, log_authz_denied, log_namespace_operation, log_rate_limit,
+    log_table_operation, AuditAction, AuditCategory, AuditEvent, AuditOutcome, AuditSeverity,
 };
 
 // Re-export errors
@@ -62,8 +61,8 @@ pub use principal::{AuthMethod, Principal, PrincipalBuilder, PrincipalType};
 
 // Re-export rate limiting
 pub use rate_limit::{
-    LimitType, RateLimitConfig, RateLimitConfigBuilder, RateLimitErrorBody,
-    RateLimitErrorResponse, RateLimitExceeded, RateLimitInfo, RateLimiter,
+    LimitType, RateLimitConfig, RateLimitConfigBuilder, RateLimitErrorBody, RateLimitErrorResponse,
+    RateLimitExceeded, RateLimitInfo, RateLimiter,
 };
 
 // Re-export store types

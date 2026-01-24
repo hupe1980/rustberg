@@ -33,9 +33,8 @@ pub const MAX_PROPERTY_VALUE_LENGTH: usize = 4096;
 /// Windows reserved device names that are forbidden regardless of extension.
 /// These could cause issues when metadata is stored on Windows filesystems.
 const WINDOWS_RESERVED_NAMES: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL",
-    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
 /// Characters allowed in namespace/table names (alphanumeric, underscore, hyphen).
@@ -47,9 +46,9 @@ fn is_valid_name_char(c: char) -> bool {
 fn is_windows_reserved(name: &str) -> bool {
     // Check without extension (CON.txt is also reserved)
     let base_name = name.split('.').next().unwrap_or(name);
-    WINDOWS_RESERVED_NAMES.iter().any(|&reserved| 
-        base_name.eq_ignore_ascii_case(reserved)
-    )
+    WINDOWS_RESERVED_NAMES
+        .iter()
+        .any(|&reserved| base_name.eq_ignore_ascii_case(reserved))
 }
 
 /// Validates a single name segment (namespace level or table name).
@@ -163,9 +162,7 @@ pub fn validate_table_name(name: &str) -> Result<()> {
 /// - Too many properties
 /// - Any key exceeds maximum length
 /// - Any value exceeds maximum length
-pub fn validate_properties(
-    properties: &std::collections::HashMap<String, String>,
-) -> Result<()> {
+pub fn validate_properties(properties: &std::collections::HashMap<String, String>) -> Result<()> {
     if properties.len() > MAX_PROPERTIES_COUNT {
         return Err(AppError::BadRequest(format!(
             "Too many properties (max: {MAX_PROPERTIES_COUNT})"
@@ -220,7 +217,10 @@ mod tests {
     fn test_validate_name_invalid_chars() {
         let result = validate_name("my namespace", "Namespace");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid character"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid character"));
 
         let result = validate_name("my/namespace", "Namespace");
         assert!(result.is_err());
@@ -270,13 +270,13 @@ mod tests {
     fn test_validate_name_windows_reserved() {
         // These should all be rejected for cross-platform safety
         assert!(validate_name("CON", "Name").is_err());
-        assert!(validate_name("con", "Name").is_err());  // Case insensitive
+        assert!(validate_name("con", "Name").is_err()); // Case insensitive
         assert!(validate_name("PRN", "Name").is_err());
         assert!(validate_name("AUX", "Name").is_err());
         assert!(validate_name("NUL", "Name").is_err());
         assert!(validate_name("COM1", "Name").is_err());
         assert!(validate_name("LPT1", "Name").is_err());
-        
+
         // These should be OK (not reserved)
         assert!(validate_name("CONSOLE", "Name").is_ok());
         assert!(validate_name("mycon", "Name").is_ok());

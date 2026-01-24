@@ -78,10 +78,7 @@ impl StartupDiagnostics {
 
         println!("{}", logo);
         println!("╔════════════════════════════════════════════════════════════════════╗");
-        println!(
-            "║  {} v{:<54}║",
-            self.service_name, self.version
-        );
+        println!("║  {} v{:<54}║", self.service_name, self.version);
         if let Some(ref commit) = self.git_commit {
             println!("║  Commit: {:<57}║", &commit[..commit.len().min(8)]);
         }
@@ -95,7 +92,11 @@ impl StartupDiagnostics {
         println!("║  Listen URL:      {:<48}║", listen_url);
         println!(
             "║  TLS:             {:<48}║",
-            if self.tls_enabled { "✓ enabled" } else { "✗ disabled (INSECURE)" }
+            if self.tls_enabled {
+                "✓ enabled"
+            } else {
+                "✗ disabled (INSECURE)"
+            }
         );
 
         // Authentication
@@ -241,7 +242,10 @@ mod tests {
         assert!(diag.tls_enabled);
         assert_eq!(diag.auth_mode, "api_key");
         assert!(diag.storage_backend.starts_with("file://"));
-        assert_eq!(diag.warehouse_location, Some("s3://bucket/warehouse".to_string()));
+        assert_eq!(
+            diag.warehouse_location,
+            Some("s3://bucket/warehouse".to_string())
+        );
         assert_eq!(diag.default_tenant_id, "my-tenant");
         assert_eq!(diag.kms_provider, Some("aws-kms".to_string()));
     }

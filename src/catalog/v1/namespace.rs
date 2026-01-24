@@ -79,7 +79,7 @@ pub async fn list_namespaces(
     let resource = Resource::catalog(&tenant_id);
     let ctx = AuthzContext::new(principal.clone(), resource, Action::List);
     state.authorizer.check(&ctx).await?;
-    
+
     // Record metric
     state.metrics.catalog_list_namespaces.inc();
 
@@ -137,7 +137,7 @@ pub async fn create_namespace(
 
     // Check for idempotency key
     let idempotency_key = IdempotencyKey::from_headers(&headers, "POST", "/v1/namespaces");
-    
+
     // If idempotency key present, check cache first
     if let Some(ref key) = idempotency_key {
         if let Some(cached) = state.idempotency_cache.get(key) {
@@ -150,7 +150,7 @@ pub async fn create_namespace(
     let resource = Resource::namespace(&tenant_id, payload.namespace.clone());
     let ctx = AuthzContext::new(principal, resource, Action::Create);
     state.authorizer.check(&ctx).await?;
-    
+
     // Record metric
     state.metrics.catalog_create_namespace.inc();
 
@@ -203,7 +203,7 @@ pub async fn get_namespace(
 ) -> Result<AxumJson<GetNamespaceResponse>> {
     // Load namespace first to get its owner
     let ns = state.catalog.get_namespace(&namespace).await?;
-    
+
     // Get the namespace's owner tenant
     let owner_tenant = ns
         .properties()
@@ -261,7 +261,7 @@ pub async fn delete_namespace(
 ) -> Result<StatusCode> {
     // Load namespace first to get its owner
     let ns = state.catalog.get_namespace(&namespace).await?;
-    
+
     // Get the namespace's owner tenant
     let owner_tenant = ns
         .properties()
@@ -273,7 +273,7 @@ pub async fn delete_namespace(
     let resource = Resource::namespace(&owner_tenant, namespace.clone().inner());
     let ctx = AuthzContext::new(principal, resource, Action::Delete);
     state.authorizer.check(&ctx).await?;
-    
+
     // Record metric
     state.metrics.catalog_delete_namespace.inc();
 
@@ -293,7 +293,7 @@ pub async fn update_namespace_properties(
 
     // Fetch the current namespace properties
     let ns = state.catalog.get_namespace(&namespace).await?;
-    
+
     // Get the namespace's owner tenant
     let owner_tenant = ns
         .properties()
@@ -350,7 +350,6 @@ pub async fn update_namespace_properties(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     // ========================================================================
     // ListNamespaceQuery Tests

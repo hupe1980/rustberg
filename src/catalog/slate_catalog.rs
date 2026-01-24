@@ -36,8 +36,8 @@ use iceberg::io::FileIO;
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
-    Catalog, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
-    TableCommit, TableCreation, TableIdent,
+    Catalog, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result, TableCommit,
+    TableCreation, TableIdent,
 };
 use serde::{Deserialize, Serialize};
 use slatedb::Db;
@@ -125,8 +125,7 @@ impl SlateCatalog {
     /// Returns error if FileIO cannot be created for the warehouse location.
     pub async fn new(db: Arc<Db>, warehouse_location: String) -> Result<Self> {
         // Create FileIO from warehouse location
-        let file_io = FileIO::from_path(&warehouse_location)?
-            .build()?;
+        let file_io = FileIO::from_path(&warehouse_location)?.build()?;
 
         Ok(Self {
             db,
@@ -214,8 +213,7 @@ impl Catalog for SlateCatalog {
             if let Ok(metadata) = serde_json::from_slice::<NamespaceMetadata>(&kv.value) {
                 // Filter by parent if specified
                 if let Some(parent_ns) = parent {
-                    let parent_parts: Vec<&str> =
-                        parent_ns.iter().map(|s| s.as_str()).collect();
+                    let parent_parts: Vec<&str> = parent_ns.iter().map(|s| s.as_str()).collect();
                     if metadata.namespace.len() == parent_parts.len() + 1
                         && metadata.namespace[..parent_parts.len()]
                             .iter()
@@ -396,10 +394,7 @@ impl Catalog for SlateCatalog {
         }
 
         // Delete namespace
-        self.db
-            .delete(&key)
-            .await
-            .map_err(Self::convert_error)?;
+        self.db.delete(&key).await.map_err(Self::convert_error)?;
 
         Ok(())
     }
@@ -545,8 +540,7 @@ impl Catalog for SlateCatalog {
         })?;
 
         // Read table metadata from storage
-        let metadata =
-            TableMetadata::read_from(&self.file_io, &entry.metadata_location).await?;
+        let metadata = TableMetadata::read_from(&self.file_io, &entry.metadata_location).await?;
 
         Table::builder()
             .identifier(table.clone())
@@ -579,10 +573,7 @@ impl Catalog for SlateCatalog {
         }
 
         // Delete from registry (does not purge data files)
-        self.db
-            .delete(&key)
-            .await
-            .map_err(Self::convert_error)?;
+        self.db.delete(&key).await.map_err(Self::convert_error)?;
 
         Ok(())
     }
@@ -681,11 +672,7 @@ impl Catalog for SlateCatalog {
     }
 
     /// Registers an existing table from its metadata location.
-    async fn register_table(
-        &self,
-        table: &TableIdent,
-        metadata_location: String,
-    ) -> Result<Table> {
+    async fn register_table(&self, table: &TableIdent, metadata_location: String) -> Result<Table> {
         let key = Self::table_key(table);
 
         // Check if table already exists
@@ -752,7 +739,8 @@ impl Catalog for SlateCatalog {
         // Load current table
         let current_table = self.load_table(&table_ident).await?;
         let current_metadata = current_table.metadata().clone();
-        let current_location = current_table.metadata_location()
+        let current_location = current_table
+            .metadata_location()
             .ok_or_else(|| Error::new(ErrorKind::Unexpected, "Table has no metadata location"))?;
 
         // Apply requirements checks
@@ -774,16 +762,22 @@ impl Catalog for SlateCatalog {
 
         // Generate new metadata location and write
         let table_location = current_table.metadata().location();
-        
+
         let new_metadata_location = MetadataLocation::new_with_table_location(table_location)
             .with_next_version()
             .to_string();
 
-        new_metadata.write_to(&self.file_io, &new_metadata_location).await?;
+        new_metadata
+            .write_to(&self.file_io, &new_metadata_location)
+            .await?;
 
         // Update registry with new metadata location
         let entry = TableRegistryEntry {
-            namespace: table_ident.namespace.iter().map(|s| s.to_string()).collect(),
+            namespace: table_ident
+                .namespace
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             name: table_ident.name().to_string(),
             metadata_location: new_metadata_location.clone(),
         };
@@ -815,8 +809,7 @@ mod tests {
 
     #[test]
     fn test_namespace_key() {
-        let ns =
-            NamespaceIdent::from_vec(vec!["db".to_string(), "schema".to_string()]).unwrap();
+        let ns = NamespaceIdent::from_vec(vec!["db".to_string(), "schema".to_string()]).unwrap();
         let key = SlateCatalog::namespace_key(&ns);
         assert_eq!(String::from_utf8_lossy(&key), "namespace:db.schema");
     }
@@ -831,8 +824,7 @@ mod tests {
 
     #[test]
     fn test_table_prefix() {
-        let ns =
-            NamespaceIdent::from_vec(vec!["db".to_string(), "schema".to_string()]).unwrap();
+        let ns = NamespaceIdent::from_vec(vec!["db".to_string(), "schema".to_string()]).unwrap();
         let prefix = SlateCatalog::table_prefix(&ns);
         assert_eq!(prefix, "table:db.schema:");
     }

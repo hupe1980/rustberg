@@ -71,7 +71,7 @@ pub async fn auth_middleware(
     // Only trust proxy headers if explicitly configured (prevents IP spoofing attacks)
     let trust_proxy = auth_state.rate_limiter.trust_proxy_headers();
     let client_ip = extract_client_ip(&request, trust_proxy);
-    
+
     // Check rate limit before authentication
     if let Some(ip) = client_ip {
         if let Err(exceeded) = auth_state.rate_limiter.check_ip_limit(&ip) {
@@ -111,10 +111,15 @@ pub async fn auth_middleware(
             }
 
             // Check per-tenant rate limit for authenticated requests
-            if let Err(exceeded) = auth_state.rate_limiter.check_tenant_limit(principal.tenant_id()) {
+            if let Err(exceeded) = auth_state
+                .rate_limiter
+                .check_tenant_limit(principal.tenant_id())
+            {
                 // Audit log: tenant rate limit triggered
                 log_rate_limit(
-                    &client_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                    &client_ip
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
                     Some(principal.tenant_id()),
                     "tenant",
                 );
@@ -140,14 +145,16 @@ pub async fn auth_middleware(
             // Record auth failure
             if let Some(ip) = client_ip {
                 // Only record failures for invalid credentials, not missing credentials
-                if matches!(e, AuthError::InvalidCredentials(_) | AuthError::ApiKeyNotFound | AuthError::ApiKeyDisabled) {
+                if matches!(
+                    e,
+                    AuthError::InvalidCredentials(_)
+                        | AuthError::ApiKeyNotFound
+                        | AuthError::ApiKeyDisabled
+                ) {
                     auth_state.rate_limiter.record_auth_failure(&ip);
-                    
+
                     // Audit log: authentication failure
-                    log_auth_failure(
-                        Some(&ip.to_string()),
-                        &e.to_string(),
-                    );
+                    log_auth_failure(Some(&ip.to_string()), &e.to_string());
                 }
             }
             e.into_response()
@@ -165,7 +172,7 @@ pub async fn require_auth_middleware(
     // Only trust proxy headers if explicitly configured (prevents IP spoofing attacks)
     let trust_proxy = auth_state.rate_limiter.trust_proxy_headers();
     let client_ip = extract_client_ip(&request, trust_proxy);
-    
+
     // Check rate limit before authentication
     if let Some(ip) = client_ip {
         if let Err(exceeded) = auth_state.rate_limiter.check_ip_limit(&ip) {
@@ -209,9 +216,14 @@ pub async fn require_auth_middleware(
             }
 
             // Check per-tenant rate limit
-            if let Err(exceeded) = auth_state.rate_limiter.check_tenant_limit(principal.tenant_id()) {
+            if let Err(exceeded) = auth_state
+                .rate_limiter
+                .check_tenant_limit(principal.tenant_id())
+            {
                 log_rate_limit(
-                    &client_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                    &client_ip
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
                     Some(principal.tenant_id()),
                     "tenant",
                 );
@@ -236,7 +248,12 @@ pub async fn require_auth_middleware(
         Err(e) => {
             // Record auth failure
             if let Some(ip) = client_ip {
-                if matches!(e, AuthError::InvalidCredentials(_) | AuthError::ApiKeyNotFound | AuthError::ApiKeyDisabled) {
+                if matches!(
+                    e,
+                    AuthError::InvalidCredentials(_)
+                        | AuthError::ApiKeyNotFound
+                        | AuthError::ApiKeyDisabled
+                ) {
                     auth_state.rate_limiter.record_auth_failure(&ip);
                     log_auth_failure(Some(&ip.to_string()), &e.to_string());
                 }
@@ -369,7 +386,9 @@ where
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(OptionalPrincipal(parts.extensions.get::<Principal>().cloned()))
+        Ok(OptionalPrincipal(
+            parts.extensions.get::<Principal>().cloned(),
+        ))
     }
 }
 
@@ -413,10 +432,7 @@ mod tests {
     async fn test_auth_middleware_allows_authenticated() {
         let app = create_test_app(Arc::new(AllowAllAuthenticator));
 
-        let request = Request::builder()
-            .uri("/test")
-            .body(Body::empty())
-            .unwrap();
+        let request = Request::builder().uri("/test").body(Body::empty()).unwrap();
 
         let response = app.oneshot(request).await.unwrap();
 
@@ -427,10 +443,7 @@ mod tests {
     async fn test_auth_middleware_denies_unauthenticated() {
         let app = create_test_app(Arc::new(DenyAllAuthenticator));
 
-        let request = Request::builder()
-            .uri("/test")
-            .body(Body::empty())
-            .unwrap();
+        let request = Request::builder().uri("/test").body(Body::empty()).unwrap();
 
         let response = app.oneshot(request).await.unwrap();
 

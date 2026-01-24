@@ -231,7 +231,7 @@ pub struct RegisterTablePayload {
 }
 
 /// Request for reporting scan/commit metrics.
-/// 
+///
 /// This struct follows the Iceberg REST Catalog specification for metrics reporting.
 /// Fields are received from clients but only logged for telemetry purposes currently.
 #[derive(Debug, Deserialize)]
@@ -350,7 +350,7 @@ pub async fn list_tables(
     let resource = Resource::namespace(&owner_tenant, namespace.clone().inner());
     let ctx = AuthzContext::new(principal, resource, Action::List);
     state.authorizer.check(&ctx).await?;
-    
+
     // Record metric
     state.metrics.catalog_list_tables.inc();
 
@@ -402,11 +402,14 @@ pub async fn create_table(
     }
 
     // Build the endpoint path for idempotency scoping
-    let endpoint_path = format!("/v1/namespaces/{}/tables", namespace.clone().inner().join("/"));
-    
+    let endpoint_path = format!(
+        "/v1/namespaces/{}/tables",
+        namespace.clone().inner().join("/")
+    );
+
     // Check for idempotency key
     let idempotency_key = IdempotencyKey::from_headers(&headers, "POST", &endpoint_path);
-    
+
     // If idempotency key present, check cache first
     if let Some(ref key) = idempotency_key {
         if let Some(cached) = state.idempotency_cache.get(key) {
@@ -423,7 +426,7 @@ pub async fn create_table(
     let resource = Resource::table(&owner_tenant, namespace.clone().inner(), &table_name);
     let ctx = AuthzContext::new(principal.clone(), resource, Action::Create);
     state.authorizer.check(&ctx).await?;
-    
+
     // Record metric
     state.metrics.catalog_create_table.inc();
 
@@ -435,7 +438,7 @@ pub async fn create_table(
 
     // Use schema_id from payload if provided, otherwise default to 0
     let schema_id = payload.schema.schema_id.unwrap_or(0);
-    
+
     let schema = IcebergSchema::builder()
         .with_schema_id(schema_id)
         .with_fields(payload.schema.fields)
@@ -514,10 +517,7 @@ pub async fn load_table(
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
     Path((namespace_str, table_name)): Path<(String, String)>,
 ) -> Result<AxumJson<LoadTableResponse>> {
-    let namespace_parts: Vec<String> = namespace_str
-        .split('\u{1F}')
-        .map(str::to_string)
-        .collect();
+    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
     let namespace = NamespaceIdent::from_vec(namespace_parts.clone())?;
 
     // Get the namespace's owner tenant
@@ -527,7 +527,7 @@ pub async fn load_table(
     let resource = Resource::table(&owner_tenant, namespace_parts.clone(), &table_name);
     let ctx = AuthzContext::new(principal.clone(), resource, Action::Read);
     state.authorizer.check(&ctx).await?;
-    
+
     // Record metric
     state.metrics.catalog_load_table.inc();
 
@@ -561,10 +561,7 @@ pub async fn table_exists(
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
     Path((namespace_str, table_name)): Path<(String, String)>,
 ) -> Result<StatusCode> {
-    let namespace_parts: Vec<String> = namespace_str
-        .split('\u{1F}')
-        .map(str::to_string)
-        .collect();
+    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
     let namespace = NamespaceIdent::from_vec(namespace_parts.clone())?;
 
     // Get the namespace's owner tenant
@@ -609,10 +606,7 @@ pub async fn load_table_credentials(
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
     Path((namespace_str, table_name)): Path<(String, String)>,
 ) -> Result<AxumJson<LoadCredentialsResponse>> {
-    let namespace_parts: Vec<String> = namespace_str
-        .split('\u{1F}')
-        .map(str::to_string)
-        .collect();
+    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
     let namespace = NamespaceIdent::from_vec(namespace_parts.clone())?;
 
     // Get the namespace's owner tenant
@@ -624,7 +618,7 @@ pub async fn load_table_credentials(
     state.authorizer.check(&ctx).await?;
 
     let table_ident = TableIdent::new(namespace, table_name.clone());
-    
+
     // Load table to get its location
     let table = state.catalog.load_table(&table_ident).await?;
     let table_location = table.metadata().location();
@@ -633,7 +627,11 @@ pub async fn load_table_credentials(
     if !state.credential_provider.supports_location(table_location) {
         return Err(AppError::NotSupported(format!(
             "Credential vending not supported for storage location: {}",
-            table_location.split('/').take(3).collect::<Vec<_>>().join("/")
+            table_location
+                .split('/')
+                .take(3)
+                .collect::<Vec<_>>()
+                .join("/")
         )));
     }
 
@@ -651,7 +649,7 @@ pub async fn load_table_credentials(
 
     if storage_credentials.is_empty() {
         return Err(AppError::NotSupported(
-            "No storage credentials available for this table".to_string()
+            "No storage credentials available for this table".to_string(),
         ));
     }
 
@@ -668,10 +666,7 @@ pub async fn drop_table(
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
     Path((namespace_str, table_name)): Path<(String, String)>,
 ) -> Result<StatusCode> {
-    let namespace_parts: Vec<String> = namespace_str
-        .split('\u{1F}')
-        .map(str::to_string)
-        .collect();
+    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
     let namespace = NamespaceIdent::from_vec(namespace_parts.clone())?;
 
     // Get the namespace's owner tenant
@@ -681,7 +676,7 @@ pub async fn drop_table(
     let resource = Resource::table(&owner_tenant, namespace_parts, &table_name);
     let ctx = AuthzContext::new(principal, resource, Action::Delete);
     state.authorizer.check(&ctx).await?;
-    
+
     // Record metric
     state.metrics.catalog_delete_table.inc();
 
@@ -709,7 +704,7 @@ pub async fn rename_table(
 
     // Get owner for source namespace
     let src_owner = get_namespace_owner(&state, &src_namespace, principal.tenant_id()).await?;
-    
+
     // Get owner for destination namespace
     let dst_owner = get_namespace_owner(&state, &dst_namespace, principal.tenant_id()).await?;
 
@@ -718,7 +713,7 @@ pub async fn rename_table(
     // Both namespaces must belong to the same tenant.
     if src_owner != dst_owner {
         return Err(AppError::Forbidden(
-            "Cannot move tables between namespaces owned by different tenants".to_string()
+            "Cannot move tables between namespaces owned by different tenants".to_string(),
         ));
     }
 
@@ -730,7 +725,7 @@ pub async fn rename_table(
     );
     let src_ctx = AuthzContext::new(principal.clone(), src_resource, Action::Update);
     state.authorizer.check(&src_ctx).await?;
-    
+
     // Check permission on destination table (Create)
     let dst_resource = Resource::table(
         &dst_owner,
@@ -739,7 +734,7 @@ pub async fn rename_table(
     );
     let dst_ctx = AuthzContext::new(principal, dst_resource, Action::Create);
     state.authorizer.check(&dst_ctx).await?;
-    
+
     // Record metric
     state.metrics.catalog_rename_table.inc();
 
@@ -777,10 +772,10 @@ pub async fn commit_table(
 
     // Build the endpoint path for idempotency scoping
     let endpoint_path = format!("/v1/namespaces/{}/tables/{}", namespace_str, table_name);
-    
+
     // Check for idempotency key
     let idempotency_key = IdempotencyKey::from_headers(&headers, "POST", &endpoint_path);
-    
+
     // If idempotency key present, check cache first
     if let Some(ref key) = idempotency_key {
         if let Some(cached) = state.idempotency_cache.get(key) {
@@ -789,11 +784,8 @@ pub async fn commit_table(
     }
 
     // Parse namespace from URL path
-    let namespace_parts: Vec<String> = namespace_str
-        .split('\u{1F}')
-        .map(str::to_string)
-        .collect();
-    
+    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
+
     // Use identifier from payload if provided, otherwise use URL path
     let (final_namespace_parts, final_table_name) = if let Some(ref ident) = payload.identifier {
         (ident.namespace.clone(), ident.name.clone())
@@ -819,7 +811,7 @@ pub async fn commit_table(
             "Commit must include at least one update".into(),
         ));
     }
-    
+
     // Record metric
     state.metrics.catalog_commit_table.inc();
 
@@ -889,11 +881,14 @@ pub async fn register_table(
     validate_table_name(&payload.name)?;
 
     // Build the endpoint path for idempotency scoping
-    let endpoint_path = format!("/v1/namespaces/{}/register", namespace.clone().inner().join("/"));
-    
+    let endpoint_path = format!(
+        "/v1/namespaces/{}/register",
+        namespace.clone().inner().join("/")
+    );
+
     // Check for idempotency key
     let idempotency_key = IdempotencyKey::from_headers(&headers, "POST", &endpoint_path);
-    
+
     // If idempotency key present, check cache first
     if let Some(ref key) = idempotency_key {
         if let Some(cached) = state.idempotency_cache.get(key) {
@@ -910,19 +905,20 @@ pub async fn register_table(
     let resource = Resource::table(&owner_tenant, namespace.clone().inner(), &table_name);
     let ctx = AuthzContext::new(principal.clone(), resource, Action::Create);
     state.authorizer.check(&ctx).await?;
-    
+
     // Record metric
     state.metrics.catalog_register_table.inc();
 
     // Read metadata from the provided location
     let file_io = FileIOBuilder::new_fs_io().build()?;
-    let metadata_content = file_io.new_input(&payload.metadata_location)?.read().await?;
-    let metadata_str = std::str::from_utf8(&metadata_content).map_err(|e| {
-        AppError::InvalidSchema(format!("Invalid metadata file encoding: {}", e))
-    })?;
-    let table_metadata: TableMetadata = serde_json::from_str(metadata_str).map_err(|e| {
-        AppError::InvalidSchema(format!("Invalid table metadata: {}", e))
-    })?;
+    let metadata_content = file_io
+        .new_input(&payload.metadata_location)?
+        .read()
+        .await?;
+    let metadata_str = std::str::from_utf8(&metadata_content)
+        .map_err(|e| AppError::InvalidSchema(format!("Invalid metadata file encoding: {}", e)))?;
+    let table_metadata: TableMetadata = serde_json::from_str(metadata_str)
+        .map_err(|e| AppError::InvalidSchema(format!("Invalid table metadata: {}", e)))?;
 
     // Verify the table doesn't already exist
     let table_ident = TableIdent::new(namespace_ident.clone(), table_name.clone());
@@ -938,7 +934,7 @@ pub async fn register_table(
     // The location comes from the metadata itself
     let location = table_metadata.location().to_string();
     let schema = table_metadata.current_schema().as_ref().clone();
-    
+
     let table_creation = TableCreation::builder()
         .name(table_name.clone())
         .location(location)
@@ -1002,10 +998,7 @@ pub async fn report_metrics(
     Path((namespace_str, table_name)): Path<(String, String)>,
     AxumJson(payload): AxumJson<ReportMetricsRequest>,
 ) -> Result<StatusCode> {
-    let namespace_parts: Vec<String> = namespace_str
-        .split('\u{1F}')
-        .map(str::to_string)
-        .collect();
+    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
     let namespace = NamespaceIdent::from_vec(namespace_parts.clone())?;
 
     // Get the namespace's owner tenant
@@ -1045,10 +1038,10 @@ pub async fn commit_transaction(
 ) -> Result<StatusCode> {
     // Build the endpoint path for idempotency scoping
     let endpoint_path = "/v1/transactions/commit";
-    
+
     // Check for idempotency key
     let idempotency_key = IdempotencyKey::from_headers(&headers, "POST", endpoint_path);
-    
+
     // If idempotency key present, check cache first
     if let Some(ref key) = idempotency_key {
         if let Some(_cached) = state.idempotency_cache.get(key) {
@@ -1064,7 +1057,7 @@ pub async fn commit_transaction(
 
     // Collect all tables and verify authorization for each
     let mut table_commits = Vec::with_capacity(payload.table_changes.len());
-    
+
     for commit_req in &payload.table_changes {
         // Each commit must have an identifier for multi-table commits
         let ident = commit_req.identifier.as_ref().ok_or_else(|| {
@@ -1082,14 +1075,18 @@ pub async fn commit_transaction(
         state.authorizer.check(&ctx).await?;
 
         let table_ident = TableIdent::new(namespace, ident.name.clone());
-        table_commits.push((table_ident, commit_req.requirements.clone(), commit_req.updates.clone()));
+        table_commits.push((
+            table_ident,
+            commit_req.requirements.clone(),
+            commit_req.updates.clone(),
+        ));
     }
 
     // Execute all commits
     // Note: True atomic multi-table transactions require catalog support.
     // For now, we commit sequentially with best-effort rollback on failure.
     let mut committed = Vec::new();
-    
+
     for (table_ident, requirements, updates) in table_commits {
         match state
             .catalog
@@ -1107,7 +1104,7 @@ pub async fn commit_transaction(
                     error = %e,
                     "Transaction commit failed, partial commits may exist"
                 );
-                
+
                 return Err(if e.kind() == iceberg::ErrorKind::CatalogCommitConflicts {
                     AppError::CommitConflict(format!(
                         "Commit conflict on table {}: {}. {} tables were already committed.",
@@ -1195,7 +1192,10 @@ mod tests {
 
     #[test]
     fn test_table_identifier_new() {
-        let ident = TableIdentifier::new(vec!["ns1".to_string(), "ns2".to_string()], "table1".to_string());
+        let ident = TableIdentifier::new(
+            vec!["ns1".to_string(), "ns2".to_string()],
+            "table1".to_string(),
+        );
         assert_eq!(ident.namespace, vec!["ns1", "ns2"]);
         assert_eq!(ident.name, "table1");
     }
@@ -1566,10 +1566,7 @@ mod tests {
     #[test]
     fn test_table_identifier_special_characters_in_name() {
         // Names with underscores and numbers should work
-        let ident = TableIdentifier::new(
-            vec!["ns_1".to_string()],
-            "table_name_123".to_string(),
-        );
+        let ident = TableIdentifier::new(vec!["ns_1".to_string()], "table_name_123".to_string());
         let json = serde_json::to_string(&ident).unwrap();
         let parsed: TableIdentifier = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.name, "table_name_123");

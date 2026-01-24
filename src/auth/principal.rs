@@ -143,9 +143,7 @@ impl Principal {
 
     /// Checks if this principal's authentication has expired.
     pub fn is_expired(&self) -> bool {
-        self.expires_at
-            .map(|exp| Utc::now() > exp)
-            .unwrap_or(false)
+        self.expires_at.map(|exp| Utc::now() > exp).unwrap_or(false)
     }
 
     /// Returns when this principal was authenticated.
@@ -322,10 +320,7 @@ mod tests {
         assert!(principal.has_role("admin"));
         assert!(principal.has_role("reader"));
         assert!(!principal.has_role("writer"));
-        assert_eq!(
-            principal.get_attribute("department"),
-            Some("engineering")
-        );
+        assert_eq!(principal.get_attribute("department"), Some("engineering"));
     }
 
     #[test]

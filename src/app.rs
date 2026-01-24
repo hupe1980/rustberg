@@ -21,13 +21,15 @@ use crate::auth::{
     ChainAuthenticator, ChainAuthorizer, InMemoryApiKeyStore, JwtAuthenticator, JwtConfig,
     RateLimitConfig, RateLimiter, RbacAuthorizer, TenantIsolationAuthorizer,
 };
-use crate::crypto::{Aes256GcmProvider, EncryptionProvider, create_kms};
-use crate::storage::KvApiKeyStore;
-use crate::catalog::{self, CatalogExt, EncryptedCatalog, ExtendedCatalog, IdempotencyCache, ViewStorage};
+use crate::catalog::{
+    self, CatalogExt, EncryptedCatalog, ExtendedCatalog, IdempotencyCache, ViewStorage,
+};
 use crate::config;
 use crate::config::CorsConfig;
 use crate::credentials::{NoopCredentialProvider, StorageCredentialProvider};
+use crate::crypto::{create_kms, Aes256GcmProvider, EncryptionProvider};
 use crate::observability::metrics::MetricsRegistry;
+use crate::storage::KvApiKeyStore;
 use crate::utils::temp_path;
 
 // ============================================================================
@@ -108,7 +110,8 @@ impl App {
         let config_routes = config::create_routes(self.app_state.clone());
         let auth_context_routes = auth_routes::create_routes(self.app_state.clone());
         let health_routes = observability::create_health_routes(Arc::new(self.app_state.clone()));
-        let metrics_routes = observability::metrics::create_routes(Arc::new(self.app_state.clone()));
+        let metrics_routes =
+            observability::metrics::create_routes(Arc::new(self.app_state.clone()));
 
         // Default request body limit: 10MB
         // This prevents memory exhaustion from oversized requests
@@ -523,9 +526,9 @@ impl AppBuilder {
         warehouse_location: &str,
     ) -> Result<Arc<dyn CatalogExt + Send + Sync>, crate::error::AppError> {
         use crate::catalog::SlateCatalog;
-        use slatedb::Db;
         use object_store::local::LocalFileSystem;
         use object_store::ObjectStore;
+        use slatedb::Db;
 
         match backend_url {
             Some(url) if url.starts_with("file://") => {
@@ -537,71 +540,101 @@ impl AppBuilder {
                 );
 
                 // Create directory if it doesn't exist
-                std::fs::create_dir_all(path)
-                    .map_err(|e| crate::error::AppError::Internal(format!("Failed to create directory: {}", e)))?;
+                std::fs::create_dir_all(path).map_err(|e| {
+                    crate::error::AppError::Internal(format!("Failed to create directory: {}", e))
+                })?;
 
                 // Create local filesystem object store for SlateDB
-                let object_store: Arc<dyn ObjectStore> = Arc::new(
-                    LocalFileSystem::new_with_prefix(path)
-                        .map_err(|e| crate::error::AppError::Internal(format!("Failed to create LocalFileSystem: {}", e)))?
-                );
+                let object_store: Arc<dyn ObjectStore> =
+                    Arc::new(LocalFileSystem::new_with_prefix(path).map_err(|e| {
+                        crate::error::AppError::Internal(format!(
+                            "Failed to create LocalFileSystem: {}",
+                            e
+                        ))
+                    })?);
 
                 // Create SlateDB instance at "catalog" path within the object store
                 let db = Db::builder("catalog", object_store)
                     .build()
                     .await
-                    .map_err(|e| crate::error::AppError::Internal(format!("Failed to open SlateDB: {}", e)))?;
+                    .map_err(|e| {
+                        crate::error::AppError::Internal(format!("Failed to open SlateDB: {}", e))
+                    })?;
 
                 // Create SlateCatalog with FileIO pointed at warehouse location
-                let slate_catalog = SlateCatalog::new(
-                    Arc::new(db),
-                    warehouse_location.to_string()
-                ).await.map_err(|e| crate::error::AppError::Internal(format!("Failed to create SlateCatalog: {}", e)))?;
+                let slate_catalog = SlateCatalog::new(Arc::new(db), warehouse_location.to_string())
+                    .await
+                    .map_err(|e| {
+                        crate::error::AppError::Internal(format!(
+                            "Failed to create SlateCatalog: {}",
+                            e
+                        ))
+                    })?;
 
                 Ok(Arc::new(ExtendedCatalog::new(slate_catalog)))
             }
-            Some(url) if url.starts_with("s3://") || url.starts_with("gs://") || url.starts_with("az://") => {
-                tracing::info!(
-                    backend = url,
-                    "Creating SlateDB catalog with cloud storage"
-                );
+            Some(url)
+                if url.starts_with("s3://")
+                    || url.starts_with("gs://")
+                    || url.starts_with("az://") =>
+            {
+                tracing::info!(backend = url, "Creating SlateDB catalog with cloud storage");
 
                 // Parse cloud storage URL and create object store
-                let (object_store, cloud_path) = object_store::parse_url(&url::Url::parse(url)
-                    .map_err(|e| crate::error::AppError::Internal(format!("Invalid URL: {}", e)))?)
-                    .map_err(|e| crate::error::AppError::Internal(format!("Failed to create object store: {}", e)))?;
+                let (object_store, cloud_path) =
+                    object_store::parse_url(&url::Url::parse(url).map_err(|e| {
+                        crate::error::AppError::Internal(format!("Invalid URL: {}", e))
+                    })?)
+                    .map_err(|e| {
+                        crate::error::AppError::Internal(format!(
+                            "Failed to create object store: {}",
+                            e
+                        ))
+                    })?;
 
                 // Create SlateDB instance at "catalog" path within the cloud path
                 let catalog_path = format!("{}/catalog", cloud_path);
                 let db = Db::builder(catalog_path, Arc::new(object_store))
                     .build()
                     .await
-                    .map_err(|e| crate::error::AppError::Internal(format!("Failed to open SlateDB: {}", e)))?;
+                    .map_err(|e| {
+                        crate::error::AppError::Internal(format!("Failed to open SlateDB: {}", e))
+                    })?;
 
                 // Create SlateCatalog with FileIO pointed at warehouse location
-                let slate_catalog = SlateCatalog::new(
-                    Arc::new(db),
-                    warehouse_location.to_string()
-                ).await.map_err(|e| crate::error::AppError::Internal(format!("Failed to create SlateCatalog: {}", e)))?;
+                let slate_catalog = SlateCatalog::new(Arc::new(db), warehouse_location.to_string())
+                    .await
+                    .map_err(|e| {
+                        crate::error::AppError::Internal(format!(
+                            "Failed to create SlateCatalog: {}",
+                            e
+                        ))
+                    })?;
 
                 Ok(Arc::new(ExtendedCatalog::new(slate_catalog)))
             }
             Some("memory://") | None => {
                 tracing::info!("Creating MemoryCatalog for development/testing");
-                
+
                 let mut props = HashMap::new();
                 props.insert("warehouse".to_string(), warehouse_location.to_string());
-                
+
                 let memory_catalog: iceberg::MemoryCatalog = MemoryCatalogBuilder::default()
                     .load("memory", props)
                     .await
-                    .map_err(|e| crate::error::AppError::Internal(format!("Failed to create MemoryCatalog: {}", e)))?;
-                
+                    .map_err(|e| {
+                        crate::error::AppError::Internal(format!(
+                            "Failed to create MemoryCatalog: {}",
+                            e
+                        ))
+                    })?;
+
                 Ok(Arc::new(ExtendedCatalog::new(memory_catalog)))
             }
-            Some(url) => {
-                Err(crate::error::AppError::Internal(format!("Unsupported storage backend: {}", url)))
-            }
+            Some(url) => Err(crate::error::AppError::Internal(format!(
+                "Unsupported storage backend: {}",
+                url
+            ))),
         }
     }
 
@@ -622,12 +655,14 @@ impl AppBuilder {
 
         let mut props = HashMap::new();
         props.insert("warehouse".to_string(), warehouse_location.to_string());
-        
+
         let memory_catalog: iceberg::MemoryCatalog = MemoryCatalogBuilder::default()
             .load("memory", props)
             .await
-            .map_err(|e| crate::error::AppError::Internal(format!("Failed to create MemoryCatalog: {}", e)))?;
-        
+            .map_err(|e| {
+                crate::error::AppError::Internal(format!("Failed to create MemoryCatalog: {}", e))
+            })?;
+
         Ok(Arc::new(ExtendedCatalog::new(memory_catalog)))
     }
 
@@ -637,18 +672,17 @@ impl AppBuilder {
     /// Use this when building from within an async context.
     pub async fn build_with_api_key_auth_async(self) -> (App, Arc<InMemoryApiKeyStore>) {
         let warehouse_location = self.warehouse_location.unwrap_or_else(temp_path);
-        let default_tenant_id = self.default_tenant_id.unwrap_or_else(|| "default".to_string());
+        let default_tenant_id = self
+            .default_tenant_id
+            .unwrap_or_else(|| "default".to_string());
 
         let base_catalog = if let Some(catalog) = self.catalog {
             catalog
         } else {
             // Create catalog based on storage backend URL
-            Self::create_catalog(
-                self.storage_backend_url.as_deref(),
-                &warehouse_location
-            )
-            .await
-            .expect("Failed to create catalog")
+            Self::create_catalog(self.storage_backend_url.as_deref(), &warehouse_location)
+                .await
+                .expect("Failed to create catalog")
         };
 
         // Wrap catalog with encryption if enabled
@@ -657,8 +691,10 @@ impl AppBuilder {
                 let kms = create_kms(kms_config, None)
                     .await
                     .expect("Failed to create KMS for table encryption");
-                
-                let key_id = self.kms_key_id.unwrap_or_else(|| "rustberg-master".to_string());
+
+                let key_id = self
+                    .kms_key_id
+                    .unwrap_or_else(|| "rustberg-master".to_string());
                 tracing::info!(key_id = %key_id, "Table metadata encryption enabled with KMS");
                 Arc::new(EncryptedCatalog::new(base_catalog, kms, key_id))
             } else {
@@ -679,11 +715,10 @@ impl AppBuilder {
         let authenticator: Arc<dyn Authenticator> = if let Some(jwt_config) = self.jwt_config {
             // Create JWT authenticator
             let jwt_auth = Arc::new(
-                JwtAuthenticator::new(jwt_config)
-                    .expect("Failed to create JWT authenticator")
+                JwtAuthenticator::new(jwt_config).expect("Failed to create JWT authenticator"),
             );
             let api_key_auth = Arc::new(ApiKeyAuthenticator::new(api_key_store.clone()));
-            
+
             // Chain: JWT first (Bearer token), then API Key
             Arc::new(ChainAuthenticator::new(vec![jwt_auth, api_key_auth]))
         } else {
@@ -693,11 +728,10 @@ impl AppBuilder {
 
         // Create authorizer with tenant isolation and RBAC
         let rbac = Arc::new(RbacAuthorizer::new());
-        let authorizer: Arc<dyn Authorizer> =
-            Arc::new(ChainAuthorizer::new(vec![
-                Arc::new(TenantIsolationAuthorizer::new(rbac.clone())),
-                rbac,
-            ]));
+        let authorizer: Arc<dyn Authorizer> = Arc::new(ChainAuthorizer::new(vec![
+            Arc::new(TenantIsolationAuthorizer::new(rbac.clone())),
+            rbac,
+        ]));
 
         // Use provided credential provider or default to noop
         let credential_provider = self
@@ -705,13 +739,11 @@ impl AppBuilder {
             .unwrap_or_else(|| Arc::new(NoopCredentialProvider::new()));
 
         // Create rate limiter (enabled by default for API key auth)
-        let rate_limiter = Arc::new(RateLimiter::new(
-            self.rate_limit_config.unwrap_or_default()
-        ));
+        let rate_limiter = Arc::new(RateLimiter::new(self.rate_limit_config.unwrap_or_default()));
 
         // Create idempotency cache
         let idempotency_cache = Arc::new(IdempotencyCache::new(
-            self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL)
+            self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL),
         ));
 
         // Create view storage
@@ -735,7 +767,13 @@ impl AppBuilder {
 
         let cors_config = self.cors_config.clone().unwrap_or_default();
 
-        (App { app_state, cors_config }, api_key_store)
+        (
+            App {
+                app_state,
+                cors_config,
+            },
+            api_key_store,
+        )
     }
 
     /// Creates an App with persistent API key storage using KvApiKeyStore.
@@ -779,13 +817,13 @@ impl AppBuilder {
     /// # }
     /// ```
     #[cfg(feature = "slatedb-storage")]
-    pub async fn build_with_persistent_api_key_auth_async(
-        self,
-    ) -> (App, Arc<KvApiKeyStore>) {
+    pub async fn build_with_persistent_api_key_auth_async(self) -> (App, Arc<KvApiKeyStore>) {
         use crate::storage::SlateDbStore;
 
         let warehouse_location = self.warehouse_location.unwrap_or_else(temp_path);
-        let default_tenant_id = self.default_tenant_id.unwrap_or_else(|| "default".to_string());
+        let default_tenant_id = self
+            .default_tenant_id
+            .unwrap_or_else(|| "default".to_string());
         let storage_backend_url = self.storage_backend_url.clone();
         let enable_table_encryption = self.enable_table_encryption;
         let kms_config = self.kms_config.clone();
@@ -806,7 +844,7 @@ impl AppBuilder {
                 let kms = create_kms(kms_config, None)
                     .await
                     .expect("Failed to create KMS for table encryption");
-                
+
                 let key_id = kms_key_id.unwrap_or_else(|| "rustberg-master".to_string());
                 tracing::info!(key_id = %key_id, "Table metadata encryption enabled with KMS");
                 Arc::new(EncryptedCatalog::new(base_catalog, kms, key_id))
@@ -828,7 +866,11 @@ impl AppBuilder {
                 let base = url.strip_prefix("file://").unwrap_or(url);
                 format!("file://{}/apikeys", base)
             }
-            Some(url) if url.starts_with("s3://") || url.starts_with("gs://") || url.starts_with("az://") => {
+            Some(url)
+                if url.starts_with("s3://")
+                    || url.starts_with("gs://")
+                    || url.starts_with("az://") =>
+            {
                 format!("{}/apikeys", url.trim_end_matches('/'))
             }
             _ => "memory://apikeys".to_string(),
@@ -845,15 +887,13 @@ impl AppBuilder {
         let kv = Arc::new(
             SlateDbStore::open_url(&kv_url)
                 .await
-                .expect("Failed to open API key storage")
+                .expect("Failed to open API key storage"),
         );
 
         // Create encryption provider if key is provided
         let encryption: Option<Arc<dyn EncryptionProvider>> = self.encryption_key.map(|key| {
-            Arc::new(
-                Aes256GcmProvider::new(&key)
-                    .expect("Invalid encryption key")
-            ) as Arc<dyn EncryptionProvider>
+            Arc::new(Aes256GcmProvider::new(&key).expect("Invalid encryption key"))
+                as Arc<dyn EncryptionProvider>
         });
 
         // Log encryption status
@@ -876,7 +916,7 @@ impl AppBuilder {
         // Create authenticator: API Key + optional JWT
         let authenticator: Arc<dyn Authenticator> = if let Some(jwt_config) = self.jwt_config {
             let jwt_auth = Arc::new(
-                JwtAuthenticator::new(jwt_config).expect("Failed to create JWT authenticator")
+                JwtAuthenticator::new(jwt_config).expect("Failed to create JWT authenticator"),
             );
             let api_key_auth = Arc::new(ApiKeyAuthenticator::new(api_key_store.clone()));
             Arc::new(ChainAuthenticator::new(vec![jwt_auth, api_key_auth]))
@@ -897,13 +937,11 @@ impl AppBuilder {
             .unwrap_or_else(|| Arc::new(NoopCredentialProvider::new()));
 
         // Create rate limiter (enabled by default for API key auth)
-        let rate_limiter = Arc::new(RateLimiter::new(
-            self.rate_limit_config.unwrap_or_default()
-        ));
+        let rate_limiter = Arc::new(RateLimiter::new(self.rate_limit_config.unwrap_or_default()));
 
         // Create idempotency cache
         let idempotency_cache = Arc::new(IdempotencyCache::new(
-            self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL)
+            self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL),
         ));
 
         // Create view storage
@@ -927,7 +965,13 @@ impl AppBuilder {
 
         let cors_config = self.cors_config.clone().unwrap_or_default();
 
-        (App { app_state, cors_config }, api_key_store)
+        (
+            App {
+                app_state,
+                cors_config,
+            },
+            api_key_store,
+        )
     }
 
     /// Creates an App with API key authentication pre-configured.
@@ -935,7 +979,9 @@ impl AppBuilder {
     /// Returns both the App and the API key store for management.
     pub fn build_with_api_key_auth(self) -> (App, Arc<InMemoryApiKeyStore>) {
         let warehouse_location = self.warehouse_location.unwrap_or_else(temp_path);
-        let default_tenant_id = self.default_tenant_id.unwrap_or_else(|| "default".to_string());
+        let default_tenant_id = self
+            .default_tenant_id
+            .unwrap_or_else(|| "default".to_string());
         let rate_limit_config = self.rate_limit_config.clone();
         let idempotency_ttl = self.idempotency_ttl;
         let jwt_config = self.jwt_config.clone();
@@ -946,28 +992,26 @@ impl AppBuilder {
 
         let base_catalog: Arc<dyn CatalogExt + Send + Sync> = self.catalog.unwrap_or_else(|| {
             // Create catalog using tokio runtime
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(async {
-                    Self::create_catalog(storage_backend_url.as_deref(), &warehouse_clone)
-                        .await
-                        .expect("Failed to create catalog")
-                })
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                Self::create_catalog(storage_backend_url.as_deref(), &warehouse_clone)
+                    .await
+                    .expect("Failed to create catalog")
+            })
         });
 
         // Wrap catalog with encryption if enabled
         let catalog: Arc<dyn CatalogExt + Send + Sync> = if enable_table_encryption {
             if let Some(kms_config) = kms_config {
                 // Create KMS using tokio runtime
-                let kms = tokio::runtime::Runtime::new()
-                    .unwrap()
-                    .block_on(async {
-                        create_kms(kms_config, None)
-                            .await
-                            .expect("Failed to create KMS for table encryption")
-                    });
-                
-                let key_id = self.kms_key_id.unwrap_or_else(|| "rustberg-master".to_string());
+                let kms = tokio::runtime::Runtime::new().unwrap().block_on(async {
+                    create_kms(kms_config, None)
+                        .await
+                        .expect("Failed to create KMS for table encryption")
+                });
+
+                let key_id = self
+                    .kms_key_id
+                    .unwrap_or_else(|| "rustberg-master".to_string());
                 tracing::info!(key_id = %key_id, "Table metadata encryption enabled with KMS");
                 Arc::new(EncryptedCatalog::new(base_catalog, kms, key_id))
             } else {
@@ -988,11 +1032,10 @@ impl AppBuilder {
         let authenticator: Arc<dyn Authenticator> = if let Some(jwt_config) = jwt_config {
             // Create JWT authenticator
             let jwt_auth = Arc::new(
-                JwtAuthenticator::new(jwt_config)
-                    .expect("Failed to create JWT authenticator")
+                JwtAuthenticator::new(jwt_config).expect("Failed to create JWT authenticator"),
             );
             let api_key_auth = Arc::new(ApiKeyAuthenticator::new(api_key_store.clone()));
-            
+
             // Chain: JWT first (Bearer token), then API Key
             Arc::new(ChainAuthenticator::new(vec![jwt_auth, api_key_auth]))
         } else {
@@ -1002,11 +1045,10 @@ impl AppBuilder {
 
         // Create authorizer with tenant isolation and RBAC
         let rbac = Arc::new(RbacAuthorizer::new());
-        let authorizer: Arc<dyn Authorizer> =
-            Arc::new(ChainAuthorizer::new(vec![
-                Arc::new(TenantIsolationAuthorizer::new(rbac.clone())),
-                rbac,
-            ]));
+        let authorizer: Arc<dyn Authorizer> = Arc::new(ChainAuthorizer::new(vec![
+            Arc::new(TenantIsolationAuthorizer::new(rbac.clone())),
+            rbac,
+        ]));
 
         // Use provided credential provider or default to noop
         let credential_provider = self
@@ -1014,13 +1056,11 @@ impl AppBuilder {
             .unwrap_or_else(|| Arc::new(NoopCredentialProvider::new()));
 
         // Create rate limiter (enabled by default for API key auth)
-        let rate_limiter = Arc::new(RateLimiter::new(
-            rate_limit_config.unwrap_or_default()
-        ));
+        let rate_limiter = Arc::new(RateLimiter::new(rate_limit_config.unwrap_or_default()));
 
         // Create idempotency cache
         let idempotency_cache = Arc::new(IdempotencyCache::new(
-            idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL)
+            idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL),
         ));
 
         // Create view storage
@@ -1044,7 +1084,13 @@ impl AppBuilder {
 
         let cors_config = self.cors_config.unwrap_or_default();
 
-        (App { app_state, cors_config }, api_key_store)
+        (
+            App {
+                app_state,
+                cors_config,
+            },
+            api_key_store,
+        )
     }
 
     /// Builds the App with the configured options (async version).
@@ -1052,60 +1098,59 @@ impl AppBuilder {
     /// Use this when building from within an async context.
     pub async fn build_async(self) -> App {
         let warehouse_location = self.warehouse_location.unwrap_or_else(temp_path);
-        let default_tenant_id = self.default_tenant_id.unwrap_or_else(|| "default".to_string());
+        let default_tenant_id = self
+            .default_tenant_id
+            .unwrap_or_else(|| "default".to_string());
 
         let catalog = if let Some(catalog) = self.catalog {
             catalog
         } else {
             // Create catalog based on storage backend URL
-            Self::create_catalog(
-                self.storage_backend_url.as_deref(),
-                &warehouse_location
-            )
-            .await
-            .expect("Failed to create catalog")
+            Self::create_catalog(self.storage_backend_url.as_deref(), &warehouse_location)
+                .await
+                .expect("Failed to create catalog")
         };
 
-        let (authenticator, authorizer): (Arc<dyn Authenticator>, Arc<dyn Authorizer>) =
-            if self.enable_auth {
-                // Default secure configuration
-                let api_key_store = Arc::new(InMemoryApiKeyStore::new());
-                
-                // Create authenticator: API Key + optional JWT
-                let authenticator: Arc<dyn Authenticator> = if let Some(jwt_config) = self.jwt_config {
-                    // Create JWT authenticator
-                    let jwt_auth = Arc::new(
-                        JwtAuthenticator::new(jwt_config)
-                            .expect("Failed to create JWT authenticator")
-                    );
-                    let api_key_auth = Arc::new(ApiKeyAuthenticator::new(api_key_store));
-                    
-                    // Chain: JWT first (Bearer token), then API Key
-                    Arc::new(ChainAuthenticator::new(vec![jwt_auth, api_key_auth]))
-                } else {
-                    // API Key only
-                    Arc::new(ApiKeyAuthenticator::new(api_key_store))
-                };
+        let (authenticator, authorizer): (Arc<dyn Authenticator>, Arc<dyn Authorizer>) = if self
+            .enable_auth
+        {
+            // Default secure configuration
+            let api_key_store = Arc::new(InMemoryApiKeyStore::new());
 
-                let rbac = Arc::new(RbacAuthorizer::new());
-                let authorizer = Arc::new(ChainAuthorizer::new(vec![
-                    Arc::new(TenantIsolationAuthorizer::new(rbac.clone())),
-                    rbac,
-                ]));
+            // Create authenticator: API Key + optional JWT
+            let authenticator: Arc<dyn Authenticator> = if let Some(jwt_config) = self.jwt_config {
+                // Create JWT authenticator
+                let jwt_auth = Arc::new(
+                    JwtAuthenticator::new(jwt_config).expect("Failed to create JWT authenticator"),
+                );
+                let api_key_auth = Arc::new(ApiKeyAuthenticator::new(api_key_store));
 
-                (authenticator, authorizer)
+                // Chain: JWT first (Bearer token), then API Key
+                Arc::new(ChainAuthenticator::new(vec![jwt_auth, api_key_auth]))
             } else {
-                // Development mode - allow all
-                let authenticator = self
-                    .authenticator
-                    .unwrap_or_else(|| Arc::new(AllowAllAuthenticator));
-
-                let authorizer = self
-                    .authorizer
-                    .unwrap_or_else(|| Arc::new(AllowAllAuthorizer));
-
-                (authenticator, authorizer)
+                // API Key only
+                Arc::new(ApiKeyAuthenticator::new(api_key_store))
             };
+
+            let rbac = Arc::new(RbacAuthorizer::new());
+            let authorizer = Arc::new(ChainAuthorizer::new(vec![
+                Arc::new(TenantIsolationAuthorizer::new(rbac.clone())),
+                rbac,
+            ]));
+
+            (authenticator, authorizer)
+        } else {
+            // Development mode - allow all
+            let authenticator = self
+                .authenticator
+                .unwrap_or_else(|| Arc::new(AllowAllAuthenticator));
+
+            let authorizer = self
+                .authorizer
+                .unwrap_or_else(|| Arc::new(AllowAllAuthorizer));
+
+            (authenticator, authorizer)
+        };
 
         // Use provided credential provider or default to noop
         let credential_provider = self
@@ -1113,19 +1158,19 @@ impl AppBuilder {
             .unwrap_or_else(|| Arc::new(NoopCredentialProvider::new()));
 
         // Create rate limiter (disabled by default in dev mode for build_async, unless explicitly configured)
-        let rate_limiter = Arc::new(RateLimiter::new(
-            self.rate_limit_config.unwrap_or_else(|| {
+        let rate_limiter = Arc::new(RateLimiter::new(self.rate_limit_config.unwrap_or_else(
+            || {
                 if self.enable_auth {
                     RateLimitConfig::default()
                 } else {
                     RateLimitConfig::disabled()
                 }
-            })
-        ));
+            },
+        )));
 
         // Create idempotency cache
         let idempotency_cache = Arc::new(IdempotencyCache::new(
-            self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL)
+            self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL),
         ));
 
         // Create view storage
@@ -1149,13 +1194,18 @@ impl AppBuilder {
 
         let cors_config = self.cors_config.clone().unwrap_or_default();
 
-        App { app_state, cors_config }
+        App {
+            app_state,
+            cors_config,
+        }
     }
 
     /// Builds the App with the configured options.
     pub fn build(self) -> App {
         let warehouse_location = self.warehouse_location.unwrap_or_else(temp_path);
-        let default_tenant_id = self.default_tenant_id.unwrap_or_else(|| "default".to_string());
+        let default_tenant_id = self
+            .default_tenant_id
+            .unwrap_or_else(|| "default".to_string());
         let storage_backend_url = self.storage_backend_url.clone();
         let warehouse_clone = warehouse_location.clone();
         let enable_table_encryption = self.enable_table_encryption;
@@ -1163,28 +1213,27 @@ impl AppBuilder {
 
         let base_catalog: Arc<dyn CatalogExt + Send + Sync> = self.catalog.unwrap_or_else(|| {
             // Create catalog using tokio runtime
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(async {
-                    Self::create_catalog(storage_backend_url.as_deref(), &warehouse_clone)
-                        .await
-                        .expect("Failed to create catalog")
-                })
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                Self::create_catalog(storage_backend_url.as_deref(), &warehouse_clone)
+                    .await
+                    .expect("Failed to create catalog")
+            })
         });
 
         // Wrap catalog with encryption if enabled
         let catalog: Arc<dyn CatalogExt + Send + Sync> = if enable_table_encryption {
             if let Some(kms_config) = kms_config {
                 // Create KMS using tokio runtime
-                let kms = tokio::runtime::Runtime::new()
-                    .unwrap()
-                    .block_on(async {
-                        create_kms(kms_config, None)
-                            .await
-                            .expect("Failed to create KMS for table encryption")
-                    });
-                
-                let key_id = self.kms_key_id.clone().unwrap_or_else(|| "rustberg-master".to_string());
+                let kms = tokio::runtime::Runtime::new().unwrap().block_on(async {
+                    create_kms(kms_config, None)
+                        .await
+                        .expect("Failed to create KMS for table encryption")
+                });
+
+                let key_id = self
+                    .kms_key_id
+                    .clone()
+                    .unwrap_or_else(|| "rustberg-master".to_string());
                 tracing::info!(key_id = %key_id, "Table metadata encryption enabled with KMS");
                 Arc::new(EncryptedCatalog::new(base_catalog, kms, key_id))
             } else {
@@ -1198,46 +1247,46 @@ impl AppBuilder {
             base_catalog
         };
 
-        let (authenticator, authorizer): (Arc<dyn Authenticator>, Arc<dyn Authorizer>) =
-            if self.enable_auth {
-                // Default secure configuration
-                let api_key_store = Arc::new(InMemoryApiKeyStore::new());
-                
-                // Create authenticator: API Key + optional JWT
-                let authenticator: Arc<dyn Authenticator> = if let Some(jwt_config) = self.jwt_config {
-                    // Create JWT authenticator
-                    let jwt_auth = Arc::new(
-                        JwtAuthenticator::new(jwt_config)
-                            .expect("Failed to create JWT authenticator")
-                    );
-                    let api_key_auth = Arc::new(ApiKeyAuthenticator::new(api_key_store));
-                    
-                    // Chain: JWT first (Bearer token), then API Key
-                    Arc::new(ChainAuthenticator::new(vec![jwt_auth, api_key_auth]))
-                } else {
-                    // API Key only
-                    Arc::new(ApiKeyAuthenticator::new(api_key_store))
-                };
+        let (authenticator, authorizer): (Arc<dyn Authenticator>, Arc<dyn Authorizer>) = if self
+            .enable_auth
+        {
+            // Default secure configuration
+            let api_key_store = Arc::new(InMemoryApiKeyStore::new());
 
-                let rbac = Arc::new(RbacAuthorizer::new());
-                let authorizer = Arc::new(ChainAuthorizer::new(vec![
-                    Arc::new(TenantIsolationAuthorizer::new(rbac.clone())),
-                    rbac,
-                ]));
+            // Create authenticator: API Key + optional JWT
+            let authenticator: Arc<dyn Authenticator> = if let Some(jwt_config) = self.jwt_config {
+                // Create JWT authenticator
+                let jwt_auth = Arc::new(
+                    JwtAuthenticator::new(jwt_config).expect("Failed to create JWT authenticator"),
+                );
+                let api_key_auth = Arc::new(ApiKeyAuthenticator::new(api_key_store));
 
-                (authenticator, authorizer)
+                // Chain: JWT first (Bearer token), then API Key
+                Arc::new(ChainAuthenticator::new(vec![jwt_auth, api_key_auth]))
             } else {
-                // Development mode - allow all
-                let authenticator = self
-                    .authenticator
-                    .unwrap_or_else(|| Arc::new(AllowAllAuthenticator));
-
-                let authorizer = self
-                    .authorizer
-                    .unwrap_or_else(|| Arc::new(AllowAllAuthorizer));
-
-                (authenticator, authorizer)
+                // API Key only
+                Arc::new(ApiKeyAuthenticator::new(api_key_store))
             };
+
+            let rbac = Arc::new(RbacAuthorizer::new());
+            let authorizer = Arc::new(ChainAuthorizer::new(vec![
+                Arc::new(TenantIsolationAuthorizer::new(rbac.clone())),
+                rbac,
+            ]));
+
+            (authenticator, authorizer)
+        } else {
+            // Development mode - allow all
+            let authenticator = self
+                .authenticator
+                .unwrap_or_else(|| Arc::new(AllowAllAuthenticator));
+
+            let authorizer = self
+                .authorizer
+                .unwrap_or_else(|| Arc::new(AllowAllAuthorizer));
+
+            (authenticator, authorizer)
+        };
 
         // Use provided credential provider or default to noop
         let credential_provider = self
@@ -1245,19 +1294,19 @@ impl AppBuilder {
             .unwrap_or_else(|| Arc::new(NoopCredentialProvider::new()));
 
         // Create rate limiter (disabled by default in dev mode, unless explicitly configured)
-        let rate_limiter = Arc::new(RateLimiter::new(
-            self.rate_limit_config.unwrap_or_else(|| {
+        let rate_limiter = Arc::new(RateLimiter::new(self.rate_limit_config.unwrap_or_else(
+            || {
                 if self.enable_auth {
                     RateLimitConfig::default()
                 } else {
                     RateLimitConfig::disabled()
                 }
-            })
-        ));
+            },
+        )));
 
         // Create idempotency cache
         let idempotency_cache = Arc::new(IdempotencyCache::new(
-            self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL)
+            self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL),
         ));
 
         // Create view storage
@@ -1281,7 +1330,10 @@ impl AppBuilder {
 
         let cors_config = self.cors_config.unwrap_or_default();
 
-        App { app_state, cors_config }
+        App {
+            app_state,
+            cors_config,
+        }
     }
 }
 
@@ -1307,9 +1359,7 @@ mod tests {
 
     #[test]
     fn test_app_builder_custom_tenant() {
-        let app = App::builder()
-            .with_default_tenant_id("my-tenant")
-            .build();
+        let app = App::builder().with_default_tenant_id("my-tenant").build();
 
         assert_eq!(app.state().default_tenant_id(), "my-tenant");
     }
@@ -1331,14 +1381,14 @@ mod tests {
         let warehouse = crate::utils::temp_path();
         let mut props = HashMap::new();
         props.insert("warehouse".to_string(), warehouse.clone());
-        
+
         let memory_catalog: iceberg::MemoryCatalog = MemoryCatalogBuilder::default()
             .load("memory", props)
             .await
             .unwrap();
-        
+
         let catalog = Arc::new(ExtendedCatalog::new(memory_catalog));
-        
+
         let app = App::builder()
             .with_catalog(catalog)
             .with_warehouse_location(&warehouse)
@@ -1362,13 +1412,10 @@ mod tests {
             response.headers().get("x-content-type-options").unwrap(),
             "nosniff"
         );
-        
+
         assert!(response.headers().contains_key("x-frame-options"));
-        assert_eq!(
-            response.headers().get("x-frame-options").unwrap(),
-            "DENY"
-        );
-        
+        assert_eq!(response.headers().get("x-frame-options").unwrap(), "DENY");
+
         assert!(response.headers().contains_key("content-security-policy"));
         assert_eq!(
             response.headers().get("content-security-policy").unwrap(),
@@ -1392,23 +1439,23 @@ mod tests {
     #[tokio::test]
     async fn test_build_with_persistent_api_key_auth_async() {
         use crate::auth::{ApiKeyBuilder, ApiKeyStore};
-        
+
         // Build with memory backend (no encryption)
         let (app, store) = App::builder()
             .with_storage_backend("memory://")
             .build_with_persistent_api_key_auth_async()
             .await;
-        
+
         assert!(Arc::strong_count(&store) >= 1);
         assert_eq!(app.state().default_tenant_id(), "default");
-        
+
         // Verify we can use the store
         let (key, _plaintext) = ApiKeyBuilder::new("Test Key", "test-tenant")
             .with_role("read")
             .build();
-        
+
         store.store(key.clone()).await.unwrap();
-        
+
         let loaded = store.get_by_id(&key.id).await;
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().name, "Test Key");
@@ -1419,27 +1466,27 @@ mod tests {
     async fn test_build_with_persistent_api_key_auth_with_encryption() {
         use crate::auth::{ApiKeyBuilder, ApiKeyStore};
         use crate::crypto::Aes256GcmProvider;
-        
+
         // Generate encryption key
         let enc_key = Aes256GcmProvider::generate_key();
-        
+
         // Build with memory backend + encryption
         let (app, store) = App::builder()
             .with_storage_backend("memory://")
             .with_encryption_key(enc_key)
             .build_with_persistent_api_key_auth_async()
             .await;
-        
+
         assert!(Arc::strong_count(&store) >= 1);
         assert_eq!(app.state().default_tenant_id(), "default");
-        
+
         // Verify we can use the store with encryption
         let (api_key, _plaintext) = ApiKeyBuilder::new("Encrypted Key", "test-tenant")
             .with_role("admin")
             .build();
-        
+
         store.store(api_key.clone()).await.unwrap();
-        
+
         let loaded = store.get_by_id(&api_key.id).await;
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().name, "Encrypted Key");

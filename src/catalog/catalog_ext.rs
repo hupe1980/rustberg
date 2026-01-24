@@ -65,7 +65,10 @@ impl<C: Catalog + Send + Sync> Catalog for ExtendedCatalog<C> {
         self.inner.create_namespace(namespace, properties).await
     }
 
-    async fn get_namespace(&self, namespace: &iceberg::NamespaceIdent) -> Result<iceberg::Namespace> {
+    async fn get_namespace(
+        &self,
+        namespace: &iceberg::NamespaceIdent,
+    ) -> Result<iceberg::Namespace> {
         self.inner.get_namespace(namespace).await
     }
 
@@ -132,36 +135,33 @@ impl<C: Catalog + Send + Sync> CatalogExt for ExtendedCatalog<C> {
     ) -> Result<Table> {
         // Load current table
         let table = self.inner.load_table(table_ident).await?;
-        
+
         // Check all requirements against current metadata
         for requirement in &requirements {
             requirement.check(Some(table.metadata()))?;
         }
-        
+
         // Get current metadata location
-        let current_metadata_location = table.metadata_location().ok_or_else(|| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                "Table has no metadata location",
-            )
-        })?;
-        
+        let current_metadata_location = table
+            .metadata_location()
+            .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "Table has no metadata location"))?;
+
         // Apply all updates to build new metadata
         let mut metadata_builder = table
             .metadata()
             .clone()
             .into_builder(Some(current_metadata_location.to_string()));
-        
+
         for update in updates {
             metadata_builder = update.apply(metadata_builder)?;
         }
-        
+
         // Build the new metadata
         let new_metadata = metadata_builder.build()?;
-        
+
         // Generate new metadata location
         let new_metadata_location = generate_new_metadata_location(current_metadata_location)?;
-        
+
         // Reconstruct the table with updated metadata using the public builder API
         let updated_table = Table::builder()
             .identifier(table_ident.clone())
@@ -169,7 +169,7 @@ impl<C: Catalog + Send + Sync> CatalogExt for ExtendedCatalog<C> {
             .metadata(Arc::new(new_metadata.metadata))
             .metadata_location(new_metadata_location)
             .build()?;
-        
+
         // Note: For MemoryCatalog, changes are not persisted across loads.
         // This is a limitation of MemoryCatalog - subsequent loads will return the original.
         //
@@ -179,7 +179,7 @@ impl<C: Catalog + Send + Sync> CatalogExt for ExtendedCatalog<C> {
         //
         // SlateCatalog is selected automatically when using storage backends
         // like file://, s3://, gs://, or az:// via App::builder().with_storage_backend().
-        
+
         Ok(updated_table)
     }
 }
@@ -187,25 +187,25 @@ impl<C: Catalog + Send + Sync> CatalogExt for ExtendedCatalog<C> {
 /// Generates a new metadata location by incrementing the version number.
 fn generate_new_metadata_location(current_location: &str) -> Result<String> {
     use std::path::Path;
-    
+
     let path = Path::new(current_location);
     let parent = path.parent().map(|p| p.to_string_lossy().to_string());
-    let filename = path.file_name()
+    let filename = path
+        .file_name()
         .and_then(|f| f.to_str())
-        .ok_or_else(|| Error::new(
-            ErrorKind::DataInvalid,
-            "Invalid metadata location",
-        ))?;
-    
+        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "Invalid metadata location"))?;
+
     // Parse version from filename (e.g., "00001-uuid.metadata.json")
-    let version = filename.split('-').next()
+    let version = filename
+        .split('-')
+        .next()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
-    
+
     let new_version = version + 1;
     let new_uuid = uuid::Uuid::new_v4();
     let new_filename = format!("{:05}-{}.metadata.json", new_version, new_uuid);
-    
+
     match parent {
         Some(p) if !p.is_empty() => Ok(format!("{}/{}", p, new_filename)),
         _ => Ok(new_filename),
@@ -220,16 +220,16 @@ mod tests {
     fn test_generate_new_metadata_location() {
         let current = "s3://bucket/warehouse/db/table/metadata/00001-abc.metadata.json";
         let new_loc = generate_new_metadata_location(current).unwrap();
-        
+
         assert!(new_loc.starts_with("s3://bucket/warehouse/db/table/metadata/00002-"));
         assert!(new_loc.ends_with(".metadata.json"));
     }
-    
+
     #[test]
     fn test_generate_new_metadata_location_local() {
         let current = "/tmp/warehouse/metadata/00005-xyz.metadata.json";
         let new_loc = generate_new_metadata_location(current).unwrap();
-        
+
         assert!(new_loc.starts_with("/tmp/warehouse/metadata/00006-"));
         assert!(new_loc.ends_with(".metadata.json"));
     }

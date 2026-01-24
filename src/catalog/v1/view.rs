@@ -11,8 +11,7 @@ use axum::{
     response::{IntoResponse, Json as AxumJson},
 };
 use iceberg::spec::{
-    NestedFieldRef, Schema as IcebergSchema, ViewMetadata, ViewMetadataBuilder,
-    ViewRepresentations,
+    NestedFieldRef, Schema as IcebergSchema, ViewMetadata, ViewMetadataBuilder, ViewRepresentations,
 };
 use iceberg::{NamespaceIdent, ViewCreation, ViewUpdate};
 use parking_lot::RwLock;
@@ -241,9 +240,7 @@ impl ViewStorage {
     /// Loads a view by namespace and name.
     pub fn load_view(&self, namespace: &[String], name: &str) -> Option<(String, ViewMetadata)> {
         let views = self.views.read();
-        views
-            .get(&(namespace.to_vec(), name.to_string()))
-            .cloned()
+        views.get(&(namespace.to_vec(), name.to_string())).cloned()
     }
 
     /// Creates a new view. Returns error if view already exists.
@@ -459,7 +456,7 @@ pub async fn create_view(
         .with_schema_id(payload.schema.schema_id.unwrap_or(0))
         .build()?;
 
-    // Build view representations - use serde to construct since ViewRepresentations 
+    // Build view representations - use serde to construct since ViewRepresentations
     // has a private constructor but implements Deserialize
     let representations_json: Vec<serde_json::Value> = payload
         .view_version
@@ -473,10 +470,11 @@ pub async fn create_view(
             })
         })
         .collect();
-    
-    let representations: ViewRepresentations = serde_json::from_value(
-        serde_json::Value::Array(representations_json)
-    ).map_err(|e| AppError::ValidationError(format!("Invalid view representations: {}", e)))?;
+
+    let representations: ViewRepresentations =
+        serde_json::from_value(serde_json::Value::Array(representations_json)).map_err(|e| {
+            AppError::ValidationError(format!("Invalid view representations: {}", e))
+        })?;
 
     if representations.is_empty() {
         return Err(AppError::ValidationError(
@@ -565,10 +563,7 @@ pub async fn load_view(
     Path((namespace_str, view_name)): Path<(String, String)>,
 ) -> Result<AxumJson<LoadViewResponse>> {
     // Parse namespace path
-    let namespace_parts: Vec<String> = namespace_str
-        .split('\u{1F}')
-        .map(str::to_string)
-        .collect();
+    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
 
     validate_namespace(&namespace_parts)?;
     validate_table_name(&view_name)?;
@@ -605,10 +600,7 @@ pub async fn view_exists(
     Path((namespace_str, view_name)): Path<(String, String)>,
 ) -> Result<StatusCode> {
     // Parse namespace path
-    let namespace_parts: Vec<String> = namespace_str
-        .split('\u{1F}')
-        .map(str::to_string)
-        .collect();
+    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
 
     validate_namespace(&namespace_parts)?;
     validate_table_name(&view_name)?;
@@ -643,10 +635,7 @@ pub async fn drop_view(
     Path((namespace_str, view_name)): Path<(String, String)>,
 ) -> Result<StatusCode> {
     // Parse namespace path
-    let namespace_parts: Vec<String> = namespace_str
-        .split('\u{1F}')
-        .map(str::to_string)
-        .collect();
+    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
 
     validate_namespace(&namespace_parts)?;
     validate_table_name(&view_name)?;
@@ -683,10 +672,7 @@ pub async fn commit_view(
     AxumJson(payload): AxumJson<CommitViewRequest>,
 ) -> Result<axum::response::Response> {
     // Parse namespace path
-    let namespace_parts: Vec<String> = namespace_str
-        .split('\u{1F}')
-        .map(str::to_string)
-        .collect();
+    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
 
     validate_namespace(&namespace_parts)?;
     validate_table_name(&view_name)?;
@@ -729,9 +715,8 @@ pub async fn commit_view(
     for requirement in &payload.requirements {
         match requirement {
             ViewRequirement::AssertViewUuid { uuid } => {
-                let expected_uuid = Uuid::parse_str(uuid).map_err(|_| {
-                    AppError::ValidationError(format!("Invalid UUID: {}", uuid))
-                })?;
+                let expected_uuid = Uuid::parse_str(uuid)
+                    .map_err(|_| AppError::ValidationError(format!("Invalid UUID: {}", uuid)))?;
                 if current_metadata.uuid() != expected_uuid {
                     return Err(AppError::CommitConflict(format!(
                         "View UUID mismatch: expected {}, found {}",
@@ -803,9 +788,9 @@ fn apply_view_update(
 ) -> Result<ViewMetadataBuilder> {
     match update {
         ViewUpdate::AssignUuid { uuid } => Ok(builder.assign_uuid(uuid)),
-        ViewUpdate::UpgradeFormatVersion { format_version } => {
-            builder.upgrade_format_version(format_version).map_err(Into::into)
-        }
+        ViewUpdate::UpgradeFormatVersion { format_version } => builder
+            .upgrade_format_version(format_version)
+            .map_err(Into::into),
         ViewUpdate::AddSchema { schema, .. } => {
             // Note: last_column_id is not supported in ViewMetadataBuilder
             Ok(builder.add_schema(schema))
@@ -818,9 +803,9 @@ fn apply_view_update(
         ViewUpdate::AddViewVersion { view_version } => {
             builder.add_version(view_version).map_err(Into::into)
         }
-        ViewUpdate::SetCurrentViewVersion { view_version_id } => {
-            builder.set_current_version_id(view_version_id).map_err(Into::into)
-        }
+        ViewUpdate::SetCurrentViewVersion { view_version_id } => builder
+            .set_current_version_id(view_version_id)
+            .map_err(Into::into),
     }
 }
 
@@ -842,11 +827,13 @@ pub async fn rename_view(
 
     // Get source namespace owner
     let src_namespace_ident = NamespaceIdent::from_vec(payload.source.namespace.clone())?;
-    let src_owner = get_namespace_owner(&state, &src_namespace_ident, principal.tenant_id()).await?;
+    let src_owner =
+        get_namespace_owner(&state, &src_namespace_ident, principal.tenant_id()).await?;
 
     // Get destination namespace owner
     let dest_namespace_ident = NamespaceIdent::from_vec(payload.destination.namespace.clone())?;
-    let dest_owner = get_namespace_owner(&state, &dest_namespace_ident, principal.tenant_id()).await?;
+    let dest_owner =
+        get_namespace_owner(&state, &dest_namespace_ident, principal.tenant_id()).await?;
 
     // Prevent cross-tenant renames
     if src_owner != dest_owner {
@@ -874,8 +861,16 @@ pub async fn rename_view(
     )?;
 
     tracing::info!(
-        source = format!("{}.{}", payload.source.namespace.join("."), payload.source.name),
-        destination = format!("{}.{}", payload.destination.namespace.join("."), payload.destination.name),
+        source = format!(
+            "{}.{}",
+            payload.source.namespace.join("."),
+            payload.source.name
+        ),
+        destination = format!(
+            "{}.{}",
+            payload.destination.namespace.join("."),
+            payload.destination.name
+        ),
         "Renamed view"
     );
 
@@ -946,13 +941,19 @@ mod tests {
         // Create representations using serde (since ViewRepresentations has private constructor)
         let representations: ViewRepresentations = serde_json::from_value(serde_json::json!([
             {"type": "sql", "sql": "SELECT 1", "dialect": "spark"}
-        ])).unwrap();
+        ]))
+        .unwrap();
 
         // Create a mock ViewMetadata
         let view_creation = ViewCreation::builder()
             .name("view1".to_string())
             .location("/test/view1".to_string())
-            .schema(IcebergSchema::builder().with_fields(vec![]).build().unwrap())
+            .schema(
+                IcebergSchema::builder()
+                    .with_fields(vec![])
+                    .build()
+                    .unwrap(),
+            )
             .default_namespace(NamespaceIdent::new("default".to_string()))
             .representations(representations)
             .build();
@@ -1023,7 +1024,8 @@ mod tests {
 
     #[test]
     fn test_view_requirement_deserialization() {
-        let json = r#"{"type": "assert-view-uuid", "uuid": "550e8400-e29b-41d4-a716-446655440000"}"#;
+        let json =
+            r#"{"type": "assert-view-uuid", "uuid": "550e8400-e29b-41d4-a716-446655440000"}"#;
         let req: ViewRequirement = serde_json::from_str(json).unwrap();
         match req {
             ViewRequirement::AssertViewUuid { uuid } => {

@@ -490,7 +490,9 @@ pub struct CacheStats {
 impl KeyManagementService for CachedKms {
     #[instrument(skip(self), fields(provider = "cached", key_id = %key_id))]
     async fn generate_data_key(&self, key_id: &str) -> Result<DataEncryptionKey> {
-        self.metrics.generate_key_total.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .generate_key_total
+            .fetch_add(1, Ordering::Relaxed);
 
         // Always go to KMS for new key generation
         let result = self.inner.generate_data_key(key_id).await;
@@ -515,7 +517,9 @@ impl KeyManagementService for CachedKms {
 
     #[instrument(skip(self, ciphertext), fields(provider = "cached", key_id = %key_id, ciphertext_len = ciphertext.len()))]
     async fn decrypt_data_key(&self, key_id: &str, ciphertext: &[u8]) -> Result<SecretBytes> {
-        self.metrics.decrypt_key_total.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .decrypt_key_total
+            .fetch_add(1, Ordering::Relaxed);
 
         if !self.config.enabled {
             return self.inner.decrypt_data_key(key_id, ciphertext).await;
@@ -552,7 +556,9 @@ impl KeyManagementService for CachedKms {
 
     #[instrument(skip(self, plaintext), fields(provider = "cached", key_id = %key_id))]
     async fn encrypt_data_key(&self, key_id: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
-        self.metrics.encrypt_key_total.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .encrypt_key_total
+            .fetch_add(1, Ordering::Relaxed);
         self.inner.encrypt_data_key(key_id, plaintext).await
     }
 
@@ -1228,12 +1234,8 @@ impl KeyManagementService for EnvKeyProvider {
         }
 
         // Parse: version (4 bytes) || nonce (12 bytes) || encrypted
-        let version = u32::from_be_bytes([
-            ciphertext[0],
-            ciphertext[1],
-            ciphertext[2],
-            ciphertext[3],
-        ]);
+        let version =
+            u32::from_be_bytes([ciphertext[0], ciphertext[1], ciphertext[2], ciphertext[3]]);
         let nonce = Nonce::from_slice(&ciphertext[4..16]);
         let encrypted = &ciphertext[16..];
 
@@ -1364,8 +1366,8 @@ impl AwsKmsProvider {
 
         // Build AWS config
         let region = aws_sdk_kms::config::Region::new(region_str.clone());
-        let mut config_builder = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(region);
+        let mut config_builder =
+            aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region);
 
         // Apply endpoint override if specified (for LocalStack/testing)
         if let Some(endpoint_url) = endpoint {
@@ -1494,9 +1496,9 @@ impl KeyManagementService for AwsKmsProvider {
             .await
             .map_err(|e| KmsError::OperationFailed(format!("DescribeKey failed: {}", e)))?;
 
-        let metadata = result.key_metadata().ok_or_else(|| {
-            KmsError::KeyNotFound(format!("Key not found: {}", key_id))
-        })?;
+        let metadata = result
+            .key_metadata()
+            .ok_or_else(|| KmsError::KeyNotFound(format!("Key not found: {}", key_id)))?;
 
         // Use creation date epoch seconds as a stable version identifier
         // This changes when the key is rotated (new backing key)
@@ -1638,8 +1640,9 @@ impl VaultKmsProvider {
             .build()
             .map_err(|e| KmsError::ConfigurationError(format!("Invalid Vault settings: {}", e)))?;
 
-        let client = VaultClient::new(settings)
-            .map_err(|e| KmsError::ConfigurationError(format!("Failed to create Vault client: {}", e)))?;
+        let client = VaultClient::new(settings).map_err(|e| {
+            KmsError::ConfigurationError(format!("Failed to create Vault client: {}", e))
+        })?;
 
         // Verify connection and key existence
         let provider = Self {
@@ -1669,8 +1672,8 @@ impl VaultKmsProvider {
         role_id: &str,
         secret_id: &str,
     ) -> Result<Self> {
-        use vaultrs::client::{Client, VaultClient, VaultClientSettingsBuilder};
         use vaultrs::auth::approle;
+        use vaultrs::client::{Client, VaultClient, VaultClientSettingsBuilder};
 
         let address_str = address.into();
         let mount_path_str = mount_path.into();
@@ -1682,8 +1685,9 @@ impl VaultKmsProvider {
             .build()
             .map_err(|e| KmsError::ConfigurationError(format!("Invalid Vault settings: {}", e)))?;
 
-        let mut client = VaultClient::new(settings)
-            .map_err(|e| KmsError::ConfigurationError(format!("Failed to create Vault client: {}", e)))?;
+        let mut client = VaultClient::new(settings).map_err(|e| {
+            KmsError::ConfigurationError(format!("Failed to create Vault client: {}", e))
+        })?;
 
         // Authenticate with AppRole
         let auth_info = approle::login(&client, "approle", role_id, secret_id)
@@ -1718,8 +1722,8 @@ impl VaultKmsProvider {
         role: &str,
         jwt_path: Option<&str>,
     ) -> Result<Self> {
-        use vaultrs::client::{Client, VaultClient, VaultClientSettingsBuilder};
         use vaultrs::auth::kubernetes;
+        use vaultrs::client::{Client, VaultClient, VaultClientSettingsBuilder};
 
         let address_str = address.into();
         let mount_path_str = mount_path.into();
@@ -1736,13 +1740,16 @@ impl VaultKmsProvider {
             .build()
             .map_err(|e| KmsError::ConfigurationError(format!("Invalid Vault settings: {}", e)))?;
 
-        let mut client = VaultClient::new(settings)
-            .map_err(|e| KmsError::ConfigurationError(format!("Failed to create Vault client: {}", e)))?;
+        let mut client = VaultClient::new(settings).map_err(|e| {
+            KmsError::ConfigurationError(format!("Failed to create Vault client: {}", e))
+        })?;
 
         // Authenticate with Kubernetes
         let auth_info = kubernetes::login(&client, "kubernetes", role, &jwt)
             .await
-            .map_err(|e| KmsError::AuthenticationFailed(format!("Kubernetes auth failed: {}", e)))?;
+            .map_err(|e| {
+                KmsError::AuthenticationFailed(format!("Kubernetes auth failed: {}", e))
+            })?;
 
         client.set_token(&auth_info.client_token);
 
@@ -1771,9 +1778,9 @@ impl VaultKmsProvider {
 impl KeyManagementService for VaultKmsProvider {
     #[instrument(skip(self), fields(provider = "vault"))]
     async fn generate_data_key(&self, key_id: &str) -> Result<DataEncryptionKey> {
+        use base64::Engine as _;
         use vaultrs::api::transit::requests::DataKeyType;
         use vaultrs::transit;
-        use base64::Engine as _;
 
         // Use Vault's data_key generation which creates a random key and wraps it atomically
         let response = transit::generate::data_key(
@@ -1786,11 +1793,12 @@ impl KeyManagementService for VaultKmsProvider {
         .await
         .map_err(|e| KmsError::OperationFailed(format!("Failed to generate data key: {}", e)))?;
 
-        let plaintext_b64 = response
-            .plaintext
-            .ok_or_else(|| KmsError::OperationFailed("Vault did not return plaintext".to_string()))?;
+        let plaintext_b64 = response.plaintext.ok_or_else(|| {
+            KmsError::OperationFailed("Vault did not return plaintext".to_string())
+        })?;
 
-        let plaintext = base64::engine::general_purpose::STANDARD.decode(&plaintext_b64)
+        let plaintext = base64::engine::general_purpose::STANDARD
+            .decode(&plaintext_b64)
             .map_err(|e| KmsError::OperationFailed(format!("Invalid base64 from Vault: {}", e)))?;
 
         // Parse version from ciphertext (format: vault:v1:ciphertext)
@@ -1819,11 +1827,12 @@ impl KeyManagementService for VaultKmsProvider {
 
     #[instrument(skip(self, ciphertext), fields(provider = "vault"))]
     async fn decrypt_data_key(&self, key_id: &str, ciphertext: &[u8]) -> Result<SecretBytes> {
-        use vaultrs::transit;
         use base64::Engine as _;
+        use vaultrs::transit;
 
-        let ciphertext_str = String::from_utf8(ciphertext.to_vec())
-            .map_err(|e| KmsError::OperationFailed(format!("Invalid ciphertext encoding: {}", e)))?;
+        let ciphertext_str = String::from_utf8(ciphertext.to_vec()).map_err(|e| {
+            KmsError::OperationFailed(format!("Invalid ciphertext encoding: {}", e))
+        })?;
 
         let decrypt_response = transit::data::decrypt(
             &self.client,
@@ -1835,10 +1844,9 @@ impl KeyManagementService for VaultKmsProvider {
         .await
         .map_err(|e| KmsError::OperationFailed(format!("Failed to decrypt DEK: {}", e)))?;
 
-        let plaintext = base64::engine::general_purpose::STANDARD.decode(
-            &decrypt_response.plaintext,
-        )
-        .map_err(|e| KmsError::OperationFailed(format!("Invalid base64 from Vault: {}", e)))?;
+        let plaintext = base64::engine::general_purpose::STANDARD
+            .decode(&decrypt_response.plaintext)
+            .map_err(|e| KmsError::OperationFailed(format!("Invalid base64 from Vault: {}", e)))?;
 
         tracing::debug!(
             provider = "vault",
@@ -1851,20 +1859,15 @@ impl KeyManagementService for VaultKmsProvider {
 
     #[instrument(skip(self, plaintext), fields(provider = "vault"))]
     async fn encrypt_data_key(&self, key_id: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
-        use vaultrs::transit;
         use base64::Engine as _;
+        use vaultrs::transit;
 
         let plaintext_b64 = base64::engine::general_purpose::STANDARD.encode(plaintext);
 
-        let encrypt_response = transit::data::encrypt(
-            &self.client,
-            &self.mount_path,
-            key_id,
-            &plaintext_b64,
-            None,
-        )
-        .await
-        .map_err(|e| KmsError::OperationFailed(format!("Failed to encrypt DEK: {}", e)))?;
+        let encrypt_response =
+            transit::data::encrypt(&self.client, &self.mount_path, key_id, &plaintext_b64, None)
+                .await
+                .map_err(|e| KmsError::OperationFailed(format!("Failed to encrypt DEK: {}", e)))?;
 
         tracing::debug!(
             provider = "vault",
@@ -1877,8 +1880,8 @@ impl KeyManagementService for VaultKmsProvider {
 
     #[instrument(skip(self), fields(provider = "vault"))]
     async fn current_version(&self, key_id: &str) -> Result<u32> {
-        use vaultrs::transit;
         use vaultrs::api::transit::responses::ReadKeyData;
+        use vaultrs::transit;
 
         let key_info = transit::key::read(&self.client, &self.mount_path, key_id)
             .await
@@ -2028,14 +2031,15 @@ impl GcpKmsProvider {
             .with_auth()
             .await
             .map_err(|e| {
-                KmsError::ConfigurationError(format!("Failed to configure GCP authentication: {}", e))
+                KmsError::ConfigurationError(format!(
+                    "Failed to configure GCP authentication: {}",
+                    e
+                ))
             })?;
 
-        let client = gcloud_kms::client::Client::new(config)
-            .await
-            .map_err(|e| {
-                KmsError::ConfigurationError(format!("Failed to create GCP KMS client: {}", e))
-            })?;
+        let client = gcloud_kms::client::Client::new(config).await.map_err(|e| {
+            KmsError::ConfigurationError(format!("Failed to create GCP KMS client: {}", e))
+        })?;
 
         tracing::info!(
             provider = "gcp-kms",
@@ -2087,11 +2091,11 @@ impl KeyManagementService for GcpKmsProvider {
             additional_authenticated_data_crc32c: None,
         };
 
-        let response = self.client.encrypt(request, None)
+        let response = self
+            .client
+            .encrypt(request, None)
             .await
-            .map_err(|e| {
-                KmsError::OperationFailed(format!("GCP KMS encrypt failed: {}", e))
-            })?;
+            .map_err(|e| KmsError::OperationFailed(format!("GCP KMS encrypt failed: {}", e)))?;
 
         tracing::debug!(
             provider = "gcp-kms",
@@ -2123,11 +2127,11 @@ impl KeyManagementService for GcpKmsProvider {
             additional_authenticated_data_crc32c: None,
         };
 
-        let response = self.client.decrypt(request, None)
+        let response = self
+            .client
+            .decrypt(request, None)
             .await
-            .map_err(|e| {
-                KmsError::OperationFailed(format!("GCP KMS decrypt failed: {}", e))
-            })?;
+            .map_err(|e| KmsError::OperationFailed(format!("GCP KMS decrypt failed: {}", e)))?;
 
         tracing::debug!(
             provider = "gcp-kms",
@@ -2154,11 +2158,11 @@ impl KeyManagementService for GcpKmsProvider {
             additional_authenticated_data_crc32c: None,
         };
 
-        let response = self.client.encrypt(request, None)
+        let response = self
+            .client
+            .encrypt(request, None)
             .await
-            .map_err(|e| {
-                KmsError::OperationFailed(format!("GCP KMS encrypt failed: {}", e))
-            })?;
+            .map_err(|e| KmsError::OperationFailed(format!("GCP KMS encrypt failed: {}", e)))?;
 
         tracing::debug!(
             provider = "gcp-kms",
@@ -2181,7 +2185,9 @@ impl KeyManagementService for GcpKmsProvider {
             name: key_name.clone(),
         };
 
-        let response = self.client.get_crypto_key(request, None)
+        let response = self
+            .client
+            .get_crypto_key(request, None)
             .await
             .map_err(|e| {
                 KmsError::OperationFailed(format!("GCP KMS get_crypto_key failed: {}", e))
@@ -2211,7 +2217,9 @@ impl KeyManagementService for GcpKmsProvider {
             crypto_key_version: None,
         };
 
-        let response = self.client.create_crypto_key_version(request, None)
+        let response = self
+            .client
+            .create_crypto_key_version(request, None)
             .await
             .map_err(|e| {
                 KmsError::OperationFailed(format!("GCP KMS key rotation failed: {}", e))
@@ -2231,7 +2239,7 @@ impl KeyManagementService for GcpKmsProvider {
         }
 
         Err(KmsError::OperationFailed(
-            "Failed to parse key version from rotation response".to_string()
+            "Failed to parse key version from rotation response".to_string(),
         ))
     }
 
@@ -2249,7 +2257,8 @@ impl KeyManagementService for GcpKmsProvider {
             name: key_name.clone(),
         };
 
-        self.client.get_crypto_key(request, None)
+        self.client
+            .get_crypto_key(request, None)
             .await
             .map_err(|e| {
                 KmsError::ServiceUnavailable(format!("GCP KMS health check failed: {}", e))
@@ -2336,17 +2345,15 @@ impl AzureKeyVaultProvider {
     /// - AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID environment variables
     /// - Managed Identity (on Azure VMs/AKS)
     /// - Azure CLI credentials
-    pub async fn new(
-        vault_url: impl Into<String>,
-        key_name: impl Into<String>,
-    ) -> Result<Self> {
+    pub async fn new(vault_url: impl Into<String>, key_name: impl Into<String>) -> Result<Self> {
         let vault_url_str = vault_url.into();
         let key_name_str = key_name.into();
 
         // Create Azure credentials using DefaultAzureCredential
         let credential = azure_identity::DefaultAzureCredential::create(
-            azure_identity::TokenCredentialOptions::default()
-        ).map_err(|e| {
+            azure_identity::TokenCredentialOptions::default(),
+        )
+        .map_err(|e| {
             KmsError::ConfigurationError(format!("Failed to create Azure credentials: {}", e))
         })?;
 
@@ -2354,7 +2361,8 @@ impl AzureKeyVaultProvider {
         let key_client = azure_security_keyvault::KeyClient::new(
             &vault_url_str,
             std::sync::Arc::new(credential),
-        ).map_err(|e| {
+        )
+        .map_err(|e| {
             KmsError::ConfigurationError(format!("Failed to create Azure Key Vault client: {}", e))
         })?;
 
@@ -2378,7 +2386,9 @@ impl AzureKeyVaultProvider {
 impl KeyManagementService for AzureKeyVaultProvider {
     #[instrument(skip(self), fields(provider = "azure-keyvault"))]
     async fn generate_data_key(&self, key_id: &str) -> Result<DataEncryptionKey> {
-        use azure_security_keyvault::prelude::{EncryptParameters, EncryptionAlgorithm, CryptographParamtersEncryption};
+        use azure_security_keyvault::prelude::{
+            CryptographParamtersEncryption, EncryptParameters, EncryptionAlgorithm,
+        };
         use rand::RngCore;
 
         // Generate random 32-byte DEK locally
@@ -2391,14 +2401,19 @@ impl KeyManagementService for AzureKeyVaultProvider {
             plaintext: plaintext.clone(),
             encrypt_parameters_encryption: CryptographParamtersEncryption::Rsa(
                 azure_security_keyvault::prelude::RsaEncryptionParameters::new(
-                    EncryptionAlgorithm::RsaOaep256
-                ).map_err(|e| {
-                    KmsError::OperationFailed(format!("Failed to create encryption parameters: {}", e))
-                })?
+                    EncryptionAlgorithm::RsaOaep256,
+                )
+                .map_err(|e| {
+                    KmsError::OperationFailed(format!(
+                        "Failed to create encryption parameters: {}",
+                        e
+                    ))
+                })?,
             ),
         };
 
-        let response = self.key_client
+        let response = self
+            .key_client
             .encrypt(key_id, encrypt_params)
             .await
             .map_err(|e| {
@@ -2422,20 +2437,27 @@ impl KeyManagementService for AzureKeyVaultProvider {
 
     #[instrument(skip(self, ciphertext), fields(provider = "azure-keyvault"))]
     async fn decrypt_data_key(&self, key_id: &str, ciphertext: &[u8]) -> Result<SecretBytes> {
-        use azure_security_keyvault::prelude::{DecryptParameters, EncryptionAlgorithm, CryptographParamtersEncryption};
+        use azure_security_keyvault::prelude::{
+            CryptographParamtersEncryption, DecryptParameters, EncryptionAlgorithm,
+        };
 
         let decrypt_params = DecryptParameters {
             ciphertext: ciphertext.to_vec(),
             decrypt_parameters_encryption: CryptographParamtersEncryption::Rsa(
                 azure_security_keyvault::prelude::RsaEncryptionParameters::new(
-                    EncryptionAlgorithm::RsaOaep256
-                ).map_err(|e| {
-                    KmsError::OperationFailed(format!("Failed to create decryption parameters: {}", e))
-                })?
+                    EncryptionAlgorithm::RsaOaep256,
+                )
+                .map_err(|e| {
+                    KmsError::OperationFailed(format!(
+                        "Failed to create decryption parameters: {}",
+                        e
+                    ))
+                })?,
             ),
         };
 
-        let response = self.key_client
+        let response = self
+            .key_client
             .decrypt(key_id, decrypt_params)
             .await
             .map_err(|e| {
@@ -2454,20 +2476,27 @@ impl KeyManagementService for AzureKeyVaultProvider {
 
     #[instrument(skip(self, plaintext), fields(provider = "azure-keyvault"))]
     async fn encrypt_data_key(&self, key_id: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
-        use azure_security_keyvault::prelude::{EncryptParameters, EncryptionAlgorithm, CryptographParamtersEncryption};
+        use azure_security_keyvault::prelude::{
+            CryptographParamtersEncryption, EncryptParameters, EncryptionAlgorithm,
+        };
 
         let encrypt_params = EncryptParameters {
             plaintext: plaintext.to_vec(),
             encrypt_parameters_encryption: CryptographParamtersEncryption::Rsa(
                 azure_security_keyvault::prelude::RsaEncryptionParameters::new(
-                    EncryptionAlgorithm::RsaOaep256
-                ).map_err(|e| {
-                    KmsError::OperationFailed(format!("Failed to create encryption parameters: {}", e))
-                })?
+                    EncryptionAlgorithm::RsaOaep256,
+                )
+                .map_err(|e| {
+                    KmsError::OperationFailed(format!(
+                        "Failed to create encryption parameters: {}",
+                        e
+                    ))
+                })?,
             ),
         };
 
-        let response = self.key_client
+        let response = self
+            .key_client
             .encrypt(key_id, encrypt_params)
             .await
             .map_err(|e| {
@@ -2487,17 +2516,14 @@ impl KeyManagementService for AzureKeyVaultProvider {
     #[instrument(skip(self), fields(provider = "azure-keyvault"))]
     async fn current_version(&self, key_id: &str) -> Result<u32> {
         // Verify the key exists by attempting to get it
-        let _key = self.key_client
-            .get(key_id)
-            .await
-            .map_err(|e| {
-                KmsError::OperationFailed(format!("Azure Key Vault get key failed: {}", e))
-            })?;
+        let _key = self.key_client.get(key_id).await.map_err(|e| {
+            KmsError::OperationFailed(format!("Azure Key Vault get key failed: {}", e))
+        })?;
 
         // Azure Key Vault uses UUID-based versions rather than numeric versions.
-        // The version is embedded in the key URL path, but since we're using the 
+        // The version is embedded in the key URL path, but since we're using the
         // latest version by default (when no version is specified in the key name),
-        // we return 1 as a placeholder. For actual version tracking, use the 
+        // we return 1 as a placeholder. For actual version tracking, use the
         // key.properties.attributes or the key URL.
         //
         // Azure automatically uses the latest enabled version when the version
@@ -2523,12 +2549,9 @@ impl KeyManagementService for AzureKeyVaultProvider {
     #[instrument(skip(self), fields(provider = "azure-keyvault"))]
     async fn health_check(&self) -> Result<()> {
         // Verify we can access the key
-        self.key_client
-            .get(&self.key_name)
-            .await
-            .map_err(|e| {
-                KmsError::ServiceUnavailable(format!("Azure Key Vault health check failed: {}", e))
-            })?;
+        self.key_client.get(&self.key_name).await.map_err(|e| {
+            KmsError::ServiceUnavailable(format!("Azure Key Vault health check failed: {}", e))
+        })?;
 
         Ok(())
     }
@@ -2606,44 +2629,68 @@ impl KmsConfig {
         match file_config.provider.as_str() {
             "env" => KmsConfig::Env,
             "aws-kms" => KmsConfig::AwsKms {
-                region: file_config.aws_region.clone().unwrap_or_else(|| "us-east-1".to_string()),
-                key_id: file_config.aws_key_id.clone().unwrap_or_else(|| "alias/rustberg".to_string()),
+                region: file_config
+                    .aws_region
+                    .clone()
+                    .unwrap_or_else(|| "us-east-1".to_string()),
+                key_id: file_config
+                    .aws_key_id
+                    .clone()
+                    .unwrap_or_else(|| "alias/rustberg".to_string()),
                 endpoint: None,
             },
             "vault" => {
-                let address = file_config.vault_address.clone()
+                let address = file_config
+                    .vault_address
+                    .clone()
                     .unwrap_or_else(|| "http://127.0.0.1:8200".to_string());
-                let key_name = file_config.vault_key_name.clone()
+                let key_name = file_config
+                    .vault_key_name
+                    .clone()
                     .unwrap_or_else(|| "rustberg".to_string());
                 // For now, use token auth from environment variable
-                let token = std::env::var("VAULT_TOKEN")
-                    .unwrap_or_else(|_| "myroot".to_string());
-                
+                let token = std::env::var("VAULT_TOKEN").unwrap_or_else(|_| "myroot".to_string());
+
                 KmsConfig::Vault {
                     address,
                     mount_path: "transit".to_string(),
                     key_name,
                     auth: VaultAuth::Token(token),
                 }
-            },
+            }
             "gcp-kms" => KmsConfig::GcpKms {
-                project_id: file_config.gcp_project_id.clone()
+                project_id: file_config
+                    .gcp_project_id
+                    .clone()
                     .unwrap_or_else(|| "my-project".to_string()),
-                location: file_config.gcp_location.clone()
+                location: file_config
+                    .gcp_location
+                    .clone()
                     .unwrap_or_else(|| "global".to_string()),
-                key_ring: file_config.gcp_key_ring.clone()
+                key_ring: file_config
+                    .gcp_key_ring
+                    .clone()
                     .unwrap_or_else(|| "rustberg".to_string()),
-                key_name: file_config.gcp_key_name.clone()
+                key_name: file_config
+                    .gcp_key_name
+                    .clone()
                     .unwrap_or_else(|| "master".to_string()),
             },
             "azure-keyvault" | "azure" => KmsConfig::AzureKeyVault {
-                vault_url: file_config.azure_vault_url.clone()
+                vault_url: file_config
+                    .azure_vault_url
+                    .clone()
                     .unwrap_or_else(|| "https://rustberg.vault.azure.net".to_string()),
-                key_name: file_config.azure_key_name.clone()
+                key_name: file_config
+                    .azure_key_name
+                    .clone()
                     .unwrap_or_else(|| "rustberg-master".to_string()),
             },
             _ => {
-                tracing::warn!("Unknown KMS provider '{}', falling back to 'env'", file_config.provider);
+                tracing::warn!(
+                    "Unknown KMS provider '{}', falling back to 'env'",
+                    file_config.provider
+                );
                 KmsConfig::Env
             }
         }
@@ -2686,24 +2733,20 @@ pub async fn create_kms(
             VaultAuth::Token(token) => {
                 Arc::new(VaultKmsProvider::new(address, mount_path, key_name, token).await?)
             }
-            VaultAuth::AppRole { role_id, secret_id } => {
-                Arc::new(
-                    VaultKmsProvider::with_approle(address, mount_path, key_name, &role_id, &secret_id)
-                        .await?,
-                )
-            }
-            VaultAuth::Kubernetes { role, jwt_path } => {
-                Arc::new(
-                    VaultKmsProvider::with_kubernetes(
-                        address,
-                        mount_path,
-                        key_name,
-                        &role,
-                        Some(&jwt_path),
-                    )
+            VaultAuth::AppRole { role_id, secret_id } => Arc::new(
+                VaultKmsProvider::with_approle(address, mount_path, key_name, &role_id, &secret_id)
                     .await?,
+            ),
+            VaultAuth::Kubernetes { role, jwt_path } => Arc::new(
+                VaultKmsProvider::with_kubernetes(
+                    address,
+                    mount_path,
+                    key_name,
+                    &role,
+                    Some(&jwt_path),
                 )
-            }
+                .await?,
+            ),
         },
 
         #[cfg(not(feature = "vault-kms"))]
@@ -2729,9 +2772,10 @@ pub async fn create_kms(
         }
 
         #[cfg(feature = "azure-kms")]
-        KmsConfig::AzureKeyVault { vault_url, key_name } => {
-            Arc::new(AzureKeyVaultProvider::new(vault_url, key_name).await?)
-        }
+        KmsConfig::AzureKeyVault {
+            vault_url,
+            key_name,
+        } => Arc::new(AzureKeyVaultProvider::new(vault_url, key_name).await?),
 
         #[cfg(not(feature = "azure-kms"))]
         KmsConfig::AzureKeyVault { .. } => {
@@ -2898,24 +2942,20 @@ pub async fn create_resilient_kms(
             VaultAuth::Token(token) => {
                 Arc::new(VaultKmsProvider::new(address, mount_path, key_name, token).await?)
             }
-            VaultAuth::AppRole { role_id, secret_id } => {
-                Arc::new(
-                    VaultKmsProvider::with_approle(address, mount_path, key_name, &role_id, &secret_id)
-                        .await?,
-                )
-            }
-            VaultAuth::Kubernetes { role, jwt_path } => {
-                Arc::new(
-                    VaultKmsProvider::with_kubernetes(
-                        address,
-                        mount_path,
-                        key_name,
-                        &role,
-                        Some(&jwt_path),
-                    )
+            VaultAuth::AppRole { role_id, secret_id } => Arc::new(
+                VaultKmsProvider::with_approle(address, mount_path, key_name, &role_id, &secret_id)
                     .await?,
+            ),
+            VaultAuth::Kubernetes { role, jwt_path } => Arc::new(
+                VaultKmsProvider::with_kubernetes(
+                    address,
+                    mount_path,
+                    key_name,
+                    &role,
+                    Some(&jwt_path),
                 )
-            }
+                .await?,
+            ),
         },
 
         #[cfg(not(feature = "vault-kms"))]
@@ -2941,9 +2981,10 @@ pub async fn create_resilient_kms(
         }
 
         #[cfg(feature = "azure-kms")]
-        KmsConfig::AzureKeyVault { vault_url, key_name } => {
-            Arc::new(AzureKeyVaultProvider::new(vault_url, key_name).await?)
-        }
+        KmsConfig::AzureKeyVault {
+            vault_url,
+            key_name,
+        } => Arc::new(AzureKeyVaultProvider::new(vault_url, key_name).await?),
 
         #[cfg(not(feature = "azure-kms"))]
         KmsConfig::AzureKeyVault { .. } => {
@@ -3039,7 +3080,9 @@ impl EncryptedEnvelope {
         }
 
         // Decrypt the DEK
-        let dek = kms.decrypt_data_key(&self.key_id, &self.wrapped_dek).await?;
+        let dek = kms
+            .decrypt_data_key(&self.key_id, &self.wrapped_dek)
+            .await?;
 
         // Decrypt the data
         let cipher = Aes256Gcm::new_from_slice(dek.expose())
@@ -3572,7 +3615,10 @@ mod tests {
         assert_ne!(rewrapped, dek.ciphertext);
 
         // But decrypt to same plaintext
-        let decrypted = provider.decrypt_data_key("test-key", &rewrapped).await.unwrap();
+        let decrypted = provider
+            .decrypt_data_key("test-key", &rewrapped)
+            .await
+            .unwrap();
         assert_eq!(decrypted.expose(), dek.plaintext.expose());
     }
 
@@ -3597,7 +3643,10 @@ mod tests {
 
         // Operations should work normally
         let dek = retry_kms.generate_data_key("test").await.unwrap();
-        let decrypted = retry_kms.decrypt_data_key("test", &dek.ciphertext).await.unwrap();
+        let decrypted = retry_kms
+            .decrypt_data_key("test", &dek.ciphertext)
+            .await
+            .unwrap();
         assert_eq!(decrypted.expose(), dek.plaintext.expose());
     }
 
@@ -3625,7 +3674,10 @@ mod tests {
 
         // Operations should work normally
         let dek = cb_kms.generate_data_key("test").await.unwrap();
-        let decrypted = cb_kms.decrypt_data_key("test", &dek.ciphertext).await.unwrap();
+        let decrypted = cb_kms
+            .decrypt_data_key("test", &dek.ciphertext)
+            .await
+            .unwrap();
         assert_eq!(decrypted.expose(), dek.plaintext.expose());
 
         // Circuit should still be closed

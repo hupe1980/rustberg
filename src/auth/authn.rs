@@ -32,7 +32,7 @@ pub const AUTHORIZATION_HEADER: &str = "Authorization";
 /// This is verified when no candidates are found to ensure constant-time behavior.
 /// The hash corresponds to the string "timing_attack_dummy_key_never_matches"
 /// with our standard Argon2id parameters (19 MiB, 2 iterations, 1 parallelism).
-const DUMMY_HASH_FOR_TIMING: &str = 
+const DUMMY_HASH_FOR_TIMING: &str =
     "$argon2id$v=19$m=19456,t=2,p=1$YTJiM2M0ZDVlNmY3ZzhoOQ$0X9ULfbvJjTfCNxvkXqWJ9Y7Pz8eS6fQrKhW4mN3dA0";
 
 /// Trait for authenticating incoming requests.
@@ -151,7 +151,7 @@ impl ApiKeyAuthenticator {
         if key.len() > MAX_API_KEY_LENGTH {
             return Err("API key too long");
         }
-        
+
         if key.len() < MIN_API_KEY_LENGTH {
             return Err("API key too short");
         }
@@ -164,7 +164,10 @@ impl ApiKeyAuthenticator {
         // Check that the key material contains only valid base64url characters
         // Valid chars: A-Z, a-z, 0-9, -, _
         let key_material = &key[API_KEY_PREFIX.len()..];
-        if !key_material.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        if !key_material
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
             return Err("API key contains invalid characters");
         }
 
@@ -340,18 +343,18 @@ mod tests {
     #[test]
     fn test_api_key_hashing_argon2() {
         use super::super::store::{hash_api_key, verify_api_key};
-        
+
         let key = "rb_test-api-key-12345";
         let hash1 = hash_api_key(key);
         let hash2 = hash_api_key(key);
 
         // Argon2 hashes are different each time (unique salt)
         assert_ne!(hash1, hash2);
-        
+
         // But both should verify against the original key
         assert!(verify_api_key(key, &hash1));
         assert!(verify_api_key(key, &hash2));
-        
+
         // Hash is in PHC format: $argon2id$v=19$m=...
         assert!(hash1.starts_with("$argon2id$"));
     }
@@ -359,13 +362,13 @@ mod tests {
     #[test]
     fn test_api_key_verification() {
         use super::super::store::{hash_api_key, verify_api_key};
-        
+
         let key = "rb_correct-key-12345";
         let hash = hash_api_key(key);
-        
+
         // Correct key verifies
         assert!(verify_api_key(key, &hash));
-        
+
         // Wrong key doesn't verify
         assert!(!verify_api_key("rb_wrong-key-54321", &hash));
     }
@@ -379,7 +382,10 @@ mod tests {
         // Valid key format: rb_ + base64url characters
         assert!(ApiKeyAuthenticator::validate_key_format("rb_abcdefghij").is_ok());
         assert!(ApiKeyAuthenticator::validate_key_format("rb_ABC123xyz-_").is_ok());
-        assert!(ApiKeyAuthenticator::validate_key_format("rb_0123456789abcdefghijklmnopqrstuvwxyz").is_ok());
+        assert!(ApiKeyAuthenticator::validate_key_format(
+            "rb_0123456789abcdefghijklmnopqrstuvwxyz"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -409,6 +415,7 @@ mod tests {
         assert!(ApiKeyAuthenticator::validate_key_format("rb_abc@def").is_err()); // @
         assert!(ApiKeyAuthenticator::validate_key_format("rb_abc!def").is_err()); // !
         assert!(ApiKeyAuthenticator::validate_key_format("rb_abc+def").is_err()); // + (not base64url)
-        assert!(ApiKeyAuthenticator::validate_key_format("rb_abc/def").is_err()); // / (not base64url)
+        assert!(ApiKeyAuthenticator::validate_key_format("rb_abc/def").is_err());
+        // / (not base64url)
     }
 }

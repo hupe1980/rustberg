@@ -277,7 +277,9 @@ async fn main() {
                         }
                         Err(e) => {
                             tracing::error!("Failed to generate self-signed certificate: {}", e);
-                            tracing::error!("Use --insecure-http to run without TLS (not recommended)");
+                            tracing::error!(
+                                "Use --insecure-http to run without TLS (not recommended)"
+                            );
                             std::process::exit(1);
                         }
                     }
@@ -309,14 +311,18 @@ async fn main() {
                 builder = builder.with_warehouse_location(warehouse);
             }
             // Storage backend URL
-            if !config.storage.backend.is_empty() && config.storage.backend != "file:///var/lib/rustberg/data" {
+            if !config.storage.backend.is_empty()
+                && config.storage.backend != "file:///var/lib/rustberg/data"
+            {
                 builder = builder.with_storage_backend(&config.storage.backend);
             }
             // KMS configuration
             let kms_config = rustberg::crypto::KmsConfig::from_file_config(&config.kms);
             builder = builder.with_kms_config(kms_config);
             // Rate limiting
-            if let Some(rate_config) = rustberg::auth::RateLimitConfig::from_file_config(&config.rate_limit) {
+            if let Some(rate_config) =
+                rustberg::auth::RateLimitConfig::from_file_config(&config.rate_limit)
+            {
                 builder = builder.with_rate_limit_config(rate_config);
             }
             // CORS
@@ -343,14 +349,18 @@ async fn main() {
                     builder = builder.with_warehouse_location(warehouse);
                 }
                 // Storage backend URL
-                if !config.storage.backend.is_empty() && config.storage.backend != "file:///var/lib/rustberg/data" {
+                if !config.storage.backend.is_empty()
+                    && config.storage.backend != "file:///var/lib/rustberg/data"
+                {
                     builder = builder.with_storage_backend(&config.storage.backend);
                 }
                 // KMS configuration
                 let kms_config = rustberg::crypto::KmsConfig::from_file_config(&config.kms);
                 builder = builder.with_kms_config(kms_config);
                 // Rate limiting
-                if let Some(rate_config) = rustberg::auth::RateLimitConfig::from_file_config(&config.rate_limit) {
+                if let Some(rate_config) =
+                    rustberg::auth::RateLimitConfig::from_file_config(&config.rate_limit)
+                {
                     builder = builder.with_rate_limit_config(rate_config);
                 }
                 // CORS
@@ -473,20 +483,20 @@ fn generate_dev_certificate(host: &str) -> Result<TlsConfig, String> {
     // Create a temporary directory for the certificates
     let temp_dir = std::env::temp_dir().join("rustberg_tls");
     std::fs::create_dir_all(&temp_dir).map_err(|e| format!("Failed to create temp dir: {}", e))?;
-    
+
     let cert_path = temp_dir.join("dev_server.crt");
     let key_path = temp_dir.join("dev_server.key");
-    
+
     // Determine the common name - use localhost if binding to 0.0.0.0 or 127.0.0.1
     let common_name = if host == "0.0.0.0" || host == "127.0.0.1" {
         "localhost"
     } else {
         host
     };
-    
+
     rustberg::server::write_self_signed_cert(common_name, &cert_path, &key_path)
         .map_err(|e| format!("Failed to generate certificate: {}", e))?;
-    
+
     Ok(TlsConfig {
         cert_path: cert_path.to_string_lossy().to_string(),
         key_path: key_path.to_string_lossy().to_string(),
@@ -496,9 +506,9 @@ fn generate_dev_certificate(host: &str) -> Result<TlsConfig, String> {
 /// Generates a sample configuration file.
 fn generate_config(output: Option<&std::path::Path>) {
     use rustberg::config::RustbergConfig;
-    
+
     let sample = RustbergConfig::sample();
-    
+
     match output {
         Some(path) => {
             if let Err(e) = std::fs::write(path, &sample) {
@@ -518,12 +528,12 @@ fn generate_config(output: Option<&std::path::Path>) {
 /// Generates the OpenAPI specification.
 fn generate_openapi(format: &str, output: Option<&std::path::Path>) {
     use rustberg::openapi::ApiDoc;
-    
+
     let spec = match format.to_lowercase().as_str() {
         "yaml" | "yml" => ApiDoc::yaml(),
         _ => ApiDoc::json(),
     };
-    
+
     match output {
         Some(path) => {
             if let Err(e) = std::fs::write(path, &spec) {
@@ -749,7 +759,7 @@ fn restore_catalog(input: &str, data_dir: &str, force: bool) {
 
         // Construct the full destination path
         let dest_path = extract_path.join(&entry_path);
-        
+
         // SECURITY: Validate that the resolved path is within the extract directory
         // This prevents path traversal attacks (Zip Slip) via paths like "../../../etc/passwd"
         let canonical_dest = match dest_path.parent() {
@@ -834,12 +844,12 @@ fn validate_backup(input: &str) {
                     Ok(e) => {
                         file_count += 1;
                         total_size += e.size();
-                        
+
                         let path = e.path().unwrap_or_default();
                         let path_str = path.to_string_lossy();
-                        
+
                         // Check for SlateDB files (SST, manifest, etc.)
-                        if path_str.contains("manifest") 
+                        if path_str.contains("manifest")
                             || path_str.contains("compacted")
                             || path_str.ends_with(".sst")
                             || path_str.contains("wal")
@@ -861,9 +871,7 @@ fn validate_backup(input: &str) {
     }
 
     // Get compressed size
-    let compressed_size = std::fs::metadata(input_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let compressed_size = std::fs::metadata(input_path).map(|m| m.len()).unwrap_or(0);
 
     println!("\n✅ Backup is valid!");
     println!("┌─────────────────────────────────────────────────────────┐");
@@ -873,7 +881,14 @@ fn validate_backup(input: &str) {
     println!("│ Compressed size: {:<38}│", format_bytes(compressed_size));
     println!("│ Uncompressed:    {:<38}│", format_bytes(total_size));
     println!("│ Files:           {:<38}│", file_count);
-    println!("│ SlateDB data:    {:<38}│", if has_slatedb_files { "✓ Present" } else { "✗ Missing" });
+    println!(
+        "│ SlateDB data:    {:<38}│",
+        if has_slatedb_files {
+            "✓ Present"
+        } else {
+            "✗ Missing"
+        }
+    );
     println!("└─────────────────────────────────────────────────────────┘");
 
     if !has_slatedb_files {
@@ -894,7 +909,7 @@ fn show_status(data_dir: &str) {
 
     // Version info
     println!("Version:     {}", env!("CARGO_PKG_VERSION"));
-    
+
     // Check data directory
     if !data_path.exists() {
         println!("Data Dir:    {} (not found)", data_dir);
@@ -905,7 +920,7 @@ fn show_status(data_dir: &str) {
     // Calculate directory size
     let mut total_size: u64 = 0;
     let mut file_count: u64 = 0;
-    
+
     if let Ok(entries) = fs::read_dir(data_path) {
         for entry in entries.flatten() {
             if let Ok(metadata) = entry.metadata() {
@@ -979,7 +994,7 @@ async fn run_benchmarks(iterations: u32) {
     // Benchmark 1: API Key generation (includes Argon2id hashing)
     println!("📊 API Key Generation (Argon2id)");
     let mut keygen_times: Vec<Duration> = Vec::with_capacity(iterations as usize);
-    
+
     for i in 0..iterations {
         let start = Instant::now();
         let _key = rustberg::auth::ApiKeyBuilder::new(format!("bench-{}", i), "benchmark")
@@ -993,7 +1008,7 @@ async fn run_benchmarks(iterations: u32) {
     let keygen_avg = keygen_times.iter().sum::<Duration>() / iterations;
     let keygen_min = keygen_times.iter().min().unwrap_or(&Duration::ZERO);
     let keygen_max = keygen_times.iter().max().unwrap_or(&Duration::ZERO);
-    
+
     println!("   Min: {:?}", keygen_min);
     println!("   Max: {:?}", keygen_max);
     println!("   Avg: {:?}", keygen_avg);
@@ -1004,9 +1019,9 @@ async fn run_benchmarks(iterations: u32) {
     let (_key, plaintext) = rustberg::auth::ApiKeyBuilder::new("verify-test", "benchmark")
         .with_role("reader")
         .build();
-    
+
     let mut verify_times: Vec<Duration> = Vec::with_capacity(iterations as usize);
-    
+
     for _ in 0..iterations {
         let start = Instant::now();
         let _hash = rustberg::auth::hash_api_key(&plaintext);
@@ -1018,7 +1033,7 @@ async fn run_benchmarks(iterations: u32) {
     let verify_avg = verify_times.iter().sum::<Duration>() / iterations;
     let verify_min = verify_times.iter().min().unwrap_or(&Duration::ZERO);
     let verify_max = verify_times.iter().max().unwrap_or(&Duration::ZERO);
-    
+
     println!("   Min: {:?}", verify_min);
     println!("   Max: {:?}", verify_max);
     println!("   Avg: {:?}", verify_avg);
@@ -1027,7 +1042,7 @@ async fn run_benchmarks(iterations: u32) {
     // Benchmark 3: OpenAPI generation
     println!("📊 OpenAPI Spec Generation");
     let mut openapi_times: Vec<Duration> = Vec::with_capacity(iterations as usize);
-    
+
     for _ in 0..iterations {
         let start = Instant::now();
         let _spec = rustberg::openapi::ApiDoc::yaml();
@@ -1035,11 +1050,11 @@ async fn run_benchmarks(iterations: u32) {
         print!(".");
     }
     println!();
-    
+
     let openapi_avg = openapi_times.iter().sum::<Duration>() / iterations;
     let openapi_min = openapi_times.iter().min().unwrap_or(&Duration::ZERO);
     let openapi_max = openapi_times.iter().max().unwrap_or(&Duration::ZERO);
-    
+
     println!("   Min: {:?}", openapi_min);
     println!("   Max: {:?}", openapi_max);
     println!("   Avg: {:?}", openapi_avg);
@@ -1049,7 +1064,7 @@ async fn run_benchmarks(iterations: u32) {
     println!("📊 TOML Config Parsing");
     let sample_config = rustberg::config::RustbergConfig::sample();
     let mut config_times: Vec<Duration> = Vec::with_capacity(iterations as usize);
-    
+
     for _ in 0..iterations {
         let start = Instant::now();
         let _config: rustberg::config::RustbergConfig = match toml::from_str(&sample_config) {
@@ -1067,7 +1082,7 @@ async fn run_benchmarks(iterations: u32) {
     let config_avg = config_times.iter().sum::<Duration>() / iterations;
     let config_min = config_times.iter().min().unwrap_or(&Duration::ZERO);
     let config_max = config_times.iter().max().unwrap_or(&Duration::ZERO);
-    
+
     println!("   Min: {:?}", config_min);
     println!("   Max: {:?}", config_max);
     println!("   Avg: {:?}", config_avg);

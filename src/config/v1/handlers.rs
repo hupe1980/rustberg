@@ -79,7 +79,10 @@ mod tests {
     fn test_config_query_with_warehouse() {
         let json = r#"{"warehouse": "s3://my-bucket/warehouse"}"#;
         let query: ConfigQuery = serde_json::from_str(json).unwrap();
-        assert_eq!(query.warehouse, Some("s3://my-bucket/warehouse".to_string()));
+        assert_eq!(
+            query.warehouse,
+            Some("s3://my-bucket/warehouse".to_string())
+        );
     }
 
     // ========================================================================
@@ -151,4 +154,5 @@ mod tests {
         // Verify endpoints have correct format (METHOD path)
         assert!(endpoints[0].as_str().unwrap().starts_with("GET "));
         assert!(endpoints[1].as_str().unwrap().starts_with("HEAD "));
-    }}
+    }
+}

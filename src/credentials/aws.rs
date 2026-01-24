@@ -237,8 +237,7 @@ impl AwsStsCredentialProviderBuilder {
         tenant_id: impl Into<String>,
         role_arn: impl Into<String>,
     ) -> Self {
-        self.tenant_roles
-            .insert(tenant_id.into(), role_arn.into());
+        self.tenant_roles.insert(tenant_id.into(), role_arn.into());
         self
     }
 
@@ -320,10 +319,7 @@ mod tests {
             .with_allowed_prefix("s3://bucket2/");
 
         assert_eq!(config.region, "us-west-2");
-        assert_eq!(
-            config.role_arn,
-            "arn:aws:iam::123456789012:role/TestRole"
-        );
+        assert_eq!(config.role_arn, "arn:aws:iam::123456789012:role/TestRole");
         assert_eq!(config.external_id, Some("ext-123".to_string()));
         assert_eq!(config.duration_seconds, 1800);
         assert_eq!(config.allowed_prefixes.len(), 2);

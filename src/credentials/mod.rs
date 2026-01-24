@@ -20,16 +20,16 @@
 //! - Credentials should be scoped to the minimum required permissions
 //! - Session names should include audit information (tenant, table)
 
-mod provider;
 #[cfg(feature = "aws-credentials")]
 pub mod aws;
 mod azure;
 #[cfg(feature = "gcp-credentials")]
 mod gcs;
+mod provider;
 
 pub use provider::{
-    NoopCredentialProvider, StorageCredential, StorageCredentialProvider,
-    StorageCredentialRequest, StorageCredentialVendingError,
+    NoopCredentialProvider, StorageCredential, StorageCredentialProvider, StorageCredentialRequest,
+    StorageCredentialVendingError,
 };
 
 #[cfg(feature = "aws-credentials")]

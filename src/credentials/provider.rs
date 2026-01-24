@@ -76,10 +76,7 @@ impl StorageCredential {
     ) -> Self {
         let mut config = HashMap::new();
         config.insert("s3.access-key-id".to_string(), access_key_id.into());
-        config.insert(
-            "s3.secret-access-key".to_string(),
-            secret_access_key.into(),
-        );
+        config.insert("s3.secret-access-key".to_string(), secret_access_key.into());
         if let Some(token) = session_token {
             config.insert("s3.session-token".to_string(), token);
         }

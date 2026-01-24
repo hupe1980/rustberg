@@ -2,9 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use dashmap::DashMap;
-use jsonwebtoken::{
-    decode, decode_header, Algorithm, DecodingKey, TokenData, Validation,
-};
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, TokenData, Validation};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
@@ -36,12 +34,12 @@ struct Jwk {
 /// Standard JWT claims that we validate
 #[derive(Debug, Serialize, Deserialize)]
 struct StandardClaims {
-    sub: String,                // Subject (user ID)
-    iss: String,                // Issuer
-    aud: StringOrVec,           // Audience
-    exp: u64,                   // Expiration time
-    iat: Option<u64>,           // Issued at
-    nbf: Option<u64>,           // Not before
+    sub: String,      // Subject (user ID)
+    iss: String,      // Issuer
+    aud: StringOrVec, // Audience
+    exp: u64,         // Expiration time
+    iat: Option<u64>, // Issued at
+    nbf: Option<u64>, // Not before
 }
 
 /// Custom claims we extract from JWT
@@ -49,20 +47,20 @@ struct StandardClaims {
 struct CustomClaims {
     #[serde(flatten)]
     standard: StandardClaims,
-    
+
     // Custom claims for Rustberg
     #[serde(default)]
     tenant_id: Option<String>,
-    
+
     #[serde(default)]
     roles: Vec<String>,
-    
+
     #[serde(default)]
     name: Option<String>,
-    
+
     #[serde(default)]
     email: Option<String>,
-    
+
     // Additional claims (stored but not used for authz)
     #[serde(flatten)]
     extra: HashMap<String, serde_json::Value>,
@@ -91,25 +89,25 @@ impl StringOrVec {
 pub struct JwtConfig {
     /// OIDC issuer URL (e.g., "https://accounts.google.com")
     pub issuer: String,
-    
+
     /// Expected audience (e.g., "rustberg-api")
     pub audience: String,
-    
+
     /// JWKS endpoint URL (e.g., "https://accounts.google.com/.well-known/jwks.json")
     pub jwks_url: String,
-    
+
     /// Default tenant ID if not in JWT claims
     pub default_tenant_id: String,
-    
+
     /// Claim name for tenant ID (default: "tenant_id")
     pub tenant_claim: String,
-    
+
     /// Claim name for roles (default: "roles")
     pub roles_claim: String,
-    
+
     /// JWKS cache TTL (default: 1 hour)
     pub jwks_cache_ttl: Duration,
-    
+
     /// Allowed algorithms (default: RS256 only)
     pub allowed_algorithms: Vec<Algorithm>,
 }
@@ -166,15 +164,15 @@ impl JwtAuthenticator {
             ));
         }
         if config.jwks_url.is_empty() {
-            return Err(AuthError::Configuration(
-                "JWKS URL is required".to_string(),
-            ));
+            return Err(AuthError::Configuration("JWKS URL is required".to_string()));
         }
 
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .map_err(|e| AuthError::Configuration(format!("Failed to create HTTP client: {}", e)))?;
+            .map_err(|e| {
+                AuthError::Configuration(format!("Failed to create HTTP client: {}", e))
+            })?;
 
         Ok(Self {
             config,
@@ -357,10 +355,7 @@ impl JwtAuthenticator {
 
 #[async_trait::async_trait]
 impl Authenticator for JwtAuthenticator {
-    async fn authenticate(
-        &self,
-        headers: &axum::http::HeaderMap,
-    ) -> Result<Principal, AuthError> {
+    async fn authenticate(&self, headers: &axum::http::HeaderMap) -> Result<Principal, AuthError> {
         // Extract token from Authorization header
         let token = match Self::extract_token(headers) {
             Some(t) => t,

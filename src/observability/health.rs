@@ -144,10 +144,7 @@ impl ReadinessStatus {
         let check_timeout = Duration::from_secs(5);
 
         // Check catalog connectivity by attempting to list root namespaces
-        let catalog = match timeout(
-            check_timeout,
-            state.catalog.list_namespaces(None)
-        ).await {
+        let catalog = match timeout(check_timeout, state.catalog.list_namespaces(None)).await {
             Ok(Ok(_)) => ComponentStatus::ready(),
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "Catalog health check failed");
@@ -320,7 +317,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_readiness_all_ready() {
-        use crate::auth::{AllowAllAuthenticator, AllowAllAuthorizer, RateLimiter, RateLimitConfig};
+        use crate::auth::{
+            AllowAllAuthenticator, AllowAllAuthorizer, RateLimitConfig, RateLimiter,
+        };
         use crate::catalog::{ExtendedCatalog, IdempotencyCache, ViewStorage};
         use crate::credentials::NoopCredentialProvider;
         use iceberg::memory::MemoryCatalogBuilder;
@@ -330,7 +329,7 @@ mod tests {
 
         let mut props = HashMap::new();
         props.insert("warehouse".to_string(), "memory://test".to_string());
-        
+
         let catalog: iceberg::MemoryCatalog = MemoryCatalogBuilder::default()
             .load("memory", props)
             .await

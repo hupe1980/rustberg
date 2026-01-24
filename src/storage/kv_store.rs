@@ -182,7 +182,11 @@ pub trait KvStore: Send + Sync + Debug {
     async fn write_batch(&self, batch: WriteBatch) -> KvResult<()>;
 
     /// Execute a batch with options.
-    async fn write_batch_with_options(&self, batch: WriteBatch, opts: WriteOptions) -> KvResult<()> {
+    async fn write_batch_with_options(
+        &self,
+        batch: WriteBatch,
+        opts: WriteOptions,
+    ) -> KvResult<()> {
         // Default implementation ignores options
         let _ = opts;
         self.write_batch(batch).await

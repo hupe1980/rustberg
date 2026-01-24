@@ -66,9 +66,7 @@ pub struct ApiKey {
 impl ApiKey {
     /// Checks if this key has expired.
     pub fn is_expired(&self) -> bool {
-        self.expires_at
-            .map(|exp| Utc::now() > exp)
-            .unwrap_or(false)
+        self.expires_at.map(|exp| Utc::now() > exp).unwrap_or(false)
     }
 }
 
@@ -138,8 +136,8 @@ impl ApiKeyBuilder {
     /// Uses Argon2id for secure password hashing.
     pub fn build(self) -> (ApiKey, String) {
         let plaintext_key = generate_api_key();
-        let key_prefix = extract_key_prefix(&plaintext_key)
-            .expect("Generated key should have valid prefix");
+        let key_prefix =
+            extract_key_prefix(&plaintext_key).expect("Generated key should have valid prefix");
         let key_hash = hash_api_key(&plaintext_key);
 
         let api_key = ApiKey {
@@ -328,20 +326,14 @@ impl InMemoryApiKeyStore {
 
         // Store the key
         self.keys_by_id.insert(id, key);
-        
+
         // Add to prefix index (allows collisions)
-        self.keys_by_prefix
-            .entry(prefix)
-            .or_default()
-            .push(id);
-            
+        self.keys_by_prefix.entry(prefix).or_default().push(id);
+
         self.usage_counters.insert(id, AtomicU64::new(0));
 
         // Add to tenant index
-        self.keys_by_tenant
-            .entry(tenant)
-            .or_default()
-            .push(id);
+        self.keys_by_tenant.entry(tenant).or_default().push(id);
 
         Ok(())
     }
@@ -503,7 +495,8 @@ mod tests {
         // Retrieve by prefix and verify with Argon2
         let candidates = store.get_by_prefix(&key_prefix).await;
         assert_eq!(candidates.len(), 1);
-        let retrieved = candidates.into_iter()
+        let retrieved = candidates
+            .into_iter()
             .find(|k| verify_api_key(test_key, &k.key_hash));
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().name, "test-key");
@@ -559,7 +552,8 @@ mod tests {
         assert_eq!(candidates.len(), 2);
 
         // Can verify the correct one with Argon2
-        let found = candidates.iter()
+        let found = candidates
+            .iter()
             .find(|k| verify_api_key("rb_same-prefix-key1", &k.key_hash));
         assert!(found.is_some());
         assert_eq!(found.unwrap().name, "key-1");

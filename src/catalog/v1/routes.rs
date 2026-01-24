@@ -52,10 +52,7 @@ pub fn create_routes(app_state: AppState) -> Router {
             get(load_table).post(commit_table),
         )
         .route("/namespaces/{namespace}/tables/{table}", head(table_exists))
-        .route(
-            "/namespaces/{namespace}/tables/{table}",
-            delete(drop_table),
-        )
+        .route("/namespaces/{namespace}/tables/{table}", delete(drop_table))
         // Credentials endpoint for vending storage access credentials
         .route(
             "/namespaces/{namespace}/tables/{table}/credentials",

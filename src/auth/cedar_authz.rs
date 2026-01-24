@@ -61,7 +61,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use super::authz::{Action, AuthzContext, AuthzDecision, Authorizer, Resource, ResourceType};
+use super::authz::{Action, Authorizer, AuthzContext, AuthzDecision, Resource, ResourceType};
 use super::error::{AuthError, Result};
 
 // ============================================================================
@@ -156,9 +156,9 @@ impl PolicyStore {
             );"#,
         )
         .map_err(|e| AuthError::Internal(format!("Invalid default policy: {}", e)))?;
-        policy_set.add(system_policy).map_err(|e| {
-            AuthError::Internal(format!("Failed to add system policy: {}", e))
-        })?;
+        policy_set
+            .add(system_policy)
+            .map_err(|e| AuthError::Internal(format!("Failed to add system policy: {}", e)))?;
 
         // Default policy: Admins have full access within their tenant
         let admin_policy = Policy::parse(
@@ -174,9 +174,9 @@ impl PolicyStore {
             };"#,
         )
         .map_err(|e| AuthError::Internal(format!("Invalid admin policy: {}", e)))?;
-        policy_set.add(admin_policy).map_err(|e| {
-            AuthError::Internal(format!("Failed to add admin policy: {}", e))
-        })?;
+        policy_set
+            .add(admin_policy)
+            .map_err(|e| AuthError::Internal(format!("Failed to add admin policy: {}", e)))?;
 
         // Default policy: Readers can list and read
         let reader_policy = Policy::parse(
@@ -192,9 +192,9 @@ impl PolicyStore {
             };"#,
         )
         .map_err(|e| AuthError::Internal(format!("Invalid reader policy: {}", e)))?;
-        policy_set.add(reader_policy).map_err(|e| {
-            AuthError::Internal(format!("Failed to add reader policy: {}", e))
-        })?;
+        policy_set
+            .add(reader_policy)
+            .map_err(|e| AuthError::Internal(format!("Failed to add reader policy: {}", e)))?;
 
         // Default policy: Writers can create and update
         let writer_policy = Policy::parse(
@@ -210,9 +210,9 @@ impl PolicyStore {
             };"#,
         )
         .map_err(|e| AuthError::Internal(format!("Invalid writer policy: {}", e)))?;
-        policy_set.add(writer_policy).map_err(|e| {
-            AuthError::Internal(format!("Failed to add writer policy: {}", e))
-        })?;
+        policy_set
+            .add(writer_policy)
+            .map_err(|e| AuthError::Internal(format!("Failed to add writer policy: {}", e)))?;
 
         Ok(Self {
             policies: Arc::new(RwLock::new(policy_set)),
@@ -242,14 +242,14 @@ impl PolicyStore {
     /// Removes a policy from the store.
     pub async fn remove_policy(&self, id: &str) -> Result<()> {
         let mut policies = self.policies.write().await;
-        
+
         // Convert PolicySet to Vec, filter, and rebuild
         let current_policies: Vec<_> = policies.policies().cloned().collect();
         let mut new_policy_set = PolicySet::new();
-        
+
         let policy_id_to_remove = PolicyId::from_str(id)
             .map_err(|e| AuthError::Internal(format!("Invalid policy ID: {}", e)))?;
-        
+
         for policy in current_policies {
             if policy.id() != &policy_id_to_remove {
                 new_policy_set.add(policy).map_err(|e| {
@@ -257,7 +257,7 @@ impl PolicyStore {
                 })?;
             }
         }
-        
+
         *policies = new_policy_set;
         Ok(())
     }
@@ -265,18 +265,13 @@ impl PolicyStore {
     /// Lists all policy IDs in the store.
     pub async fn list_policies(&self) -> Vec<String> {
         let policies = self.policies.read().await;
-        policies
-            .policies()
-            .map(|p| p.id().to_string())
-            .collect()
+        policies.policies().map(|p| p.id().to_string()).collect()
     }
 
     /// Gets a policy by ID.
     pub async fn get_policy(&self, id: &str) -> Option<String> {
         let policies = self.policies.read().await;
-        let policy = policies
-            .policies()
-            .find(|p| p.id().to_string() == id)?;
+        let policy = policies.policies().find(|p| p.id().to_string() == id)?;
         Some(policy.to_string())
     }
 
@@ -332,7 +327,7 @@ impl CedarAuthorizer {
             .map_err(|e| AuthError::Internal(format!("Invalid action type: {}", e)))?;
         let entity_id = EntityId::from_str(action_name)
             .map_err(|e| AuthError::Internal(format!("Invalid action ID: {}", e)))?;
-        
+
         Ok(EntityUid::from_type_name_and_id(type_name, entity_id))
     }
 
@@ -340,24 +335,34 @@ impl CedarAuthorizer {
     fn resource_to_cedar(resource: &Resource) -> Result<EntityUid> {
         let (resource_type_name, resource_id) = match resource.resource_type {
             ResourceType::Namespace => {
-                let id = resource.namespace.as_ref()
+                let id = resource
+                    .namespace
+                    .as_ref()
                     .map(|ns| ns.join("/"))
                     .unwrap_or_else(|| "root".to_string());
                 ("Namespace", id)
             }
             ResourceType::Table => {
-                let ns = resource.namespace.as_ref()
+                let ns = resource
+                    .namespace
+                    .as_ref()
                     .map(|ns| ns.join("/"))
                     .unwrap_or_else(|| "root".to_string());
-                let name = resource.name.as_ref()
+                let name = resource
+                    .name
+                    .as_ref()
                     .ok_or_else(|| AuthError::Internal("Table resource missing name".into()))?;
                 ("Table", format!("{}/{}", ns, name))
             }
             ResourceType::View => {
-                let ns = resource.namespace.as_ref()
+                let ns = resource
+                    .namespace
+                    .as_ref()
                     .map(|ns| ns.join("/"))
                     .unwrap_or_else(|| "root".to_string());
-                let name = resource.name.as_ref()
+                let name = resource
+                    .name
+                    .as_ref()
                     .ok_or_else(|| AuthError::Internal("View resource missing name".into()))?;
                 ("View", format!("{}/{}", ns, name))
             }
@@ -371,7 +376,7 @@ impl CedarAuthorizer {
             .map_err(|e| AuthError::Internal(format!("Invalid resource type: {}", e)))?;
         let entity_id = EntityId::from_str(&resource_id)
             .map_err(|e| AuthError::Internal(format!("Invalid resource ID: {}", e)))?;
-        
+
         Ok(EntityUid::from_type_name_and_id(type_name, entity_id))
     }
 
@@ -447,20 +452,20 @@ impl Authorizer for CedarAuthorizer {
         // needed for proper lifetime handling
         let decision = {
             let policies = self.policy_store.policies().await;
-            let response = self.authorizer.is_authorized(&request, &policies, &entities);
+            let response = self
+                .authorizer
+                .is_authorized(&request, &policies, &entities);
             response.decision().clone()
         };
 
         match decision {
             Decision::Allow => AuthzDecision::Allow,
-            Decision::Deny => {
-                AuthzDecision::Deny(format!(
-                    "Access denied: principal '{}' does not have '{}' permission on '{}'",
-                    ctx.principal.id(),
-                    ctx.action,
-                    ctx.resource.resource_type
-                ))
-            }
+            Decision::Deny => AuthzDecision::Deny(format!(
+                "Access denied: principal '{}' does not have '{}' permission on '{}'",
+                ctx.principal.id(),
+                ctx.action,
+                ctx.resource.resource_type
+            )),
         }
     }
 }
@@ -505,7 +510,7 @@ mod tests {
     async fn test_policy_store_creation() {
         let store = PolicyStore::new().unwrap();
         let policies = store.list_policies().await;
-        
+
         // Should have default policies
         assert!(policies.contains(&"system-full-access".to_string()));
         assert!(policies.contains(&"admin-full-access".to_string()));
@@ -516,7 +521,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_custom_policy() {
         let store = PolicyStore::new().unwrap();
-        
+
         let custom_policy = r#"
             permit(
                 principal,
@@ -526,9 +531,12 @@ mod tests {
                 principal.roles.contains("viewer")
             };
         "#;
-        
-        store.add_policy("viewer-read".to_string(), custom_policy).await.unwrap();
-        
+
+        store
+            .add_policy("viewer-read".to_string(), custom_policy)
+            .await
+            .unwrap();
+
         let policies = store.list_policies().await;
         assert!(policies.contains(&"viewer-read".to_string()));
     }
@@ -536,7 +544,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_policy() {
         let store = PolicyStore::new().unwrap();
-        
+
         let custom_policy = r#"
             permit(
                 principal,
@@ -546,12 +554,21 @@ mod tests {
                 principal.roles.contains("deleter")
             };
         "#;
-        
-        store.add_policy("deleter-policy".to_string(), custom_policy).await.unwrap();
-        assert!(store.list_policies().await.contains(&"deleter-policy".to_string()));
-        
+
+        store
+            .add_policy("deleter-policy".to_string(), custom_policy)
+            .await
+            .unwrap();
+        assert!(store
+            .list_policies()
+            .await
+            .contains(&"deleter-policy".to_string()));
+
         store.remove_policy("deleter-policy").await.unwrap();
-        assert!(!store.list_policies().await.contains(&"deleter-policy".to_string()));
+        assert!(!store
+            .list_policies()
+            .await
+            .contains(&"deleter-policy".to_string()));
     }
 
     #[tokio::test]
@@ -646,6 +663,9 @@ mod tests {
 
         let ctx = AuthzContext::new(principal, resource, Action::Manage);
         let decision = authorizer.authorize(&ctx).await;
-        assert!(decision.is_allowed(), "System principal should have full access");
+        assert!(
+            decision.is_allowed(),
+            "System principal should have full access"
+        );
     }
 }

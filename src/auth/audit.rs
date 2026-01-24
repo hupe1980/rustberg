@@ -352,11 +352,7 @@ impl AuditEvent {
     }
 
     /// Sets the table resource.
-    pub fn with_table<S1: Into<String>, S2: Into<String>>(
-        self,
-        namespace: S1,
-        table: S2,
-    ) -> Self {
+    pub fn with_table<S1: Into<String>, S2: Into<String>>(self, namespace: S1, table: S2) -> Self {
         let resource_id = format!("{}.{}", namespace.into(), table.into());
         self.with_resource("table", resource_id)
     }
@@ -579,7 +575,10 @@ mod tests {
         assert_eq!(event.tenant_id, Some("tenant-456".to_string()));
         assert_eq!(event.client_ip, Some("192.168.1.1".to_string()));
         assert_eq!(event.request_id, Some("req-789".to_string()));
-        assert_eq!(event.details.get("api_key_prefix"), Some(&"rb_".to_string()));
+        assert_eq!(
+            event.details.get("api_key_prefix"),
+            Some(&"rb_".to_string())
+        );
     }
 
     #[test]
@@ -588,10 +587,7 @@ mod tests {
             .with_table("my_namespace", "my_table");
 
         assert_eq!(event.resource_type, Some("table".to_string()));
-        assert_eq!(
-            event.resource_id,
-            Some("my_namespace.my_table".to_string())
-        );
+        assert_eq!(event.resource_id, Some("my_namespace.my_table".to_string()));
     }
 
     #[test]
@@ -608,12 +604,12 @@ mod tests {
 
     #[test]
     fn test_audit_outcome_affects_severity() {
-        let denied = AuditEvent::authorization(AuditAction::AccessDenied)
-            .with_outcome(AuditOutcome::Denied);
+        let denied =
+            AuditEvent::authorization(AuditAction::AccessDenied).with_outcome(AuditOutcome::Denied);
         assert_eq!(denied.severity, AuditSeverity::Warning);
 
-        let failure = AuditEvent::authentication(AuditAction::ApiKeyAuth)
-            .with_outcome(AuditOutcome::Failure);
+        let failure =
+            AuditEvent::authentication(AuditAction::ApiKeyAuth).with_outcome(AuditOutcome::Failure);
         assert_eq!(failure.severity, AuditSeverity::Error);
     }
 
@@ -652,9 +648,7 @@ mod tests {
 
         // Check ISO format contains expected components
         assert!(event.timestamp_iso.contains("T"));
-        assert!(
-            event.timestamp_iso.contains("Z") || event.timestamp_iso.contains("+")
-        );
+        assert!(event.timestamp_iso.contains("Z") || event.timestamp_iso.contains("+"));
 
         // Timestamp should be reasonable (after year 2020)
         assert!(event.timestamp > 1577836800000); // Jan 1, 2020

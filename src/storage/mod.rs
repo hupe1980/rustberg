@@ -37,14 +37,16 @@
 //!   value: "file:///data/rustberg"
 //! ```
 
-pub mod kv_store;
 pub mod kv_api_key_store;
+pub mod kv_store;
 
 #[cfg(feature = "slatedb-storage")]
 pub mod slatedb_store;
 
-pub use kv_store::{KvError, KvResult, KvStore, KvStoreConfig, MemoryKvStore, WriteBatch, KeyValue};
 pub use kv_api_key_store::{KvApiKeyStore, StorageError, StorageResult};
+pub use kv_store::{
+    KeyValue, KvError, KvResult, KvStore, KvStoreConfig, MemoryKvStore, WriteBatch,
+};
 
 #[cfg(feature = "slatedb-storage")]
 pub use slatedb_store::SlateDbStore;

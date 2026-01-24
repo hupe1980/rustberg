@@ -81,12 +81,10 @@ impl PaginationQuery {
 
         // Find starting position based on cursor
         let start_index = match &cursor {
-            Some(cursor_key) => {
-                items
-                    .iter()
-                    .position(|item| cursor_fn(item) > *cursor_key)
-                    .unwrap_or(items.len())
-            }
+            Some(cursor_key) => items
+                .iter()
+                .position(|item| cursor_fn(item) > *cursor_key)
+                .unwrap_or(items.len()),
             None => 0,
         };
 
@@ -242,7 +240,7 @@ mod tests {
     #[test]
     fn test_paginate_second_page() {
         let items: Vec<i32> = (1..=10).collect();
-        
+
         // First page
         let query1 = PaginationQuery {
             page_token: None,

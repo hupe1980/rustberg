@@ -5,8 +5,8 @@ pub mod idempotency;
 pub mod pagination;
 #[cfg(feature = "slatedb-storage")]
 mod slate_catalog;
-pub mod validation;
 mod v1;
+pub mod validation;
 
 use axum::Router;
 

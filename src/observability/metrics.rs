@@ -48,7 +48,7 @@ pub struct MetricsRegistry {
     pub requests_post: Counter,
     pub requests_delete: Counter,
     pub requests_head: Counter,
-    
+
     // Catalog operation counters
     pub catalog_list_namespaces: Counter,
     pub catalog_create_namespace: Counter,
@@ -61,16 +61,16 @@ pub struct MetricsRegistry {
     pub catalog_register_table: Counter,
     pub catalog_rename_table: Counter,
     pub catalog_operation_errors: Counter,
-    
+
     // Auth counters
     pub auth_api_key_success: Counter,
     pub auth_api_key_failure: Counter,
     pub auth_jwt_success: Counter,
     pub auth_jwt_failure: Counter,
-    
+
     // Rate limiting
     pub rate_limit_exceeded: Counter,
-    
+
     // Error counters by type
     pub errors_400: Counter,
     pub errors_401: Counter,
@@ -91,7 +91,7 @@ impl MetricsRegistry {
     pub fn render(&self) -> String {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()  // Safe: returns Duration::ZERO if clock is before epoch
+            .unwrap_or_default() // Safe: returns Duration::ZERO if clock is before epoch
             .as_secs();
 
         format!(
@@ -244,7 +244,7 @@ mod tests {
         registry.requests_get.inc();
         registry.requests_get.inc();
         registry.auth_api_key_success.inc();
-        
+
         let output = registry.render();
 
         // Verify Prometheus format basics
@@ -254,10 +254,12 @@ mod tests {
         assert!(output.contains("rustberg_requests_total"));
         assert!(output.contains("rustberg_auth_attempts_total"));
         assert!(output.contains("rustberg_rate_limit_exceeded_total"));
-        
+
         // Verify counters have correct values
         assert!(output.contains(r#"rustberg_requests_total{method="GET"} 2"#));
-        assert!(output.contains(r#"rustberg_auth_attempts_total{method="api_key",result="success"} 1"#));
+        assert!(
+            output.contains(r#"rustberg_auth_attempts_total{method="api_key",result="success"} 1"#)
+        );
     }
 
     #[test]

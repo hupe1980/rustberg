@@ -101,10 +101,7 @@ impl KvApiKeyStore {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new(
-        kv: Arc<dyn KvStore>,
-        encryption: Option<Arc<dyn EncryptionProvider>>,
-    ) -> Self {
+    pub fn new(kv: Arc<dyn KvStore>, encryption: Option<Arc<dyn EncryptionProvider>>) -> Self {
         let encryption = encryption.unwrap_or_else(|| Arc::new(NoopEncryptionProvider));
         Self { kv, encryption }
     }
@@ -187,7 +184,13 @@ impl KvApiKeyStore {
 
         // Check if key already exists
         let id_key = Self::key_by_id(&api_key.id);
-        if self.kv.get(&id_key).await.map_err(Self::map_kv_error)?.is_some() {
+        if self
+            .kv
+            .get(&id_key)
+            .await
+            .map_err(Self::map_kv_error)?
+            .is_some()
+        {
             return Err(StorageError::AlreadyExists(api_key.id.to_string()));
         }
 
@@ -209,7 +212,10 @@ impl KvApiKeyStore {
             encrypted,
         );
 
-        self.kv.write_batch(batch).await.map_err(Self::map_kv_error)?;
+        self.kv
+            .write_batch(batch)
+            .await
+            .map_err(Self::map_kv_error)?;
         Ok(())
     }
 
@@ -235,7 +241,11 @@ impl KvApiKeyStore {
     /// for verification via Argon2.
     async fn get_by_prefix_internal(&self, key_prefix: &str) -> StorageResult<Vec<ApiKey>> {
         let scan_prefix = Self::prefix_scan_key(key_prefix);
-        let entries = self.kv.scan_prefix(&scan_prefix).await.map_err(Self::map_kv_error)?;
+        let entries = self
+            .kv
+            .scan_prefix(&scan_prefix)
+            .await
+            .map_err(Self::map_kv_error)?;
 
         let mut keys = Vec::new();
         for entry in entries {
@@ -254,19 +264,21 @@ impl KvApiKeyStore {
     /// List all API keys for a specific tenant.
     async fn list_by_tenant_internal(&self, tenant_id: &str) -> StorageResult<Vec<ApiKey>> {
         let prefix = Self::tenant_prefix(tenant_id);
-        let entries = self.kv.scan_prefix(&prefix).await.map_err(Self::map_kv_error)?;
+        let entries = self
+            .kv
+            .scan_prefix(&prefix)
+            .await
+            .map_err(Self::map_kv_error)?;
 
         let mut keys = Vec::new();
         for entry in entries {
             match self.decrypt(&entry.value) {
-                Ok(decrypted) => {
-                    match serde_json::from_slice::<ApiKey>(&decrypted) {
-                        Ok(api_key) => keys.push(api_key),
-                        Err(e) => {
-                            tracing::warn!("Failed to deserialize API key: {}", e);
-                        }
+                Ok(decrypted) => match serde_json::from_slice::<ApiKey>(&decrypted) {
+                    Ok(api_key) => keys.push(api_key),
+                    Err(e) => {
+                        tracing::warn!("Failed to deserialize API key: {}", e);
                     }
-                }
+                },
                 Err(e) => {
                     tracing::warn!("Failed to decrypt API key: {}", e);
                 }
@@ -283,7 +295,13 @@ impl KvApiKeyStore {
 
         // Verify key exists
         let id_key = Self::key_by_id(&api_key.id);
-        if self.kv.get(&id_key).await.map_err(Self::map_kv_error)?.is_none() {
+        if self
+            .kv
+            .get(&id_key)
+            .await
+            .map_err(Self::map_kv_error)?
+            .is_none()
+        {
             return Err(StorageError::NotFound(api_key.id.to_string()));
         }
 
@@ -301,7 +319,10 @@ impl KvApiKeyStore {
 
         // Note: We don't update the prefix index because the prefix never changes
 
-        self.kv.write_batch(batch).await.map_err(Self::map_kv_error)?;
+        self.kv
+            .write_batch(batch)
+            .await
+            .map_err(Self::map_kv_error)?;
         Ok(())
     }
 
@@ -323,7 +344,10 @@ impl KvApiKeyStore {
         batch.delete(Self::key_by_prefix(&api_key.key_prefix, id));
         batch.delete(Self::key_by_tenant(&api_key.tenant_id, id));
 
-        self.kv.write_batch(batch).await.map_err(Self::map_kv_error)?;
+        self.kv
+            .write_batch(batch)
+            .await
+            .map_err(Self::map_kv_error)?;
         Ok(())
     }
 }
@@ -331,7 +355,9 @@ impl KvApiKeyStore {
 #[async_trait]
 impl ApiKeyStore for KvApiKeyStore {
     async fn get_by_prefix(&self, key_prefix: &str) -> Vec<ApiKey> {
-        self.get_by_prefix_internal(key_prefix).await.unwrap_or_default()
+        self.get_by_prefix_internal(key_prefix)
+            .await
+            .unwrap_or_default()
     }
 
     async fn get_by_id(&self, id: &Uuid) -> Option<ApiKey> {
@@ -339,7 +365,9 @@ impl ApiKeyStore for KvApiKeyStore {
     }
 
     async fn list_for_tenant(&self, tenant_id: &str) -> Vec<ApiKey> {
-        self.list_by_tenant_internal(tenant_id).await.unwrap_or_default()
+        self.list_by_tenant_internal(tenant_id)
+            .await
+            .unwrap_or_default()
     }
 
     async fn store(&self, key: ApiKey) -> Result<(), String> {

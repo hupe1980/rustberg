@@ -67,14 +67,17 @@ impl IdempotencyKey {
     /// Creates a new idempotency key with scope.
     pub fn new(key: impl Into<String>, method: &str, path: &str) -> Option<Self> {
         let key = key.into();
-        
+
         // Validate key length
         if key.is_empty() || key.len() > MAX_KEY_LENGTH {
             return None;
         }
 
         // Validate key characters (alphanumeric, hyphens, underscores)
-        if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        if !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
             return None;
         }
 
@@ -224,22 +227,22 @@ impl IdempotencyCache {
     /// Removes approximately 10% of entries (oldest by cached_at time).
     fn evict_oldest(&self) {
         let evict_count = MAX_CACHE_SIZE / 10;
-        
+
         // Collect entries with their age
         let mut entries: Vec<(IdempotencyKey, Instant)> = self
             .cache
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().cached_at))
             .collect();
-        
+
         // Sort by cached_at (oldest first)
         entries.sort_by_key(|(_, cached_at)| *cached_at);
-        
+
         // Remove the oldest entries
         for (key, _) in entries.into_iter().take(evict_count) {
             self.cache.remove(&key);
         }
-        
+
         tracing::debug!(
             evicted = evict_count,
             remaining = self.cache.len(),
@@ -263,7 +266,8 @@ impl IdempotencyCache {
     ///
     /// Call this periodically to prevent unbounded memory growth.
     pub fn cleanup(&self) {
-        self.cache.retain(|_, response| !response.is_expired(self.ttl));
+        self.cache
+            .retain(|_, response| !response.is_expired(self.ttl));
     }
 
     /// Returns the number of cached entries.
@@ -350,7 +354,7 @@ mod tests {
         assert!(IdempotencyKey::new("", "POST", "/v1/tables").is_none()); // Empty
         assert!(IdempotencyKey::new("key with spaces", "POST", "/v1/tables").is_none()); // Spaces
         assert!(IdempotencyKey::new("key@symbol", "POST", "/v1/tables").is_none()); // Invalid char
-        
+
         // Too long
         let long_key = "a".repeat(MAX_KEY_LENGTH + 1);
         assert!(IdempotencyKey::new(&long_key, "POST", "/v1/tables").is_none());
@@ -469,7 +473,9 @@ mod tests {
         let response = CachedResponse::from_json(StatusCode::CREATED, &value).unwrap();
         assert_eq!(response.status, StatusCode::CREATED);
         assert_eq!(response.content_type, Some("application/json".to_string()));
-        assert!(std::str::from_utf8(&response.body).unwrap().contains("success"));
+        assert!(std::str::from_utf8(&response.body)
+            .unwrap()
+            .contains("success"));
     }
 
     #[test]
@@ -491,7 +497,7 @@ mod tests {
         // Adding more entries should trigger eviction when we hit MAX_CACHE_SIZE
         // For unit testing, we just verify the evict_oldest function works
         cache.evict_oldest();
-        
+
         // Should have evicted ~10% of entries
         assert!(cache.len() < test_size);
     }

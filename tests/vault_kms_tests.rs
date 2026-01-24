@@ -91,8 +91,15 @@ async fn test_vault_kms_provider_basic_operations() {
         .await
         .expect("Failed to generate data key");
 
-    assert_eq!(dek.plaintext.expose().len(), 32, "DEK should be 32 bytes (256 bits)");
-    assert!(!dek.ciphertext.is_empty(), "Encrypted DEK should not be empty");
+    assert_eq!(
+        dek.plaintext.expose().len(),
+        32,
+        "DEK should be 32 bytes (256 bits)"
+    );
+    assert!(
+        !dek.ciphertext.is_empty(),
+        "Encrypted DEK should not be empty"
+    );
     assert!(dek.version >= 1, "Version should be at least 1");
 
     // Test decryption of the wrapped key
@@ -251,8 +258,11 @@ async fn test_vault_kms_connection_error() {
     )
     .await;
 
-    assert!(result.is_err(), "Should fail to connect to non-existent Vault");
-    
+    assert!(
+        result.is_err(),
+        "Should fail to connect to non-existent Vault"
+    );
+
     let err = result.unwrap_err();
     println!("Expected error: {}", err);
 }
@@ -287,7 +297,10 @@ async fn test_vault_kms_concurrent_operations() {
         .expect("Failed to enable transit");
 
     client
-        .post(format!("{}/v1/transit/keys/concurrent-test-key", vault_addr))
+        .post(format!(
+            "{}/v1/transit/keys/concurrent-test-key",
+            vault_addr
+        ))
         .header("X-Vault-Token", root_token)
         .json(&serde_json::json!({"type": "aes256-gcm96"}))
         .send()
@@ -312,7 +325,7 @@ async fn test_vault_kms_concurrent_operations() {
         let provider = Arc::clone(&provider);
         let handle = tokio::spawn(async move {
             let data = format!("concurrent-data-{}", i);
-            
+
             // Generate a data key
             let dek = provider
                 .generate_data_key("concurrent-test-key")

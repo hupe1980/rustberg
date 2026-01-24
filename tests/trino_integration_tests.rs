@@ -73,7 +73,10 @@ impl RustbergTestServer {
             sleep(Duration::from_millis(100)).await;
         }
 
-        Self { port, _handle: handle }
+        Self {
+            port,
+            _handle: handle,
+        }
     }
 
     fn catalog_url(&self) -> String {
@@ -278,8 +281,11 @@ async fn trino_can_create_and_query_table() {
     println!("Insert result: {:?}", insert_result);
 
     // Query data
-    let select_result =
-        trino_query(&trino_url, "SELECT * FROM iceberg.analytics.events ORDER BY event_id").await;
+    let select_result = trino_query(
+        &trino_url,
+        "SELECT * FROM iceberg.analytics.events ORDER BY event_id",
+    )
+    .await;
 
     println!("Select result: {:?}", select_result);
 

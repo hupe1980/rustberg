@@ -27,7 +27,9 @@
 //!           value: "us-east-1"
 //! ```
 
-use super::kv_store::{BatchOperation, KeyValue, KvError, KvResult, KvStore, WriteBatch, WriteOptions};
+use super::kv_store::{
+    BatchOperation, KeyValue, KvError, KvResult, KvStore, WriteBatch, WriteOptions,
+};
 use async_trait::async_trait;
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, Settings};
@@ -298,8 +300,8 @@ fn increment_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
 
 /// Parses an object store URL and returns the appropriate ObjectStore and path.
 fn parse_object_store_url(url: &str) -> KvResult<(Arc<dyn ObjectStore>, String)> {
-    use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::local::LocalFileSystem;
+    use slatedb::object_store::memory::InMemory;
 
     if url.starts_with("memory://") {
         let path = url.strip_prefix("memory://").unwrap_or("/");
@@ -319,8 +321,8 @@ fn parse_object_store_url(url: &str) -> KvResult<(Arc<dyn ObjectStore>, String)>
     #[cfg(feature = "slatedb-storage")]
     {
         use slatedb::object_store::aws::AmazonS3Builder;
-        use slatedb::object_store::gcp::GoogleCloudStorageBuilder;
         use slatedb::object_store::azure::MicrosoftAzureBuilder;
+        use slatedb::object_store::gcp::GoogleCloudStorageBuilder;
 
         if url.starts_with("s3://") {
             let without_scheme = url.strip_prefix("s3://").unwrap();

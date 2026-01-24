@@ -58,9 +58,7 @@ async fn make_request(
 ) -> (StatusCode, String) {
     let router = app.clone().into_router();
 
-    let mut request_builder = Request::builder()
-        .method(method)
-        .uri(uri);
+    let mut request_builder = Request::builder().method(method).uri(uri);
 
     if let Some(key) = api_key {
         request_builder = request_builder.header("X-API-Key", key);
@@ -133,14 +131,8 @@ async fn test_valid_api_key_authenticates() {
 
     store.store(api_key).await.expect("Failed to store key");
 
-    let (status, _body) = make_request(
-        &app,
-        Method::GET,
-        "/v1/config",
-        Some(&plaintext_key),
-        None,
-    )
-    .await;
+    let (status, _body) =
+        make_request(&app, Method::GET, "/v1/config", Some(&plaintext_key), None).await;
 
     assert_eq!(status, StatusCode::OK);
 }
@@ -158,14 +150,8 @@ async fn test_expired_api_key_returns_401() {
 
     store.store(api_key).await.expect("Failed to store key");
 
-    let (status, _body) = make_request(
-        &app,
-        Method::GET,
-        "/v1/config",
-        Some(&plaintext_key),
-        None,
-    )
-    .await;
+    let (status, _body) =
+        make_request(&app, Method::GET, "/v1/config", Some(&plaintext_key), None).await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
@@ -182,14 +168,8 @@ async fn test_disabled_api_key_returns_401() {
     api_key.enabled = false;
     store.store(api_key).await.expect("Failed to store key");
 
-    let (status, _body) = make_request(
-        &app,
-        Method::GET,
-        "/v1/config",
-        Some(&plaintext_key),
-        None,
-    )
-    .await;
+    let (status, _body) =
+        make_request(&app, Method::GET, "/v1/config", Some(&plaintext_key), None).await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
@@ -384,7 +364,10 @@ async fn test_kv_api_key_store_operations() {
         .build();
 
     let key_id = api_key.id;
-    store.store(api_key.clone()).await.expect("Failed to store key");
+    store
+        .store(api_key.clone())
+        .await
+        .expect("Failed to store key");
 
     // Verify it's stored by ID
     let retrieved_by_id = store.get_by_id(&key_id).await;
@@ -392,13 +375,14 @@ async fn test_kv_api_key_store_operations() {
     assert_eq!(retrieved_by_id.unwrap().name, "persistent-key");
 
     // Verify by prefix lookup
-    let key_prefix = rustberg::auth::extract_key_prefix(&plaintext_key)
-        .expect("Should extract prefix");
+    let key_prefix =
+        rustberg::auth::extract_key_prefix(&plaintext_key).expect("Should extract prefix");
     let candidates = store.get_by_prefix(&key_prefix).await;
     assert!(!candidates.is_empty(), "Should find key by prefix");
 
     // Verify with Argon2
-    let retrieved = candidates.into_iter()
+    let retrieved = candidates
+        .into_iter()
         .find(|k| rustberg::auth::verify_api_key(&plaintext_key, &k.key_hash))
         .expect("Key should verify with Argon2");
 
@@ -448,10 +432,14 @@ async fn test_kv_api_key_store_concurrent_access() {
     for i in 0..10 {
         let store_clone = store.clone();
         tasks.spawn(async move {
-            let (api_key, _) = ApiKeyBuilder::new(format!("concurrent-key-{}", i), "tenant-concurrent")
-                .with_role("user")
-                .build();
-            store_clone.store(api_key).await.expect("Failed to store key");
+            let (api_key, _) =
+                ApiKeyBuilder::new(format!("concurrent-key-{}", i), "tenant-concurrent")
+                    .with_role("user")
+                    .build();
+            store_clone
+                .store(api_key)
+                .await
+                .expect("Failed to store key");
         });
     }
 
@@ -551,24 +539,24 @@ async fn test_auth_context_returns_principal_info() {
     assert_eq!(status, StatusCode::OK);
 
     let response: serde_json::Value = serde_json::from_str(&body).expect("Invalid JSON");
-    
+
     // Verify principal info (id is the key's UUID, not the name)
     assert_eq!(response["principal"]["id"], expected_id);
     assert_eq!(response["principal"]["name"], "context-test-key");
     assert_eq!(response["principal"]["tenant_id"], "tenant-context");
     assert_eq!(response["principal"]["principal_type"], "api_key");
     assert_eq!(response["principal"]["auth_method"], "api_key");
-    
+
     // Verify roles are present
     let roles = response["principal"]["roles"].as_array().unwrap();
     assert!(roles.contains(&json!("admin")));
     assert!(roles.contains(&json!("reader")));
-    
+
     // Verify capabilities structure exists
     assert!(response["capabilities"]["catalog"].is_object());
     assert!(response["capabilities"]["namespaces"].is_object());
     assert!(response["capabilities"]["tables"].is_object());
-    
+
     // Admin should have is_admin = true
     assert_eq!(response["capabilities"]["is_admin"], true);
 }
@@ -611,14 +599,14 @@ async fn test_auth_context_reader_not_admin() {
     assert_eq!(status, StatusCode::OK);
 
     let response: serde_json::Value = serde_json::from_str(&body).expect("Invalid JSON");
-    
+
     // Reader should not be admin
     assert_eq!(response["capabilities"]["is_admin"], false);
-    
+
     // Reader should have read capabilities
     assert_eq!(response["capabilities"]["namespaces"]["list"], true);
     assert_eq!(response["capabilities"]["namespaces"]["read"], true);
-    
+
     // Reader should not have write capabilities
     assert_eq!(response["capabilities"]["namespaces"]["create"], false);
     assert_eq!(response["capabilities"]["namespaces"]["delete"], false);
@@ -721,7 +709,8 @@ async fn test_get_namespace_properties() {
     )
     .await;
 
-    let (status, body) = make_request(&app, Method::GET, "/v1/namespaces/prop-test", None, None).await;
+    let (status, body) =
+        make_request(&app, Method::GET, "/v1/namespaces/prop-test", None, None).await;
 
     assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_str(&body).expect("Invalid JSON");
@@ -761,14 +750,8 @@ async fn test_delete_namespace() {
     assert_eq!(delete_status, StatusCode::NO_CONTENT);
 
     // Verify it's gone
-    let (get_status, _) = make_request(
-        &app,
-        Method::GET,
-        "/v1/namespaces/delete-test",
-        None,
-        None,
-    )
-    .await;
+    let (get_status, _) =
+        make_request(&app, Method::GET, "/v1/namespaces/delete-test", None, None).await;
 
     assert_eq!(get_status, StatusCode::NOT_FOUND);
 }
@@ -813,14 +796,8 @@ async fn test_update_namespace_properties() {
     assert_eq!(update_status, StatusCode::OK);
 
     // Verify update
-    let (get_status, get_body) = make_request(
-        &app,
-        Method::GET,
-        "/v1/namespaces/update-test",
-        None,
-        None,
-    )
-    .await;
+    let (get_status, get_body) =
+        make_request(&app, Method::GET, "/v1/namespaces/update-test", None, None).await;
 
     assert_eq!(get_status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_str(&get_body).expect("Invalid JSON");
@@ -1091,10 +1068,12 @@ async fn test_commit_table_set_properties() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    
+
     // Parse table metadata to get UUID for requirement
     let create_response: serde_json::Value = serde_json::from_str(&body).expect("Invalid JSON");
-    let table_uuid = create_response["metadata"]["table-uuid"].as_str().expect("No table UUID");
+    let table_uuid = create_response["metadata"]["table-uuid"]
+        .as_str()
+        .expect("No table UUID");
 
     // Commit: Set properties
     let commit_body = json!({
@@ -1124,10 +1103,16 @@ async fn test_commit_table_set_properties() {
     )
     .await;
 
-    assert_eq!(commit_status, StatusCode::OK, "Commit failed: {}", commit_body);
-    
+    assert_eq!(
+        commit_status,
+        StatusCode::OK,
+        "Commit failed: {}",
+        commit_body
+    );
+
     // Verify the response contains updated metadata
-    let commit_response: serde_json::Value = serde_json::from_str(&commit_body).expect("Invalid JSON");
+    let commit_response: serde_json::Value =
+        serde_json::from_str(&commit_body).expect("Invalid JSON");
     assert!(commit_response["metadata-location"].is_string());
     assert!(commit_response["metadata"]["properties"]["custom.prop1"].as_str() == Some("value1"));
     assert!(commit_response["metadata"]["properties"]["custom.prop2"].as_str() == Some("value2"));
@@ -1204,7 +1189,11 @@ async fn test_commit_table_uuid_requirement_fails() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::CONFLICT, "Expected 409 Conflict for UUID mismatch");
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "Expected 409 Conflict for UUID mismatch"
+    );
 }
 
 // ============================================================================
@@ -1215,14 +1204,8 @@ async fn test_commit_table_uuid_requirement_fails() {
 async fn test_namespace_not_found() {
     let (app, _state) = create_test_app_no_auth().await;
 
-    let (status, _body) = make_request(
-        &app,
-        Method::GET,
-        "/v1/namespaces/nonexistent",
-        None,
-        None,
-    )
-    .await;
+    let (status, _body) =
+        make_request(&app, Method::GET, "/v1/namespaces/nonexistent", None, None).await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
@@ -1331,24 +1314,18 @@ async fn test_namespace_pagination() {
     }
 
     // List with small page size
-    let (status, body) = make_request(
-        &app,
-        Method::GET,
-        "/v1/namespaces?pageSize=2",
-        None,
-        None,
-    )
-    .await;
+    let (status, body) =
+        make_request(&app, Method::GET, "/v1/namespaces?pageSize=2", None, None).await;
     assert_eq!(status, StatusCode::OK);
-    
+
     let response: serde_json::Value = serde_json::from_str(&body).unwrap();
     let namespaces = response["namespaces"].as_array().unwrap();
     assert_eq!(namespaces.len(), 2);
-    
+
     // Should have next page token
     assert!(response["next-page-token"].is_string());
     let page_token = response["next-page-token"].as_str().unwrap();
-    
+
     // Fetch second page
     let (status, body) = make_request(
         &app,
@@ -1359,7 +1336,7 @@ async fn test_namespace_pagination() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    
+
     let response: serde_json::Value = serde_json::from_str(&body).unwrap();
     let namespaces = response["namespaces"].as_array().unwrap();
     assert_eq!(namespaces.len(), 2);
@@ -1414,11 +1391,11 @@ async fn test_table_pagination() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    
+
     let response: serde_json::Value = serde_json::from_str(&body).unwrap();
     let tables = response["identifiers"].as_array().unwrap();
     assert_eq!(tables.len(), 2);
-    
+
     // Should have next page token
     assert!(response["next-page-token"].is_string());
 }
@@ -1448,10 +1425,13 @@ async fn test_idempotency_key_on_create_namespace() {
 
     let response1 = router.clone().oneshot(request1).await.unwrap();
     assert_eq!(response1.status(), StatusCode::OK);
-    
+
     // Check that idempotency key was used
     assert_eq!(
-        response1.headers().get("idempotency-key-used").map(|v| v.to_str().unwrap()),
+        response1
+            .headers()
+            .get("idempotency-key-used")
+            .map(|v| v.to_str().unwrap()),
         Some("true")
     );
 
@@ -1468,7 +1448,10 @@ async fn test_idempotency_key_on_create_namespace() {
     // Should succeed with cached response (not conflict)
     assert_eq!(response2.status(), StatusCode::OK);
     assert_eq!(
-        response2.headers().get("idempotency-key-used").map(|v| v.to_str().unwrap()),
+        response2
+            .headers()
+            .get("idempotency-key-used")
+            .map(|v| v.to_str().unwrap()),
         Some("true")
     );
 }
@@ -1514,7 +1497,7 @@ async fn test_idempotency_key_on_create_table() {
 
     let response1 = router.clone().oneshot(request1).await.unwrap();
     assert_eq!(response1.status(), StatusCode::OK);
-    
+
     // Second request with same idempotency key should return cached response
     let request2 = Request::builder()
         .method(Method::POST)
@@ -1596,7 +1579,7 @@ async fn test_report_metrics_endpoint() {
 }
 
 // ============================================================================
-// Transaction Commit Tests  
+// Transaction Commit Tests
 // ============================================================================
 
 #[tokio::test]
@@ -1684,7 +1667,7 @@ async fn test_request_id_header_propagation() {
 
     let response = router.clone().oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    
+
     // Verify request ID header is present in response
     assert!(response.headers().contains_key("x-request-id"));
 }
@@ -1706,7 +1689,9 @@ async fn test_security_headers_present() {
     // Verify security headers
     let headers = response.headers();
     assert_eq!(
-        headers.get("x-content-type-options").map(|v| v.to_str().unwrap()),
+        headers
+            .get("x-content-type-options")
+            .map(|v| v.to_str().unwrap()),
         Some("nosniff")
     );
     assert_eq!(
@@ -1730,8 +1715,13 @@ async fn test_content_type_json_response() {
 
     let response = router.clone().oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    
-    let content_type = response.headers().get("content-type").unwrap().to_str().unwrap();
+
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(content_type.contains("application/json"));
 }
 
@@ -1750,7 +1740,7 @@ async fn test_accept_encoding_compression() {
 
     let response = router.clone().oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    
+
     // Response may or may not be compressed depending on size threshold
     // but the request should succeed
 }
@@ -1767,15 +1757,15 @@ async fn test_rate_limiter_is_enabled() {
     // Note: In tests without actual network connections, client_ip is None
     // so rate limit headers won't be added. This test verifies the rate limiter
     // is configured and enabled.
-    
+
     // Check rate limiter configuration - verify it exists
     let _rate_limiter = &state.rate_limiter;
-    
+
     // The rate limiter should be enabled by default for API key auth apps
     // We can't directly test headers in unit tests without mocking the connection
     // but we verify the limiter exists and the app builds correctly
     assert!(!state.warehouse_location.is_empty());
-    
+
     // Also verify the router builds without error
     let _router = app.into_router();
 }
@@ -1803,14 +1793,8 @@ async fn test_search_returns_empty_for_empty_catalog() {
         .build();
     store.store(api_key).await.unwrap();
 
-    let (status, body) = make_request(
-        &app,
-        Method::GET,
-        "/v1/search",
-        Some(&plaintext_key),
-        None,
-    )
-    .await;
+    let (status, body) =
+        make_request(&app, Method::GET, "/v1/search", Some(&plaintext_key), None).await;
 
     assert_eq!(status, StatusCode::OK);
 
@@ -1871,13 +1855,14 @@ async fn test_search_finds_namespaces() {
 
     let response: serde_json::Value = serde_json::from_str(&body).unwrap();
     let results = response["results"].as_array().unwrap();
-    
+
     // Should find both namespaces
     assert_eq!(results.len(), 2);
     assert_eq!(response["totalCount"], 2);
-    
+
     // Check that both namespaces are present
-    let names: Vec<&str> = results.iter()
+    let names: Vec<&str> = results
+        .iter()
         .map(|r| r["name"].as_str().unwrap())
         .collect();
     assert!(names.contains(&"sales"));
@@ -1927,7 +1912,7 @@ async fn test_search_with_query_filter() {
 
     let response: serde_json::Value = serde_json::from_str(&body).unwrap();
     let results = response["results"].as_array().unwrap();
-    
+
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["name"], "sales_data");
 }
@@ -1968,7 +1953,7 @@ async fn test_search_respects_limit() {
 
     let response: serde_json::Value = serde_json::from_str(&body).unwrap();
     let results = response["results"].as_array().unwrap();
-    
+
     // Should only return 2 results but totalCount should be 5
     assert_eq!(results.len(), 2);
     assert_eq!(response["totalCount"], 5);
@@ -2011,38 +1996,24 @@ async fn test_search_tenant_isolation() {
     .await;
 
     // Tenant 1 searches - should only see their own namespace
-    let (status, body) = make_request(
-        &app,
-        Method::GET,
-        "/v1/search",
-        Some(&key1),
-        None,
-    )
-    .await;
+    let (status, body) = make_request(&app, Method::GET, "/v1/search", Some(&key1), None).await;
 
     assert_eq!(status, StatusCode::OK);
 
     let response: serde_json::Value = serde_json::from_str(&body).unwrap();
     let results = response["results"].as_array().unwrap();
-    
+
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["name"], "tenant1_data");
 
     // Tenant 2 searches - should only see their own namespace
-    let (status, body) = make_request(
-        &app,
-        Method::GET,
-        "/v1/search",
-        Some(&key2),
-        None,
-    )
-    .await;
+    let (status, body) = make_request(&app, Method::GET, "/v1/search", Some(&key2), None).await;
 
     assert_eq!(status, StatusCode::OK);
 
     let response: serde_json::Value = serde_json::from_str(&body).unwrap();
     let results = response["results"].as_array().unwrap();
-    
+
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["name"], "tenant2_data");
 }

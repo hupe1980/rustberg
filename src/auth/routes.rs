@@ -172,10 +172,7 @@ pub async fn get_auth_context(
 ///
 /// This queries the authorizer to determine what actions are allowed
 /// for catalog, namespace, and table resources.
-async fn evaluate_capabilities(
-    principal: &super::Principal,
-    app_state: &AppState,
-) -> Capabilities {
+async fn evaluate_capabilities(principal: &super::Principal, app_state: &AppState) -> Capabilities {
     let tenant_id = principal.tenant_id();
 
     // Check if principal has admin/system role

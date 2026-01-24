@@ -22,7 +22,7 @@ Get Rustberg running in under 5 minutes.
 
 ## Prerequisites
 
-- **Rust 1.75+** (for building from source)
+- **Rust 1.85+** (for building from source)
 - **Docker** (optional, for integration testing)
 
 ---

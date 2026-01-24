@@ -160,16 +160,19 @@ impl EncryptedCatalog {
         let mut encrypted_props = HashMap::new();
         encrypted_props.insert(
             "__encrypted_properties".to_string(),
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &envelope.ciphertext),
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &envelope.ciphertext,
+            ),
         );
         encrypted_props.insert(
             "__wrapped_dek".to_string(),
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &envelope.wrapped_dek),
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &envelope.wrapped_dek,
+            ),
         );
-        encrypted_props.insert(
-            "__kms_key_id".to_string(),
-            envelope.key_id,
-        );
+        encrypted_props.insert("__kms_key_id".to_string(), envelope.key_id);
 
         tracing::debug!(
             table = %table,
@@ -195,14 +198,12 @@ impl EncryptedCatalog {
             }
         };
 
-        let wrapped_dek = properties
-            .get("__wrapped_dek")
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    "Missing __wrapped_dek for encrypted table",
-                )
-            })?;
+        let wrapped_dek = properties.get("__wrapped_dek").ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Missing __wrapped_dek for encrypted table",
+            )
+        })?;
 
         let key_id = properties
             .get("__kms_key_id")
@@ -210,21 +211,23 @@ impl EncryptedCatalog {
             .unwrap_or_else(|| self.key_id.clone());
 
         // Decode base64
-        let ciphertext = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encrypted_data)
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Invalid base64 in __encrypted_properties: {}", e),
-                )
-            })?;
+        let ciphertext =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encrypted_data)
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid base64 in __encrypted_properties: {}", e),
+                    )
+                })?;
 
-        let wrapped_dek_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, wrapped_dek)
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Invalid base64 in __wrapped_dek: {}", e),
-                )
-            })?;
+        let wrapped_dek_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, wrapped_dek)
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid base64 in __wrapped_dek: {}", e),
+                    )
+                })?;
 
         // Create envelope and decrypt
         let envelope = EncryptedEnvelope {
@@ -239,12 +242,13 @@ impl EncryptedCatalog {
             .map_err(|e| convert_kms_error(e, table))?;
 
         // Deserialize properties
-        let decrypted: HashMap<String, String> = serde_json::from_slice(&plaintext).map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("Failed to deserialize decrypted properties: {}", e),
-            )
-        })?;
+        let decrypted: HashMap<String, String> =
+            serde_json::from_slice(&plaintext).map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Failed to deserialize decrypted properties: {}", e),
+                )
+            })?;
 
         tracing::debug!(
             table = %table,
@@ -284,7 +288,10 @@ fn convert_kms_error(err: KmsError, table: &TableIdent) -> Error {
 #[async_trait]
 impl Catalog for EncryptedCatalog {
     /// Lists all namespaces (pass-through, namespaces are not encrypted).
-    async fn list_namespaces(&self, parent: Option<&NamespaceIdent>) -> Result<Vec<NamespaceIdent>> {
+    async fn list_namespaces(
+        &self,
+        parent: Option<&NamespaceIdent>,
+    ) -> Result<Vec<NamespaceIdent>> {
         self.inner.list_namespaces(parent).await
     }
 
@@ -353,7 +360,10 @@ impl Catalog for EncryptedCatalog {
         };
 
         // Create table with encrypted properties
-        let table = self.inner.create_table(namespace, encrypted_creation).await?;
+        let table = self
+            .inner
+            .create_table(namespace, encrypted_creation)
+            .await?;
 
         // Note: The returned table will have encrypted properties
         // Clients should use load_table to get decrypted properties
@@ -395,11 +405,7 @@ impl Catalog for EncryptedCatalog {
     }
 
     /// Registers an existing table (pass-through).
-    async fn register_table(
-        &self,
-        table: &TableIdent,
-        metadata_location: String,
-    ) -> Result<Table> {
+    async fn register_table(&self, table: &TableIdent, metadata_location: String) -> Result<Table> {
         self.inner.register_table(table, metadata_location).await
     }
 }
@@ -414,7 +420,9 @@ impl CatalogExt for EncryptedCatalog {
         updates: Vec<TableUpdate>,
     ) -> Result<Table> {
         // Delegate to inner catalog's commit_table
-        self.inner.commit_table(table_ident, requirements, updates).await
+        self.inner
+            .commit_table(table_ident, requirements, updates)
+            .await
     }
 }
 
@@ -455,7 +463,7 @@ mod tests {
         let key = vec![0u8; 32];
         let kms = Arc::new(EnvKeyProvider::with_key(key).unwrap());
         let inner = create_test_catalog().await;
-        
+
         let wrapper = EncryptedCatalog::new(
             inner,
             kms as Arc<dyn KeyManagementService>,
@@ -472,20 +480,26 @@ mod tests {
         original_props.insert("secret".to_string(), "sensitive_data".to_string());
 
         // Encrypt
-        let encrypted = wrapper.encrypt_properties(&table, &original_props).await.unwrap();
-        
+        let encrypted = wrapper
+            .encrypt_properties(&table, &original_props)
+            .await
+            .unwrap();
+
         // Verify encrypted properties have special keys
         assert!(encrypted.contains_key("__encrypted_properties"));
         assert!(encrypted.contains_key("__wrapped_dek"));
         assert!(encrypted.contains_key("__kms_key_id"));
-        
+
         // Original keys should not be present
         assert!(!encrypted.contains_key("key1"));
         assert!(!encrypted.contains_key("secret"));
 
         // Decrypt
-        let decrypted = wrapper.decrypt_properties(&table, &encrypted).await.unwrap();
-        
+        let decrypted = wrapper
+            .decrypt_properties(&table, &encrypted)
+            .await
+            .unwrap();
+
         // Should match original
         assert_eq!(decrypted, original_props);
     }
@@ -495,7 +509,7 @@ mod tests {
         let key = vec![0u8; 32];
         let kms = Arc::new(EnvKeyProvider::with_key(key).unwrap());
         let inner = create_test_catalog().await;
-        
+
         let wrapper = EncryptedCatalog::new(
             inner,
             kms as Arc<dyn KeyManagementService>,

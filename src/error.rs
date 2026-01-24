@@ -283,12 +283,12 @@ impl From<iceberg::Error> for AppError {
             _ => {
                 // Try to detect specific error types from the message
                 let message = err.message().to_lowercase();
-                
+
                 // Check for "not found" / "does not exist" / "no such" patterns
-                let is_not_found = message.contains("not found") 
+                let is_not_found = message.contains("not found")
                     || message.contains("does not exist")
                     || message.contains("no such");
-                
+
                 let is_already_exists = message.contains("already exists");
 
                 if is_not_found {
@@ -406,56 +406,122 @@ mod tests {
 
     #[test]
     fn test_all_400_errors() {
-        assert_eq!(AppError::BadRequest("".into()).status_code(), StatusCode::BAD_REQUEST);
-        assert_eq!(AppError::InvalidNamespace("".into()).status_code(), StatusCode::BAD_REQUEST);
-        assert_eq!(AppError::InvalidTableIdentifier("".into()).status_code(), StatusCode::BAD_REQUEST);
-        assert_eq!(AppError::InvalidSchema("".into()).status_code(), StatusCode::BAD_REQUEST);
-        assert_eq!(AppError::ValidationError("".into()).status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            AppError::BadRequest("".into()).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            AppError::InvalidNamespace("".into()).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            AppError::InvalidTableIdentifier("".into()).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            AppError::InvalidSchema("".into()).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            AppError::ValidationError("".into()).status_code(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]
     fn test_all_401_errors() {
-        assert_eq!(AppError::Unauthenticated.status_code(), StatusCode::UNAUTHORIZED);
-        assert_eq!(AppError::InvalidCredentials.status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            AppError::Unauthenticated.status_code(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AppError::InvalidCredentials.status_code(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[test]
     fn test_all_403_errors() {
-        assert_eq!(AppError::Forbidden("".into()).status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            AppError::Forbidden("".into()).status_code(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[test]
     fn test_all_404_errors() {
-        assert_eq!(AppError::NoSuchNamespace("".into()).status_code(), StatusCode::NOT_FOUND);
-        assert_eq!(AppError::NoSuchTable("".into()).status_code(), StatusCode::NOT_FOUND);
-        assert_eq!(AppError::NoSuchView("".into()).status_code(), StatusCode::NOT_FOUND);
-        assert_eq!(AppError::NoSuchSnapshot("".into()).status_code(), StatusCode::NOT_FOUND);
-        assert_eq!(AppError::NoSuchReference("".into()).status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            AppError::NoSuchNamespace("".into()).status_code(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            AppError::NoSuchTable("".into()).status_code(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            AppError::NoSuchView("".into()).status_code(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            AppError::NoSuchSnapshot("".into()).status_code(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            AppError::NoSuchReference("".into()).status_code(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]
     fn test_all_409_errors() {
-        assert_eq!(AppError::NamespaceAlreadyExists("".into()).status_code(), StatusCode::CONFLICT);
-        assert_eq!(AppError::TableAlreadyExists("".into()).status_code(), StatusCode::CONFLICT);
-        assert_eq!(AppError::ViewAlreadyExists("".into()).status_code(), StatusCode::CONFLICT);
-        assert_eq!(AppError::CommitConflict("".into()).status_code(), StatusCode::CONFLICT);
-        assert_eq!(AppError::NamespaceNotEmpty("".into()).status_code(), StatusCode::CONFLICT);
+        assert_eq!(
+            AppError::NamespaceAlreadyExists("".into()).status_code(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            AppError::TableAlreadyExists("".into()).status_code(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            AppError::ViewAlreadyExists("".into()).status_code(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            AppError::CommitConflict("".into()).status_code(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            AppError::NamespaceNotEmpty("".into()).status_code(),
+            StatusCode::CONFLICT
+        );
     }
 
     #[test]
     fn test_all_422_errors() {
-        assert_eq!(AppError::UnprocessableEntity("".into()).status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            AppError::UnprocessableEntity("".into()).status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
     }
 
     #[test]
     fn test_all_500_errors() {
-        assert_eq!(AppError::Internal("".into()).status_code(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(AppError::StorageError("".into()).status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            AppError::Internal("".into()).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            AppError::StorageError("".into()).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
     fn test_all_503_errors() {
-        assert_eq!(AppError::ServiceUnavailable("".into()).status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            AppError::ServiceUnavailable("".into()).status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     // ========================================================================
@@ -480,56 +546,122 @@ mod tests {
 
     #[test]
     fn test_error_types_400() {
-        assert_eq!(AppError::BadRequest("".into()).error_type(), "BadRequestException");
-        assert_eq!(AppError::InvalidNamespace("".into()).error_type(), "BadRequestException");
-        assert_eq!(AppError::InvalidTableIdentifier("".into()).error_type(), "BadRequestException");
-        assert_eq!(AppError::InvalidSchema("".into()).error_type(), "BadRequestException");
-        assert_eq!(AppError::ValidationError("".into()).error_type(), "BadRequestException");
+        assert_eq!(
+            AppError::BadRequest("".into()).error_type(),
+            "BadRequestException"
+        );
+        assert_eq!(
+            AppError::InvalidNamespace("".into()).error_type(),
+            "BadRequestException"
+        );
+        assert_eq!(
+            AppError::InvalidTableIdentifier("".into()).error_type(),
+            "BadRequestException"
+        );
+        assert_eq!(
+            AppError::InvalidSchema("".into()).error_type(),
+            "BadRequestException"
+        );
+        assert_eq!(
+            AppError::ValidationError("".into()).error_type(),
+            "BadRequestException"
+        );
     }
 
     #[test]
     fn test_error_types_401() {
-        assert_eq!(AppError::Unauthenticated.error_type(), "NotAuthorizedException");
-        assert_eq!(AppError::InvalidCredentials.error_type(), "NotAuthorizedException");
+        assert_eq!(
+            AppError::Unauthenticated.error_type(),
+            "NotAuthorizedException"
+        );
+        assert_eq!(
+            AppError::InvalidCredentials.error_type(),
+            "NotAuthorizedException"
+        );
     }
 
     #[test]
     fn test_error_types_403() {
-        assert_eq!(AppError::Forbidden("".into()).error_type(), "ForbiddenException");
+        assert_eq!(
+            AppError::Forbidden("".into()).error_type(),
+            "ForbiddenException"
+        );
     }
 
     #[test]
     fn test_error_types_404() {
-        assert_eq!(AppError::NoSuchNamespace("".into()).error_type(), "NoSuchNamespaceException");
-        assert_eq!(AppError::NoSuchTable("".into()).error_type(), "NoSuchTableException");
-        assert_eq!(AppError::NoSuchView("".into()).error_type(), "NoSuchViewException");
-        assert_eq!(AppError::NoSuchSnapshot("".into()).error_type(), "NoSuchSnapshotException");
-        assert_eq!(AppError::NoSuchReference("".into()).error_type(), "NoSuchReferenceException");
+        assert_eq!(
+            AppError::NoSuchNamespace("".into()).error_type(),
+            "NoSuchNamespaceException"
+        );
+        assert_eq!(
+            AppError::NoSuchTable("".into()).error_type(),
+            "NoSuchTableException"
+        );
+        assert_eq!(
+            AppError::NoSuchView("".into()).error_type(),
+            "NoSuchViewException"
+        );
+        assert_eq!(
+            AppError::NoSuchSnapshot("".into()).error_type(),
+            "NoSuchSnapshotException"
+        );
+        assert_eq!(
+            AppError::NoSuchReference("".into()).error_type(),
+            "NoSuchReferenceException"
+        );
     }
 
     #[test]
     fn test_error_types_409() {
-        assert_eq!(AppError::NamespaceAlreadyExists("".into()).error_type(), "AlreadyExistsException");
-        assert_eq!(AppError::TableAlreadyExists("".into()).error_type(), "AlreadyExistsException");
-        assert_eq!(AppError::ViewAlreadyExists("".into()).error_type(), "AlreadyExistsException");
-        assert_eq!(AppError::CommitConflict("".into()).error_type(), "CommitFailedException");
-        assert_eq!(AppError::NamespaceNotEmpty("".into()).error_type(), "NamespaceNotEmptyException");
+        assert_eq!(
+            AppError::NamespaceAlreadyExists("".into()).error_type(),
+            "AlreadyExistsException"
+        );
+        assert_eq!(
+            AppError::TableAlreadyExists("".into()).error_type(),
+            "AlreadyExistsException"
+        );
+        assert_eq!(
+            AppError::ViewAlreadyExists("".into()).error_type(),
+            "AlreadyExistsException"
+        );
+        assert_eq!(
+            AppError::CommitConflict("".into()).error_type(),
+            "CommitFailedException"
+        );
+        assert_eq!(
+            AppError::NamespaceNotEmpty("".into()).error_type(),
+            "NamespaceNotEmptyException"
+        );
     }
 
     #[test]
     fn test_error_types_422() {
-        assert_eq!(AppError::UnprocessableEntity("".into()).error_type(), "UnprocessableEntityException");
+        assert_eq!(
+            AppError::UnprocessableEntity("".into()).error_type(),
+            "UnprocessableEntityException"
+        );
     }
 
     #[test]
     fn test_error_types_500() {
-        assert_eq!(AppError::Internal("".into()).error_type(), "InternalServerError");
-        assert_eq!(AppError::StorageError("".into()).error_type(), "InternalServerError");
+        assert_eq!(
+            AppError::Internal("".into()).error_type(),
+            "InternalServerError"
+        );
+        assert_eq!(
+            AppError::StorageError("".into()).error_type(),
+            "InternalServerError"
+        );
     }
 
     #[test]
     fn test_error_types_503() {
-        assert_eq!(AppError::ServiceUnavailable("".into()).error_type(), "ServiceUnavailableException");
+        assert_eq!(
+            AppError::ServiceUnavailable("".into()).error_type(),
+            "ServiceUnavailableException"
+        );
     }
 
     // ========================================================================
@@ -557,7 +689,10 @@ mod tests {
     #[test]
     fn test_error_display_commit_conflict() {
         let err = AppError::CommitConflict("table modified concurrently".into());
-        assert_eq!(err.to_string(), "Commit conflict: table modified concurrently");
+        assert_eq!(
+            err.to_string(),
+            "Commit conflict: table modified concurrently"
+        );
     }
 
     #[test]
@@ -635,10 +770,7 @@ mod tests {
     #[test]
     fn test_from_iceberg_error_data_invalid() {
         // DataInvalid Iceberg errors map to 400 Bad Request
-        let iceberg_err = iceberg::Error::new(
-            iceberg::ErrorKind::DataInvalid,
-            "invalid data"
-        );
+        let iceberg_err = iceberg::Error::new(iceberg::ErrorKind::DataInvalid, "invalid data");
         let app_err: AppError = iceberg_err.into();
         assert_eq!(app_err.status_code(), StatusCode::BAD_REQUEST);
     }
@@ -646,10 +778,7 @@ mod tests {
     #[test]
     fn test_from_iceberg_error_unexpected() {
         // Unexpected Iceberg errors map to 500 Internal Server Error
-        let iceberg_err = iceberg::Error::new(
-            iceberg::ErrorKind::Unexpected,
-            "unexpected error"
-        );
+        let iceberg_err = iceberg::Error::new(iceberg::ErrorKind::Unexpected, "unexpected error");
         let app_err: AppError = iceberg_err.into();
         assert_eq!(app_err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
     }

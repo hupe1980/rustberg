@@ -233,7 +233,7 @@ mod tests {
         // These assertions verify the sanitization logic exists
         let internal = AuthError::Internal("secret database error".into());
         let storage = AuthError::StorageError("connection refused to db.internal".into());
-        
+
         // The sanitized message should not contain the secret details
         // (This test verifies the method exists and returns a string)
         assert!(!internal.sanitized_message().is_empty());

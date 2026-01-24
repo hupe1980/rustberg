@@ -79,11 +79,11 @@ impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            per_ip_requests: 1000,  // 1000 req/min per IP
-            per_ip_burst: 100,      // Allow burst of 100
+            per_ip_requests: 1000,      // 1000 req/min per IP
+            per_ip_burst: 100,          // Allow burst of 100
             per_tenant_requests: 10000, // 10000 req/min per tenant
-            per_tenant_burst: 1000, // Allow burst of 1000
-            auth_fail_limit: 10,    // 10 failed auths before ban
+            per_tenant_burst: 1000,     // Allow burst of 1000
+            auth_fail_limit: 10,        // 10 failed auths before ban
             auth_fail_ban_duration: Duration::from_secs(300), // 5 minute ban
             trust_proxy_headers: false, // SECURE DEFAULT: don't trust proxy headers
         }
@@ -249,7 +249,7 @@ impl TokenBucket {
     fn refill(&mut self) {
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        
+
         self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.capacity as f64);
         self.last_refill = now;
     }
@@ -374,9 +374,10 @@ impl RateLimiter {
             return;
         }
 
-        let entry = self.auth_failures.entry(*ip).or_insert_with(|| {
-            Mutex::new(AuthFailureEntry::new())
-        });
+        let entry = self
+            .auth_failures
+            .entry(*ip)
+            .or_insert_with(|| Mutex::new(AuthFailureEntry::new()));
 
         let mut entry = entry.lock();
 
@@ -390,9 +391,7 @@ impl RateLimiter {
 
         // Check if we should ban
         if entry.failures >= self.config.auth_fail_limit {
-            entry.ban_until = Some(
-                std::time::Instant::now() + self.config.auth_fail_ban_duration
-            );
+            entry.ban_until = Some(std::time::Instant::now() + self.config.auth_fail_ban_duration);
             tracing::warn!(
                 ip = %ip,
                 failures = entry.failures,
@@ -461,12 +460,15 @@ impl RateLimiter {
             return Ok(RateLimitInfo::unlimited());
         }
 
-        let entry = self.tenant_limiters.entry(tenant_id.to_string()).or_insert_with(|| {
-            Mutex::new(TokenBucket::new(
-                self.config.per_tenant_burst,
-                self.config.per_tenant_requests,
-            ))
-        });
+        let entry = self
+            .tenant_limiters
+            .entry(tenant_id.to_string())
+            .or_insert_with(|| {
+                Mutex::new(TokenBucket::new(
+                    self.config.per_tenant_burst,
+                    self.config.per_tenant_requests,
+                ))
+            });
 
         let mut bucket = entry.lock();
 
@@ -499,7 +501,7 @@ impl RateLimiter {
         // Then check tenant limit (only for authenticated requests)
         if let Some(tenant_id) = tenant_id {
             let tenant_result = self.check_tenant_limit(tenant_id)?;
-            
+
             // Return the more restrictive limit info
             if tenant_result.remaining < ip_result.remaining {
                 return Ok(tenant_result);
@@ -696,7 +698,7 @@ impl IntoResponse for RateLimitExceeded {
         };
 
         let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
-        
+
         // Add rate limit headers
         for (name, value) in self.headers() {
             response.headers_mut().insert(name, value);
@@ -784,7 +786,10 @@ mod tests {
         assert!(!limiter.is_ip_banned(&ip));
 
         limiter.record_auth_failure(&ip);
-        assert!(limiter.is_ip_banned(&ip), "IP should be banned after 3 failures");
+        assert!(
+            limiter.is_ip_banned(&ip),
+            "IP should be banned after 3 failures"
+        );
 
         // Check that requests are rejected
         let result = limiter.check_ip_limit(&ip);

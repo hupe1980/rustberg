@@ -272,7 +272,7 @@ pub trait Authorizer: Send + Sync {
     /// This method also emits audit log events for authorization denials.
     async fn check(&self, ctx: &AuthzContext) -> Result<()> {
         let decision = self.authorize(ctx).await;
-        
+
         if decision.is_denied() {
             // Emit audit log for authorization denial
             use super::audit::log_authz_denied;
@@ -284,7 +284,7 @@ pub trait Authorizer: Send + Sync {
                 &ctx.action.to_string(),
             );
         }
-        
+
         decision.into_result()
     }
 }

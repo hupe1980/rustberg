@@ -208,10 +208,10 @@ pub async fn search(
     // Determine which namespaces to search
     let namespaces_to_search = if let Some(ref ns_filter) = query.namespace {
         // Search only the specified namespace
-        vec![NamespaceIdent::from_strs(
-            ns_filter.split('.').collect::<Vec<_>>(),
-        )
-        .map_err(|e| crate::error::AppError::BadRequest(e.to_string()))?]
+        vec![
+            NamespaceIdent::from_strs(ns_filter.split('.').collect::<Vec<_>>())
+                .map_err(|e| crate::error::AppError::BadRequest(e.to_string()))?,
+        ]
     } else {
         // Get all root namespaces
         state.catalog.list_namespaces(None).await?
@@ -241,7 +241,9 @@ pub async fn search(
     }
 
     // Sort results by qualified name for consistency
-    collector.results.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
+    collector
+        .results
+        .sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
 
     let has_more = collector.total_count > limit;
     let final_results: Vec<_> = collector.results.into_iter().take(limit).collect();

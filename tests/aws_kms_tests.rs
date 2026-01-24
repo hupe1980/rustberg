@@ -35,7 +35,7 @@ async fn test_aws_kms_provider_basic_operations() {
 
     // Create a KMS key using AWS CLI equivalent via HTTP
     let client = reqwest::Client::new();
-    
+
     // Create key via LocalStack KMS API
     let create_key_response = client
         .post(format!("{}/", endpoint_url))
@@ -76,13 +76,9 @@ async fn test_aws_kms_provider_basic_operations() {
     std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
 
     // Create the AWS KMS provider with LocalStack endpoint
-    let provider = AwsKmsProvider::new(
-        "us-east-1",
-        key_id,
-        Some(endpoint_url.clone()),
-    )
-    .await
-    .expect("Failed to create AwsKmsProvider");
+    let provider = AwsKmsProvider::new("us-east-1", key_id, Some(endpoint_url.clone()))
+        .await
+        .expect("Failed to create AwsKmsProvider");
 
     // Test health check
     provider.health_check().await.expect("Health check failed");
@@ -98,7 +94,10 @@ async fn test_aws_kms_provider_basic_operations() {
         32,
         "DEK should be 32 bytes (256 bits)"
     );
-    assert!(!dek.ciphertext.is_empty(), "Encrypted DEK should not be empty");
+    assert!(
+        !dek.ciphertext.is_empty(),
+        "Encrypted DEK should not be empty"
+    );
     assert!(dek.version >= 1, "Version should be at least 1");
 
     // Test decryption of the wrapped key
@@ -195,7 +194,10 @@ async fn test_aws_kms_envelope_encryption() {
     assert!(!envelope.wrapped_dek.is_empty());
 
     // Decrypt and verify
-    let decrypted = envelope.decrypt(&provider).await.expect("Failed to decrypt envelope");
+    let decrypted = envelope
+        .decrypt(&provider)
+        .await
+        .expect("Failed to decrypt envelope");
     assert_eq!(decrypted, plaintext);
 
     std::env::remove_var("AWS_ACCESS_KEY_ID");
@@ -229,12 +231,8 @@ async fn test_aws_kms_key_not_found() {
     std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
 
     // Create provider with a non-existent key
-    let result = AwsKmsProvider::new(
-        "us-east-1",
-        "non-existent-key-12345",
-        Some(endpoint_url),
-    )
-    .await;
+    let result =
+        AwsKmsProvider::new("us-east-1", "non-existent-key-12345", Some(endpoint_url)).await;
 
     // Provider creation might succeed but operations should fail
     if let Ok(provider) = result {

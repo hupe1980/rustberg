@@ -375,9 +375,7 @@ mod tests {
 
         let provider = AzureCredentialProvider::new(config).unwrap();
 
-        assert!(
-            provider.is_location_allowed("abfss://any@account.dfs.core.windows.net/any/path")
-        );
+        assert!(provider.is_location_allowed("abfss://any@account.dfs.core.windows.net/any/path"));
     }
 
     #[test]
