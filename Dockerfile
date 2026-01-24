@@ -18,26 +18,19 @@ ARG TARGETPLATFORM
 ARG TARGETARCH
 ARG BUILDPLATFORM
 
-# Install musl toolchain for static linking
-# Note: No cmake/clang needed - Rustberg is 100% pure Rust!
+# Install minimal dependencies and cargo-zigbuild for cross-compilation
+# cargo-zigbuild uses Zig as a linker, which provides hermetic musl support
+# without needing external toolchain downloads
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     musl-tools \
     musl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install cross-compilation tools for arm64 if building on amd64
-# We use a pre-built musl cross-compiler for aarch64
-RUN if [ "$TARGETARCH" = "arm64" ] && [ "$BUILDPLATFORM" = "linux/amd64" ]; then \
-        apt-get update && apt-get install -y --no-install-recommends \
-            wget \
-        && rm -rf /var/lib/apt/lists/* \
-        && wget -qO- https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /opt \
-        && ln -s /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc /usr/local/bin/ \
-        && ln -s /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-ar /usr/local/bin/ \
-        && mkdir -p ~/.cargo \
-        && printf '[target.aarch64-unknown-linux-musl]\nlinker = "aarch64-linux-musl-gcc"\n' >> ~/.cargo/config.toml; \
-    fi
+# Install Zig and cargo-zigbuild for reliable cross-compilation
+RUN curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ -C /opt \
+    && ln -s /opt/zig-linux-x86_64-0.13.0/zig /usr/local/bin/zig \
+    && cargo install cargo-zigbuild
 
 # Set up Rust target based on architecture
 RUN case "$TARGETARCH" in \
@@ -60,7 +53,7 @@ RUN mkdir -p src && \
 
 # Build dependencies only (this layer is cached)
 RUN RUST_TARGET=$(cat /tmp/rust-target) && \
-    cargo build --release --target $RUST_TARGET --features slatedb-storage,cli,tls 2>/dev/null || true
+    cargo zigbuild --release --target $RUST_TARGET --features slatedb-storage,cli,tls 2>/dev/null || true
 
 # Remove dummy source
 RUN rm -rf src/
@@ -73,7 +66,7 @@ RUN touch src/main.rs src/lib.rs
 
 # Build the actual binary
 RUN RUST_TARGET=$(cat /tmp/rust-target) && \
-    cargo build --release --target $RUST_TARGET --features slatedb-storage,cli,tls && \
+    cargo zigbuild --release --target $RUST_TARGET --features slatedb-storage,cli,tls && \
     cp /build/target/$RUST_TARGET/release/rustberg /build/rustberg && \
     strip /build/rustberg 2>/dev/null || true
 

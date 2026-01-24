@@ -53,7 +53,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         # Exclude tests requiring Docker (not available on macOS runners)
-        run: cargo test --all-features --verbose -- --skip test_aws_kms_ --skip test_vault_kms_
+        run: cargo test --all-features --verbose -- --skip test_aws_kms_ --skip test_vault_kms_ --skip trino_can_
 
   test-windows:
     name: Test (Windows)
@@ -64,7 +64,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         # Exclude tests requiring Docker (not available on Windows runners)
-        run: cargo test --all-features --verbose -- --skip test_aws_kms_ --skip test_vault_kms_
+        run: cargo test --all-features --verbose -- --skip test_aws_kms_ --skip test_vault_kms_ --skip trino_can_
 
   test-pyiceberg:
     name: PyIceberg Integration
@@ -138,7 +138,7 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             artifact: rustberg
-            cross: true
+            zigbuild: true
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: rustberg
@@ -154,14 +154,16 @@ jobs:
       - name: Install musl-tools
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-      - name: Build release (cross)
-        if: matrix.cross
-        run: cross build --release --features slatedb-storage,cli,tls --target ${{ matrix.target }}
+      - name: Install cargo-zigbuild
+        if: matrix.zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild,zig
+      - name: Build release (zigbuild)
+        if: matrix.zigbuild
+        run: cargo zigbuild --release --features slatedb-storage,cli,tls --target ${{ matrix.target }}
       - name: Build release (native)
-        if: ${{ !matrix.cross }}
+        if: ${{ !matrix.zigbuild }}
         run: cargo build --release --features slatedb-storage,cli,tls --target ${{ matrix.target }}
       - name: Upload artifact
         uses: actions/upload-artifact@v4
