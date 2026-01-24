@@ -94,7 +94,7 @@ LABEL org.opencontainers.image.description="Production-grade Apache Iceberg REST
 LABEL org.opencontainers.image.vendor="hupe1980"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL org.opencontainers.image.source="https://github.com/hupe1980/rustberg"
-LABEL org.opencontainers.image.documentation="https://github.com/hupe1980/rustberg#readme"
+LABEL org.opencontainers.image.documentation="https://hupe1980.github.io/rustberg/"
 
 # Copy binary from builder
 COPY --from=builder /build/rustberg /usr/local/bin/rustberg

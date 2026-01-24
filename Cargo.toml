@@ -1,6 +1,6 @@
 [package]
 name = "rustberg"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 authors = ["hupe1980"]
 description = "A production-grade, cross-platform, single-binary Apache Iceberg REST Catalog"
@@ -9,7 +9,7 @@ keywords = ["rustberg", "iceberg", "catalog", "lakehouse", "data"]
 categories = ["database", "web-programming"]
 license = "Apache-2.0"
 repository = "https://github.com/hupe1980/rustberg"
-homepage = "https://github.com/hupe1980/rustberg"
+homepage = "https://hupe1980.github.io/rustberg/"
 rust-version = "1.89"
 
 [features]

@@ -27,8 +27,11 @@ use crate::catalog::{
 use crate::config;
 use crate::config::CorsConfig;
 use crate::credentials::{NoopCredentialProvider, StorageCredentialProvider};
-use crate::crypto::{create_kms, Aes256GcmProvider, EncryptionProvider};
+use crate::crypto::create_kms;
+#[cfg(feature = "slatedb-storage")]
+use crate::crypto::{Aes256GcmProvider, EncryptionProvider};
 use crate::observability::metrics::MetricsRegistry;
+#[cfg(feature = "slatedb-storage")]
 use crate::storage::KvApiKeyStore;
 use crate::utils::temp_path;
 
@@ -1350,11 +1353,17 @@ mod tests {
 
     #[test]
     fn test_app_builder_custom_warehouse() {
-        let app = App::builder()
-            .with_warehouse_location("/custom/warehouse")
-            .build();
+        // Use a cross-platform compatible path format
+        // On Windows, paths with drive letters are misinterpreted as URL schemes
+        let warehouse = if cfg!(windows) {
+            "file:///C:/custom/warehouse".to_string()
+        } else {
+            "/custom/warehouse".to_string()
+        };
 
-        assert_eq!(app.state().warehouse_location, "/custom/warehouse");
+        let app = App::builder().with_warehouse_location(&warehouse).build();
+
+        assert_eq!(app.state().warehouse_location, warehouse);
     }
 
     #[test]

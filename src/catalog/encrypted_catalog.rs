@@ -431,12 +431,13 @@ mod tests {
     use super::*;
     use crate::catalog::ExtendedCatalog;
     use crate::crypto::EnvKeyProvider;
+    use crate::utils::temp_path;
     use iceberg::{memory::MemoryCatalogBuilder, CatalogBuilder};
     use std::collections::HashMap;
 
     async fn create_test_catalog() -> Arc<dyn CatalogExt + Send + Sync> {
         let mut props = HashMap::new();
-        props.insert("warehouse".to_string(), "/tmp/test".to_string());
+        props.insert("warehouse".to_string(), temp_path());
         let memory_catalog = MemoryCatalogBuilder::default()
             .load("memory", props)
             .await
