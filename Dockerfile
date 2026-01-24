@@ -25,12 +25,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     musl-tools \
     musl-dev \
+    xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Zig and cargo-zigbuild for reliable cross-compilation
-RUN curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ -C /opt \
-    && ln -s /opt/zig-linux-x86_64-0.13.0/zig /usr/local/bin/zig \
-    && cargo install cargo-zigbuild
+# Install Zig (architecture-aware) and cargo-zigbuild for reliable cross-compilation
+RUN case "$BUILDPLATFORM" in \
+        linux/amd64) ZIG_ARCH="x86_64" ;; \
+        linux/arm64) ZIG_ARCH="aarch64" ;; \
+        *) echo "Unsupported build platform: $BUILDPLATFORM" && exit 1 ;; \
+    esac && \
+    curl -L "https://ziglang.org/download/0.13.0/zig-linux-${ZIG_ARCH}-0.13.0.tar.xz" | tar -xJ -C /opt && \
+    ln -s /opt/zig-linux-${ZIG_ARCH}-0.13.0/zig /usr/local/bin/zig && \
+    cargo install cargo-zigbuild
 
 # Set up Rust target based on architecture
 RUN case "$TARGETARCH" in \

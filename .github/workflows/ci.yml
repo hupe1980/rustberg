@@ -154,11 +154,16 @@ jobs:
       - name: Install musl-tools
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install Zig
+        if: matrix.zigbuild
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
       - name: Install cargo-zigbuild
         if: matrix.zigbuild
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-zigbuild,zig
+          tool: cargo-zigbuild
       - name: Build release (zigbuild)
         if: matrix.zigbuild
         run: cargo zigbuild --release --features slatedb-storage,cli,tls --target ${{ matrix.target }}
