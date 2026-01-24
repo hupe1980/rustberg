@@ -1,0 +1,38 @@
+# Cargo audit configuration
+# https://rustsec.org/
+
+[advisories]
+# List of advisory IDs to ignore
+# These are all unmaintained warnings (not security vulnerabilities)
+# in transitive dependencies that we cannot directly update.
+ignore = [
+    # fxhash - unmaintained, transitive dep from sled
+    # No security vulnerability, just unmaintained
+    "RUSTSEC-2025-0057",
+
+    # instant - unmaintained, transitive dep from sled and azure_* crates
+    # No security vulnerability, just unmaintained
+    "RUSTSEC-2024-0384",
+
+    # paste - unmaintained, transitive dep from parquet, foyer-storage, azure_core
+    # No security vulnerability, just unmaintained
+    "RUSTSEC-2024-0436",
+
+    # rustls-pemfile - unmaintained, transitive dep from object_store, bollard
+    # No security vulnerability, just unmaintained
+    "RUSTSEC-2025-0134",
+
+    # bincode - unmaintained, transitive dep from madsim (foyer/slatedb)
+    # No security vulnerability, just unmaintained
+    "RUSTSEC-2025-0141",
+
+    # tokio-tar - PAX header parsing issue, only used in testcontainers (dev dependency)
+    # This is only used for running integration tests, not in production code.
+    # The vulnerability allows file smuggling when extracting archives, which is
+    # not a concern for our test containers that only pull trusted images.
+    # No fix available yet - waiting for upstream.
+    "RUSTSEC-2025-0111",
+]
+
+# Warn for informational advisories (default: false)
+informational_warnings = ["unmaintained"]

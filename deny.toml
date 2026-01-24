@@ -7,21 +7,27 @@
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
-notice = "warn"
 
 # Ignore specific advisories (add with justification)
 ignore = [
-    # Example: "RUSTSEC-2020-0071", # unmaintained, no alternative available
+    # fxhash - unmaintained, transitive dep from sled
+    "RUSTSEC-2025-0057",
+    # instant - unmaintained, transitive dep from sled and azure_* crates
+    "RUSTSEC-2024-0384",
+    # paste - unmaintained, transitive dep from parquet, foyer-storage, azure_core
+    "RUSTSEC-2024-0436",
+    # rustls-pemfile - unmaintained, transitive dep from object_store, bollard
+    "RUSTSEC-2025-0134",
+    # bincode - unmaintained, transitive dep from madsim (foyer/slatedb)
+    "RUSTSEC-2025-0141",
+    # tokio-tar - dev dependency only (testcontainers), no fix available
+    "RUSTSEC-2025-0111",
 ]
 
 # ===========================================================================
 # Licenses - Allowed license checking
 # ===========================================================================
 [licenses]
-unlicensed = "deny"
 confidence-threshold = 0.8
 
 # List of allowed licenses
@@ -32,22 +38,14 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
+    "OpenSSL",                          # aws-lc-sys
     "Zlib",
     "0BSD",
     "CC0-1.0",
-    "MPL-2.0",
     "Unicode-DFS-2016",
+    "Unicode-3.0",                      # icu4x crates (yoke, zerofrom, zerovec, etc.)
+    "CDLA-Permissive-2.0",              # webpki-roots
     "BSL-1.0",
-]
-
-# Explicitly deny copyleft licenses
-deny = [
-    "GPL-2.0",
-    "GPL-3.0",
-    "AGPL-3.0",
-    "LGPL-2.0",
-    "LGPL-2.1",
-    "LGPL-3.0",
 ]
 
 # Crates with clarifications
@@ -64,11 +62,6 @@ expression = "ISC"
 license-files = [
     { path = "LICENSE", hash = 0x001c7e6c },
 ]
-
-# Exceptions for specific crates (with justification)
-[[licenses.exceptions]]
-name = "unicode-ident"
-allow = ["Unicode-DFS-2016"]
 
 # ===========================================================================
 # Bans - Dependency bans and duplicates
