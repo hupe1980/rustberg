@@ -87,13 +87,13 @@ impl StringOrVec {
 /// Configuration for JWT authentication
 #[derive(Debug, Clone)]
 pub struct JwtConfig {
-    /// OIDC issuer URL (e.g., "https://accounts.google.com")
+    /// OIDC issuer URL (e.g., "<https://accounts.google.com>")
     pub issuer: String,
 
     /// Expected audience (e.g., "rustberg-api")
     pub audience: String,
 
-    /// JWKS endpoint URL (e.g., "https://accounts.google.com/.well-known/jwks.json")
+    /// JWKS endpoint URL (e.g., "<https://accounts.google.com/.well-known/jwks.json>")
     pub jwks_url: String,
 
     /// Default tenant ID if not in JWT claims

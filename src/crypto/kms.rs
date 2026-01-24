@@ -1618,7 +1618,7 @@ impl VaultKmsProvider {
     ///
     /// # Arguments
     ///
-    /// * `address` - Vault server address (e.g., "https://vault.example.com:8200")
+    /// * `address` - Vault server address (e.g., "<https://vault.example.com:8200>")
     /// * `mount_path` - Transit secrets engine mount path (default: "transit")
     /// * `key_name` - Key name in Vault Transit engine
     /// * `token` - Vault authentication token
@@ -2338,7 +2338,7 @@ impl AzureKeyVaultProvider {
     ///
     /// # Arguments
     ///
-    /// * `vault_url` - Key Vault URL (e.g., "https://myvault.vault.azure.net")
+    /// * `vault_url` - Key Vault URL (e.g., "<https://myvault.vault.azure.net>")
     /// * `key_name` - Key name in the vault
     ///
     /// Uses DefaultAzureCredential for authentication:
@@ -2580,7 +2580,7 @@ pub enum KmsConfig {
 
     /// HashiCorp Vault configuration.
     Vault {
-        /// Vault address (e.g., "https://vault.example.com:8200").
+        /// Vault address (e.g., "<https://vault.example.com:8200>").
         address: String,
         /// Transit secrets engine mount path (default: "transit").
         mount_path: String,
@@ -2604,7 +2604,7 @@ pub enum KmsConfig {
 
     /// Azure Key Vault configuration.
     AzureKeyVault {
-        /// Vault URL (e.g., "https://myvault.vault.azure.net").
+        /// Vault URL (e.g., "<https://myvault.vault.azure.net>").
         vault_url: String,
         /// Key name.
         key_name: String,

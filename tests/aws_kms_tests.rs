@@ -302,12 +302,12 @@ async fn test_aws_kms_concurrent_operations() {
             let dek = provider
                 .generate_data_key(&key_id)
                 .await
-                .expect(&format!("Failed to generate DEK {}", i));
+                .unwrap_or_else(|_| panic!("Failed to generate DEK {}", i));
 
             let decrypted = provider
                 .decrypt_data_key(&key_id, &dek.ciphertext)
                 .await
-                .expect(&format!("Failed to decrypt DEK {}", i));
+                .unwrap_or_else(|_| panic!("Failed to decrypt DEK {}", i));
 
             assert_eq!(decrypted.expose(), dek.plaintext.expose());
             i

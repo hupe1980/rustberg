@@ -10,7 +10,7 @@ categories = ["database", "web-programming"]
 license = "Apache-2.0"
 repository = "https://github.com/hupe1980/rustberg"
 homepage = "https://github.com/hupe1980/rustberg"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [features]
 default = ["cli", "tls", "slatedb-storage"]

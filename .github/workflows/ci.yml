@@ -52,7 +52,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test --all-features --verbose
+        # Exclude tests requiring Docker (not available on macOS runners)
+        run: cargo test --all-features --verbose -- --skip aws_kms_tests --skip vault_kms_tests
 
   test-windows:
     name: Test (Windows)
@@ -62,7 +63,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test --all-features --verbose
+        # Exclude tests requiring Docker (not available on Windows runners)
+        run: cargo test --all-features --verbose -- --skip aws_kms_tests --skip vault_kms_tests
 
   test-pyiceberg:
     name: PyIceberg Integration
