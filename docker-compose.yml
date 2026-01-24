@@ -1,0 +1,134 @@
+# =============================================================================
+# Docker Compose for Rustberg Iceberg Catalog
+# =============================================================================
+#
+# Production (default - authentication enabled):
+#   docker-compose up -d
+#
+# Development (no auth, for local testing only):
+#   docker-compose --profile dev up -d
+#
+# With MinIO storage:
+#   docker-compose --profile storage up -d
+#
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Rustberg Catalog Server (Production Mode - Auth Enabled)
+  # ---------------------------------------------------------------------------
+  rustberg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      RUSTBERG_HOST: "0.0.0.0"
+      RUSTBERG_PORT: "8000"
+      RUSTBERG_INSECURE_HTTP: "true"
+      RUSTBERG_WAREHOUSE: "/var/lib/rustberg/warehouse"
+      # Authentication is enabled by default (no RUSTBERG_NO_AUTH)
+      RUSTBERG_CREATE_DEMO_KEY: "true"
+      RUSTBERG_MASTER_KEY: "${RUSTBERG_MASTER_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
+      RUST_LOG: "info"
+    volumes:
+      - rustberg-data:/var/lib/rustberg/data
+      - rustberg-warehouse:/var/lib/rustberg/warehouse
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Rustberg Development Mode (No Auth - FOR LOCAL TESTING ONLY)
+  # ---------------------------------------------------------------------------
+  rustberg-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles:
+      - dev
+    ports:
+      - "8000:8000"
+    environment:
+      RUSTBERG_HOST: "0.0.0.0"
+      RUSTBERG_PORT: "8000"
+      RUSTBERG_INSECURE_HTTP: "true"
+      RUSTBERG_NO_AUTH: "true"  # Explicitly disable auth for development
+      RUSTBERG_WAREHOUSE: "/var/lib/rustberg/warehouse"
+      RUST_LOG: "debug"
+    volumes:
+      - rustberg-dev-data:/var/lib/rustberg/data
+      - rustberg-dev-warehouse:/var/lib/rustberg/warehouse
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # MinIO for S3-compatible object storage (optional)
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    profiles:
+      - storage
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+volumes:
+  rustberg-data:
+  rustberg-dev-data:
+  rustberg-warehouse:
+  rustberg-dev-warehouse:
+  minio-data:
+
+# =============================================================================
+# Usage Examples:
+#
+# 1. Start production server (with authentication):
+#    docker-compose up -d
+#
+# 2. Start development server (no authentication):
+#    docker-compose --profile dev up -d
+#
+# 3. Start with MinIO storage:
+#    docker-compose --profile storage up -d
+#
+# 4. Generate API key (production):
+#    docker-compose exec rustberg rustberg generate-key --name admin --roles admin
+#
+# 5. Create backup:
+#    docker-compose exec rustberg rustberg backup --output /tmp/backup.tar.gz
+#
+# 6. View logs:
+#    docker-compose logs -f rustberg
+#
+# 7. Check health:
+#    curl http://localhost:8000/health
+#    curl http://localhost:8000/ready
+#
+# Security Notes:
+# - Production mode (default) requires API key authentication
+# - Development mode (--profile dev) disables auth - NEVER use in production
+# - Set RUSTBERG_MASTER_KEY to a secure random value in production
+# - Consider enabling TLS for production deployments
+#
+# =============================================================================

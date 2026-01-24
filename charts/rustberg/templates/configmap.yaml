@@ -1,0 +1,11 @@
+{{- if .Values.rustberg.config }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "rustberg.fullname" . }}-config
+  labels:
+    {{- include "rustberg.labels" . | nindent 4 }}
+data:
+  rustberg.toml: |
+    {{- .Values.rustberg.config | nindent 4 }}
+{{- end }}

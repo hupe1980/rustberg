@@ -1,0 +1,77 @@
+# =============================================================================
+# Rustberg Python Integration Tests
+# =============================================================================
+# All Python tooling for Rustberg integration tests.
+# Use `uv sync` to install dependencies.
+# =============================================================================
+
+[project]
+name = "rustberg-tests"
+version = "0.1.0"
+description = "Integration tests for Rustberg Iceberg REST Catalog"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+
+dependencies = [
+    # PyIceberg for REST catalog testing
+    "pyiceberg>=0.8.0",
+    # PySpark for Spark integration tests  
+    "pyspark>=3.5.0",
+    # DuckDB for embedded analytics
+    "duckdb>=1.0.0",
+    # PyArrow for data handling
+    "pyarrow>=15.0.0",
+    # Testing framework
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-timeout>=2.3.0",
+    # HTTP client
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+]
+
+# =============================================================================
+# Tool Configuration
+# =============================================================================
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+timeout = 300  # 5 minute timeout per test
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "spark: marks tests requiring PySpark",
+    "pyiceberg: marks tests using PyIceberg client",
+    "duckdb: marks tests using DuckDB client",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "C4", "UP"]
+ignore = ["E501"]  # Line length handled by formatter
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+
+[dependency-groups]
+dev = [
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+]

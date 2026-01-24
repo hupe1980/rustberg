@@ -1,0 +1,33 @@
+# Local development configuration
+# This file overrides _config.yml for local development
+#
+# Usage: bundle exec jekyll serve --config _config.yml,_config_local.yml
+# Or simply: just docs-serve
+
+# Override baseurl for local development
+baseurl: ""
+
+# Use localhost URL
+url: "http://localhost:4000"
+
+# Use gem-based theme instead of remote_theme for local dev
+theme: just-the-docs
+remote_theme: null
+
+# Disable some plugins that need GitHub
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+  - jekyll-feed
+  # Disable github-metadata for local dev (requires JEKYLL_GITHUB_TOKEN)
+  # - jekyll-github-metadata
+
+# Faster builds for development
+incremental: true
+profile: true
+
+# Show drafts
+show_drafts: true
+
+# Verbose output
+verbose: true

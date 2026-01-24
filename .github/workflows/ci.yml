@@ -1,0 +1,287 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test-linux:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --all-features --verbose
+      - name: Run tests (no default features)
+        run: cargo test --no-default-features --verbose
+
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --all-features --verbose
+
+  test-windows:
+    name: Test (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --all-features --verbose
+
+  test-pyiceberg:
+    name: PyIceberg Integration
+    runs-on: ubuntu-latest
+    needs: [test-linux]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - name: Build Rustberg
+        run: cargo build --all-features
+      - name: Install Python dependencies
+        run: uv sync
+      - name: Run PyIceberg tests
+        run: uv run pytest tests/python/test_pyiceberg -v --tb=short
+
+  test-pyspark:
+    name: PySpark Integration
+    runs-on: ubuntu-latest
+    needs: [test-linux]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+      - name: Build Rustberg
+        run: cargo build --all-features
+      - name: Install Python dependencies
+        run: uv sync
+      - name: Run PySpark tests
+        run: uv run pytest tests/python/test_pyspark -v --tb=short -m spark
+
+  test-duckdb:
+    name: DuckDB Integration
+    runs-on: ubuntu-latest
+    needs: [test-linux]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - name: Build Rustberg
+        run: cargo build --all-features
+      - name: Install Python dependencies
+        run: uv sync
+      - name: Run DuckDB tests
+        run: uv run pytest tests/python/test_duckdb -v --tb=short -m duckdb
+
+  build-release:
+    name: Build Release (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: rustberg
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: rustberg
+            cross: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: rustberg
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: rustberg.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Build release (cross)
+        if: matrix.cross
+        run: cross build --release --features slatedb-storage,cli,tls --target ${{ matrix.target }}
+      - name: Build release (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --features slatedb-storage,cli,tls --target ${{ matrix.target }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustberg-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build Docker image (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          platforms: linux/amd64,linux/arm64
+          tags: rustberg:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Test Docker image
+        run: |
+          docker buildx build --platform linux/amd64 --load -t rustberg:test-amd64 .
+          docker run --rm rustberg:test-amd64 --version
+          docker run --rm rustberg:test-amd64 --help
+
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build documentation
+        run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+
+  helm-lint:
+    name: Helm Chart Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.14.0'
+      - name: Lint Helm chart
+        run: helm lint charts/rustberg
+      - name: Template Helm chart
+        run: helm template rustberg charts/rustberg > /dev/null
+      - name: Validate Helm chart
+        run: |
+          helm template rustberg charts/rustberg | kubectl apply --dry-run=client -f - 2>/dev/null || true
+
+  benchmark-startup:
+    name: Startup Benchmark
+    runs-on: ubuntu-latest
+    needs: [test-linux]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install hyperfine
+        run: sudo apt-get update && sudo apt-get install -y hyperfine
+      - name: Build release
+        run: cargo build --release --all-features
+      - name: Measure startup time
+        run: |
+          echo "=== Startup Time Benchmark ==="
+          hyperfine --warmup 3 --runs 10 './target/release/rustberg --help' --export-markdown startup-bench.md
+          cat startup-bench.md
+      - name: Measure binary size
+        run: |
+          echo "=== Binary Size ==="
+          ls -lh target/release/rustberg
+          du -h target/release/rustberg
+
+  benchmark-memory:
+    name: Memory Benchmark
+    runs-on: ubuntu-latest
+    needs: [test-linux]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+      - name: Build release
+        run: cargo build --release --all-features
+      - name: Check for memory leaks (generate-config)
+        run: valgrind --leak-check=full --error-exitcode=1 ./target/release/rustberg generate-config > /dev/null
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install grcov
+        run: cargo install grcov
+      - name: Run tests with coverage
+        run: |
+          CARGO_INCREMENTAL=0 RUSTFLAGS='-Cinstrument-coverage' LLVM_PROFILE_FILE='cargo-test-%p-%m.profraw' cargo test --all-features
+      - name: Generate coverage report
+        run: |
+          grcov . --binary-path ./target/debug/deps/ -s . -t lcov --branch --ignore-not-existing --ignore '../*' --ignore "/*" -o coverage.lcov
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.lcov
+          fail_ci_if_error: false

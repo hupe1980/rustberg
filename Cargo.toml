@@ -3,11 +3,161 @@ name = "rustberg"
 version = "0.0.1"
 edition = "2021"
 authors = ["hupe1980"]
-description = "A rust iceberg catalog"
+description = "A production-grade, cross-platform, single-binary Apache Iceberg REST Catalog"
 readme = "README.md"
-keywords = ["rustberg", "iceberg", "catalog"]
-license = "MIT"
+keywords = ["rustberg", "iceberg", "catalog", "lakehouse", "data"]
+categories = ["database", "web-programming"]
+license = "Apache-2.0"
 repository = "https://github.com/hupe1980/rustberg"
 homepage = "https://github.com/hupe1980/rustberg"
+rust-version = "1.75"
+
+[features]
+default = ["cli", "tls", "slatedb-storage"]
+cli = ["clap"]
+tls = ["axum-server/tls-rustls", "rcgen", "rustls"]
+slatedb-storage = ["slatedb", "object_store"]
+sled-storage = ["sled"]
+metrics = ["prometheus", "opentelemetry", "tracing-opentelemetry"]
+rate-limiting = ["tower_governor"]
+aws-credentials = ["aws-config", "aws-sdk-sts"]
+aws-kms = ["aws-config", "aws-sdk-kms"]
+gcp-credentials = ["google-cloud-auth"]
+gcp-kms = ["gcloud-kms"]
+azure-kms = ["azure_security_keyvault", "azure_identity"]
+vault-kms = ["vaultrs"]
+
+[[bin]]
+name = "rustberg"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[lib]
+name = "rustberg"
+path = "src/lib.rs"
 
 [dependencies]
+# Core async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# HTTP framework
+axum = { version = "0.8", features = ["json", "tokio"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+axum-server = { version = "0.8", default-features = false }
+tower-http = { version = "0.6", features = ["trace", "limit", "set-header", "timeout", "cors", "request-id", "compression-gzip", "compression-deflate"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+url = "2"
+
+# Iceberg
+iceberg = "0.8"
+
+# Authentication & Security
+jsonwebtoken = "9.3"
+constant_time_eq = "0.3"
+ring = "0.17"
+sha2 = "0.10"
+base64 = "0.22"
+argon2 = "0.5"  # Password hashing for API keys
+
+# Authorization
+cedar-policy = "4.8"
+
+# Cryptography (encryption at rest)
+aes-gcm = "0.10"
+hex = "0.4"
+zeroize = { version = "1.8", features = ["derive"] }
+
+# Caching
+moka = { version = "0.12", features = ["future"] }
+dashmap = "6"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+rand = "0.8"
+thiserror = "2"
+parking_lot = "0.12"
+regex = "1.11"
+
+# HTTP client (for JWKS fetching)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Validation
+validator = { version = "0.20", features = ["derive"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Backup/Restore
+tar = "0.4"
+flate2 = "1.0"
+
+# Temporary files (for tests and cert generation)
+tempfile = "3"
+
+# TLS (optional)
+rcgen = { version = "0.13", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+
+# Storage backends (optional)
+sled = { version = "0.34", optional = true }
+slatedb = { version = "0.10", optional = true }
+object_store = { version = "0.12", features = ["aws", "gcp", "azure"], optional = true }
+
+# AWS SDK for credential vending (optional)
+aws-config = { version = "1.5", optional = true }
+aws-sdk-sts = { version = "1.51", optional = true }
+aws-sdk-kms = { version = "1.54", optional = true }
+
+# GCP SDK for credential vending (optional)
+google-cloud-auth = { version = "1.4", optional = true }
+
+# HashiCorp Vault KMS (optional)
+vaultrs = { version = "0.7", optional = true }
+
+# GCP Cloud KMS (optional)
+gcloud-kms = { version = "1.4", optional = true }
+
+# Azure Key Vault (optional)
+azure_security_keyvault = { version = "0.21", optional = true }
+azure_identity = { version = "0.21", optional = true }
+
+# Rate limiting (optional)
+tower_governor = { version = "0.4", optional = true }
+
+# Metrics and observability (optional)
+prometheus = { version = "0.14", optional = true }
+opentelemetry = { version = "0.27", optional = true }
+tracing-opentelemetry = { version = "0.27", optional = true }
+
+# CLI (optional)
+clap = { version = "4", features = ["derive", "env"], optional = true }
+
+[dev-dependencies]
+axum-test = "17"
+tokio = { version = "1", features = ["test-util", "macros"] }
+reqwest = { version = "0.12", features = ["json"] }
+http = "1.1"
+tempfile = "3"
+serial_test = "3.2"
+tower = { version = "0.5", features = ["util"] }
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["hashicorp_vault", "localstack"] }
+futures = "0.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release-debug]
+inherits = "release"
+debug = true
+strip = false

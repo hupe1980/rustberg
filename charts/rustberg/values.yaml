@@ -1,0 +1,292 @@
+# Default values for rustberg
+# This is a YAML-formatted file.
+
+# =============================================================================
+# Image Configuration
+# =============================================================================
+image:
+  repository: ghcr.io/hupe1980/rustberg
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# =============================================================================
+# Replica Configuration
+# =============================================================================
+replicaCount: 1
+
+# Autoscaling configuration
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+
+# =============================================================================
+# Rustberg Configuration
+# =============================================================================
+rustberg:
+  # Server configuration
+  server:
+    host: "0.0.0.0"
+    port: 8080
+    # TLS configuration (optional)
+    tls:
+      enabled: false
+      certSecretName: ""
+      # certFile: /certs/tls.crt
+      # keyFile: /certs/tls.key
+
+  # Storage backend configuration
+  storage:
+    # Backend type: memory, local, s3, gcs, azure
+    type: "memory"
+    
+    # S3 configuration
+    s3:
+      bucket: ""
+      region: "us-east-1"
+      endpoint: ""  # For MinIO or LocalStack
+      accessKeyId: ""
+      secretAccessKey: ""
+      # Use existing secret for credentials
+      existingSecret: ""
+      existingSecretAccessKeyIdKey: "access-key-id"
+      existingSecretSecretAccessKeyKey: "secret-access-key"
+    
+    # GCS configuration
+    gcs:
+      bucket: ""
+      projectId: ""
+      # Service account key JSON (use existingSecret for production)
+      serviceAccountKey: ""
+      existingSecret: ""
+      existingSecretKey: "credentials.json"
+    
+    # Azure configuration
+    azure:
+      container: ""
+      accountName: ""
+      accountKey: ""
+      existingSecret: ""
+      existingSecretKey: "account-key"
+
+  # Warehouse location
+  warehouse:
+    location: "file:///data/warehouse"
+
+  # Authentication configuration
+  auth:
+    # Enable authentication
+    enabled: false
+    
+    # API key authentication
+    apiKeys:
+      enabled: false
+      # Pre-configured API keys (use secrets in production)
+      keys: []
+      # - name: "admin"
+      #   key: "rk_xxx"
+      #   roles: ["admin"]
+    
+    # JWT/OIDC authentication
+    jwt:
+      enabled: false
+      issuer: ""
+      audience: ""
+      jwksUri: ""
+
+  # Authorization configuration
+  authorization:
+    # Enable Cedar authorization
+    enabled: false
+    # Cedar policies (inline)
+    policies: ""
+    # Load policies from ConfigMap
+    policiesConfigMap: ""
+
+  # Encryption configuration
+  encryption:
+    enabled: false
+    # KMS provider: env, aws-kms, vault, gcp-kms, azure-keyvault
+    kmsProvider: "env"
+    
+    # Environment key provider (development only)
+    envKey: ""
+    
+    # AWS KMS
+    awsKms:
+      keyId: ""
+      region: "us-east-1"
+    
+    # HashiCorp Vault
+    vault:
+      address: ""
+      token: ""
+      transitMount: "transit"
+      keyName: "rustberg"
+      existingSecret: ""
+      existingSecretTokenKey: "token"
+
+  # Additional environment variables
+  extraEnv: []
+  # - name: RUST_LOG
+  #   value: "info"
+
+  # Configuration file (rustberg.toml) - raw content
+  config: ""
+
+# =============================================================================
+# Service Configuration
+# =============================================================================
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+# =============================================================================
+# Ingress Configuration
+# =============================================================================
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: rustberg.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: rustberg-tls
+  #    hosts:
+  #      - rustberg.local
+
+# =============================================================================
+# Service Account
+# =============================================================================
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+    # eks.amazonaws.com/role-arn: arn:aws:iam::123456789:role/rustberg
+  name: ""
+
+# =============================================================================
+# Pod Configuration
+# =============================================================================
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+
+# =============================================================================
+# Resources
+# =============================================================================
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 64Mi
+
+# =============================================================================
+# Probes
+# =============================================================================
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# =============================================================================
+# Persistence (for local storage backend)
+# =============================================================================
+persistence:
+  enabled: false
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 10Gi
+  annotations: {}
+
+# =============================================================================
+# Scheduling
+# =============================================================================
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# Pod topology spread constraints
+topologySpreadConstraints: []
+
+# Pod disruption budget
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  # maxUnavailable: 1
+
+# =============================================================================
+# Monitoring
+# =============================================================================
+serviceMonitor:
+  enabled: false
+  namespace: ""
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+  annotations: {}
+
+# =============================================================================
+# Network Policies
+# =============================================================================
+networkPolicy:
+  enabled: false
+  ingress:
+    # Allow traffic from these namespaces
+    from: []
+    # - namespaceSelector:
+    #     matchLabels:
+    #       name: data-platform
+  egress:
+    # Allow traffic to these destinations
+    to: []
+    # - namespaceSelector: {}
+    #   podSelector:
+    #     matchLabels:
+    #       app: minio

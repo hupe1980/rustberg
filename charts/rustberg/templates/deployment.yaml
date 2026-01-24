@@ -1,0 +1,154 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rustberg.fullname" . }}
+  labels:
+    {{- include "rustberg.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "rustberg.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "rustberg.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "rustberg.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: {{ include "rustberg.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--host"
+            - "{{ .Values.rustberg.server.host }}"
+            - "--port"
+            - "{{ .Values.rustberg.server.port }}"
+            - "--storage"
+            - "{{ include "rustberg.warehouseLocation" . }}"
+            {{- if .Values.rustberg.config }}
+            - "--config"
+            - "/config/rustberg.toml"
+            {{- end }}
+            {{- if not .Values.rustberg.server.tls.enabled }}
+            - "--insecure-http"
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.rustberg.server.port }}
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: "info"
+            {{- include "rustberg.storageEnv" . | nindent 12 }}
+            {{- if .Values.rustberg.encryption.enabled }}
+            {{- if eq .Values.rustberg.encryption.kmsProvider "env" }}
+            - name: RUSTBERG_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rustberg.fullname" . }}-encryption
+                  key: encryption-key
+            {{- end }}
+            {{- if eq .Values.rustberg.encryption.kmsProvider "vault" }}
+            - name: VAULT_ADDR
+              value: {{ .Values.rustberg.encryption.vault.address | quote }}
+            {{- if .Values.rustberg.encryption.vault.existingSecret }}
+            - name: VAULT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.rustberg.encryption.vault.existingSecret }}
+                  key: {{ .Values.rustberg.encryption.vault.existingSecretTokenKey }}
+            {{- else }}
+            - name: VAULT_TOKEN
+              value: {{ .Values.rustberg.encryption.vault.token | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.rustberg.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            {{- if .Values.rustberg.config }}
+            - name: config
+              mountPath: /config
+              readOnly: true
+            {{- end }}
+            {{- if .Values.persistence.enabled }}
+            - name: data
+              mountPath: /data
+            {{- end }}
+            {{- if and (eq .Values.rustberg.storage.type "gcs") .Values.rustberg.storage.gcs.existingSecret }}
+            - name: gcp-credentials
+              mountPath: /gcp
+              readOnly: true
+            {{- end }}
+            {{- if .Values.rustberg.server.tls.enabled }}
+            - name: tls
+              mountPath: /certs
+              readOnly: true
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        {{- if .Values.rustberg.config }}
+        - name: config
+          configMap:
+            name: {{ include "rustberg.fullname" . }}-config
+        {{- end }}
+        {{- if .Values.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "rustberg.fullname" . }}-data
+        {{- end }}
+        {{- if and (eq .Values.rustberg.storage.type "gcs") .Values.rustberg.storage.gcs.existingSecret }}
+        - name: gcp-credentials
+          secret:
+            secretName: {{ .Values.rustberg.storage.gcs.existingSecret }}
+        {{- end }}
+        {{- if .Values.rustberg.server.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.rustberg.server.tls.certSecretName }}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

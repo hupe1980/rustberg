@@ -1,0 +1,119 @@
+# Rustberg Configuration Example
+# Copy this file to rustberg.toml and customize for your environment.
+# Configuration files are searched in this order:
+#   1. ./rustberg.toml
+#   2. /etc/rustberg/config.toml
+#   3. ./config/rustberg.toml
+
+# =============================================================================
+# Server Configuration
+# =============================================================================
+[server]
+# Host address to bind to (0.0.0.0 for all interfaces)
+host = "0.0.0.0"
+# Port to listen on
+port = 8000
+
+# Authentication configuration
+[server.auth]
+# Enable API key authentication
+api_key_enabled = true
+# Enable JWT authentication (for SSO/OAuth)
+jwt_enabled = false
+
+# JWT configuration (only used if jwt_enabled = true)
+# [server.auth.jwt]
+# issuer = "https://auth.example.com"
+# audience = "rustberg-api"
+# jwks_url = "https://auth.example.com/.well-known/jwks.json"
+# default_tenant_id = "default"
+# tenant_claim = "tenant_id"
+# roles_claim = "roles"
+# jwks_cache_ttl_seconds = 3600
+
+# CORS configuration
+[server.cors]
+allowed_origins = ["*"]
+allowed_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+allowed_headers = ["*"]
+
+# =============================================================================
+# TLS Configuration
+# =============================================================================
+[tls]
+# Enable TLS (HTTPS)
+# For production, set enabled = true and provide cert/key paths
+enabled = false
+# Path to TLS certificate file (PEM format)
+# cert_path = "/etc/rustberg/tls/cert.pem"
+# Path to TLS private key file (PEM format)
+# key_path = "/etc/rustberg/tls/key.pem"
+# Allow insecure HTTP (development only - DO NOT use in production)
+insecure_http = true
+
+# =============================================================================
+# Storage Configuration
+# =============================================================================
+[storage]
+# Storage backend URL:
+#   - "file:///var/lib/rustberg/data" - Local filesystem (single-node)
+#   - "s3://bucket/prefix?region=us-east-1" - AWS S3 (K8s HA)
+#   - "gs://bucket/prefix" - Google Cloud Storage (K8s HA)
+#   - "az://container/prefix" - Azure Blob Storage (K8s HA)
+#   - "memory://" - In-memory (testing only)
+backend = "file:///var/lib/rustberg/data"
+# Warehouse location for table data (S3, GCS, HDFS, or local path)
+# warehouse_location = "s3://my-bucket/warehouse"
+
+# =============================================================================
+# KMS Configuration (Key Management Service)
+# =============================================================================
+[kms]
+# KMS provider: "env" (default), "aws-kms", "vault", "gcp-kms", "azure-keyvault"
+provider = "env"
+
+# For "env" provider:
+# Set RUSTBERG_MASTER_KEY environment variable with a 32-byte hex-encoded key.
+# Generate with: openssl rand -hex 32
+
+# For "aws-kms" provider:
+# aws_key_id = "alias/rustberg-key"
+# aws_region = "us-east-1"
+
+# For "vault" provider:
+# vault_address = "https://vault.example.com:8200"
+# vault_key_name = "rustberg-transit"
+
+# Cache TTL for KMS operations (seconds)
+cache_ttl_seconds = 300
+# Enable circuit breaker for KMS failures (recommended for production)
+circuit_breaker_enabled = true
+
+# =============================================================================
+# Rate Limiting Configuration
+# =============================================================================
+[rate_limit]
+# Enable rate limiting (recommended for production)
+enabled = true
+# Maximum requests per second (per IP address)
+requests_per_second = 100
+# Burst size for rate limiter
+burst_size = 200
+
+# Authentication failure tracking
+track_auth_failures = true
+# Maximum authentication failures before lockout
+max_auth_failures = 5
+# Lockout duration in seconds (5 minutes)
+lockout_duration_seconds = 300
+
+# =============================================================================
+# Logging Configuration
+# =============================================================================
+[logging]
+# Log level: "trace", "debug", "info", "warn", "error"
+level = "info"
+# Output logs in JSON format (for SIEM ingestion)
+json_format = false
+# Include span events in tracing output
+with_span_events = true

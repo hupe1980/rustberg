@@ -19,3 +19,15 @@ target/
 # Added by cargo
 
 /target
+
+# Custom
+.DS_Store
+FINDINGS.md
+_prompts
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+uv.lock

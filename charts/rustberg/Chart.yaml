@@ -1,0 +1,22 @@
+apiVersion: v2
+name: rustberg
+description: A Helm chart for Rustberg - Apache Iceberg REST Catalog
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/hupe1980/rustberg
+sources:
+  - https://github.com/hupe1980/rustberg
+maintainers:
+  - name: hupe1980
+    url: https://github.com/hupe1980
+keywords:
+  - iceberg
+  - catalog
+  - data-lake
+  - lakehouse
+  - rust
+icon: https://raw.githubusercontent.com/hupe1980/rustberg/main/docs/assets/logo.png
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/category: data-processing

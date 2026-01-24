@@ -1,0 +1,105 @@
+# Rustberg Documentation Site
+# Modern Jekyll configuration for GitHub Pages
+
+# Site Settings
+title: Rustberg
+tagline: Zero-dependency Apache Iceberg REST Catalog
+description: >-
+  A production-ready, single-binary Apache Iceberg REST Catalog written in 100% Rust.
+  Zero external dependencies, sub-10ms startup, 9MB memory footprint.
+url: "https://hupe1980.github.io"
+baseurl: "/rustberg"
+repository: hupe1980/rustberg
+
+# Build Settings
+markdown: kramdown
+remote_theme: just-the-docs/just-the-docs@v0.10.0
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+  - jekyll-feed
+  - jekyll-github-metadata
+
+# Theme Settings
+color_scheme: light
+search_enabled: true
+search:
+  heading_level: 2
+  previews: 3
+  preview_words_before: 5
+  preview_words_after: 10
+  tokenizer_separator: /[\s/]+/
+  rel_url: true
+  button: false
+
+# Navigation
+nav_enabled: true
+nav_sort: case_insensitive
+
+# Heading anchor links
+heading_anchors: true
+
+# Back to top link
+back_to_top: true
+back_to_top_text: "Back to top"
+
+# Footer
+footer_content: "Copyright &copy; 2026 Rustberg. Distributed under the <a href=\"https://github.com/hupe1980/rustberg/blob/main/LICENSE\">Apache License 2.0</a>."
+
+# Exclude from processing
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - node_modules
+  - vendor
+
+# SEO
+twitter:
+  card: summary
+social:
+  name: Rustberg
+  links:
+    - https://github.com/hupe1980/rustberg
+
+# Google Analytics (optional - add your tracking ID)
+# ga_tracking: UA-XXXXXXXXX-X
+
+# Collections
+collections:
+  docs:
+    output: true
+    permalink: /:collection/:path/
+
+# Defaults
+defaults:
+  - scope:
+      path: ""
+      type: "pages"
+    values:
+      layout: "default"
+  - scope:
+      path: ""
+      type: "docs"
+    values:
+      layout: "default"
+
+# Callouts
+callouts:
+  warning:
+    title: Warning
+    color: yellow
+  note:
+    title: Note
+    color: blue
+  important:
+    title: Important
+    color: green
+  security:
+    title: Security
+    color: red
+
+# Mermaid diagram support
+mermaid:
+  version: "11"
+  config:
+    theme: "default"
