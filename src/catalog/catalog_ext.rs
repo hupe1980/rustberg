@@ -5,7 +5,6 @@
 //! us to update tables directly from HTTP request payloads.
 
 use std::fmt::Debug;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use iceberg::table::Table;
@@ -32,6 +31,18 @@ pub trait CatalogExt: Catalog {
         table_ident: &TableIdent,
         requirements: Vec<TableRequirement>,
         updates: Vec<TableUpdate>,
+    ) -> Result<Table>;
+
+    /// Updates the metadata location for an existing table in the catalog registry.
+    ///
+    /// This is used internally by `commit_table` to atomically update the catalog's
+    /// pointer to the new metadata file after writing it to storage.
+    ///
+    /// Unlike `register_table`, this method expects the table to already exist.
+    async fn update_table_metadata_location(
+        &self,
+        table_ident: &TableIdent,
+        new_metadata_location: String,
     ) -> Result<Table>;
 }
 
@@ -162,25 +173,32 @@ impl<C: Catalog + Send + Sync> CatalogExt for ExtendedCatalog<C> {
         // Generate new metadata location
         let new_metadata_location = generate_new_metadata_location(current_metadata_location)?;
 
-        // Reconstruct the table with updated metadata using the public builder API
-        let updated_table = Table::builder()
-            .identifier(table_ident.clone())
-            .file_io(table.file_io().clone())
-            .metadata(Arc::new(new_metadata.metadata))
-            .metadata_location(new_metadata_location)
-            .build()?;
+        // Write the new metadata file to storage
+        // This is critical for persistence - without this, snapshots are lost!
+        new_metadata
+            .metadata
+            .write_to(table.file_io(), &new_metadata_location)
+            .await?;
 
-        // Note: For MemoryCatalog, changes are not persisted across loads.
-        // This is a limitation of MemoryCatalog - subsequent loads will return the original.
-        //
-        // For production deployments, use SlateCatalog which:
-        // 1. Writes new metadata JSON to storage via FileIO
-        // 2. Updates the catalog registry atomically in SlateDB
-        //
-        // SlateCatalog is selected automatically when using storage backends
-        // like file://, s3://, gs://, or az:// via App::builder().with_storage_backend().
+        // Update the catalog registry with the new metadata location
+        self.update_table_metadata_location(table_ident, new_metadata_location)
+            .await
+    }
 
-        Ok(updated_table)
+    async fn update_table_metadata_location(
+        &self,
+        table_ident: &TableIdent,
+        new_metadata_location: String,
+    ) -> Result<Table> {
+        // For the generic ExtendedCatalog, we use a drop-and-register approach.
+        // This is not ideal for concurrent access, but works for MemoryCatalog.
+        //
+        // Note: SlateCatalog has a more efficient implementation that directly
+        // updates the registry atomically.
+        self.inner.drop_table(table_ident).await?;
+        self.inner
+            .register_table(table_ident, new_metadata_location)
+            .await
     }
 }
 

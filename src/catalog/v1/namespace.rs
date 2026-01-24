@@ -64,9 +64,9 @@ pub struct UpdateNamespacePropertiesPayload {
 
 #[derive(Serialize)]
 pub struct UpdateNamespacePropertiesResponse {
-    updated: Vec<String>,         // List of property keys that were added or updated
-    removed: Vec<String>,         // List of properties that were removed
-    missing: Option<Vec<String>>, // List of properties requested for removal but not found (nullable)
+    updated: Vec<String>, // List of property keys that were added or updated
+    removed: Vec<String>, // List of properties that were removed
+    missing: Vec<String>, // List of properties requested for removal but not found
 }
 
 pub async fn list_namespaces(
@@ -336,11 +336,7 @@ pub async fn update_namespace_properties(
     Ok(AxumJson(UpdateNamespacePropertiesResponse {
         updated,
         removed,
-        missing: if missing.is_empty() {
-            None
-        } else {
-            Some(missing)
-        },
+        missing,
     }))
 }
 // ============================================================================
@@ -522,7 +518,7 @@ mod tests {
         let response = UpdateNamespacePropertiesResponse {
             updated: vec!["a".to_string(), "b".to_string()],
             removed: vec!["c".to_string()],
-            missing: Some(vec!["d".to_string()]),
+            missing: vec!["d".to_string()],
         };
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["updated"].as_array().unwrap().len(), 2);
@@ -535,11 +531,11 @@ mod tests {
         let response = UpdateNamespacePropertiesResponse {
             updated: vec!["key".to_string()],
             removed: vec![],
-            missing: None,
+            missing: vec![],
         };
         let json = serde_json::to_value(&response).unwrap();
-        // missing should be null when None
-        assert!(json["missing"].is_null());
+        // missing should be empty array when no properties were missing
+        assert!(json["missing"].as_array().unwrap().is_empty());
     }
 
     // ========================================================================

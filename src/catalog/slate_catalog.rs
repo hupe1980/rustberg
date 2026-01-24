@@ -37,10 +37,12 @@ use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result, TableCommit,
-    TableCreation, TableIdent,
+    TableCreation, TableIdent, TableRequirement, TableUpdate,
 };
 use serde::{Deserialize, Serialize};
 use slatedb::Db;
+
+use super::CatalogExt;
 
 /// Metadata stored for each namespace in the catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -797,6 +799,100 @@ impl Catalog for SlateCatalog {
         Table::builder()
             .identifier(table_ident)
             .metadata(new_metadata)
+            .metadata_location(new_metadata_location)
+            .file_io(self.file_io.clone())
+            .build()
+    }
+}
+
+#[async_trait]
+impl CatalogExt for SlateCatalog {
+    async fn commit_table(
+        &self,
+        table_ident: &TableIdent,
+        requirements: Vec<TableRequirement>,
+        updates: Vec<TableUpdate>,
+    ) -> Result<Table> {
+        // Load current table
+        let table = self.load_table(table_ident).await?;
+
+        // Check all requirements against current metadata
+        for requirement in &requirements {
+            requirement.check(Some(table.metadata()))?;
+        }
+
+        // Get current metadata location
+        let current_metadata_location = table
+            .metadata_location()
+            .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "Table has no metadata location"))?;
+
+        // Apply all updates to build new metadata
+        let mut metadata_builder = table
+            .metadata()
+            .clone()
+            .into_builder(Some(current_metadata_location.to_string()));
+
+        for update in updates {
+            metadata_builder = update.apply(metadata_builder)?;
+        }
+
+        // Build the new metadata
+        let new_metadata = metadata_builder.build()?;
+
+        // Generate new metadata location
+        let table_location = table.metadata().location();
+        let new_metadata_location = MetadataLocation::new_with_table_location(table_location)
+            .with_next_version()
+            .to_string();
+
+        // Write the new metadata file to storage
+        new_metadata
+            .metadata
+            .write_to(&self.file_io, &new_metadata_location)
+            .await?;
+
+        // Update the catalog registry with the new metadata location
+        self.update_table_metadata_location(table_ident, new_metadata_location)
+            .await
+    }
+
+    async fn update_table_metadata_location(
+        &self,
+        table_ident: &TableIdent,
+        new_metadata_location: String,
+    ) -> Result<Table> {
+        let key = Self::table_key(table_ident);
+
+        // Read metadata from the new location to verify it's valid
+        let metadata = TableMetadata::read_from(&self.file_io, &new_metadata_location).await?;
+
+        // Update the registry entry with the new metadata location
+        let entry = TableRegistryEntry {
+            namespace: table_ident
+                .namespace
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            name: table_ident.name().to_string(),
+            metadata_location: new_metadata_location.clone(),
+        };
+
+        let value = serde_json::to_vec(&entry).map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to serialize table registry entry: {}", e),
+            )
+        })?;
+
+        // Atomically update the registry
+        self.db
+            .put(&key, &value)
+            .await
+            .map_err(Self::convert_error)?;
+
+        Table::builder()
+            .identifier(table_ident.clone())
+            .metadata(metadata)
             .metadata_location(new_metadata_location)
             .file_io(self.file_io.clone())
             .build()

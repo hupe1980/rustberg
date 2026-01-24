@@ -10,30 +10,32 @@ name = "rustberg-tests"
 version = "0.1.0"
 description = "Integration tests for Rustberg Iceberg REST Catalog"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
 
 dependencies = [
     # PyIceberg for REST catalog testing
-    "pyiceberg>=0.8.0",
+    "pyiceberg>=0.10.0",
     # PySpark for Spark integration tests  
-    "pyspark>=3.5.0",
+    "pyspark>=4.0.0",
     # DuckDB for embedded analytics
-    "duckdb>=1.0.0",
+    "duckdb>=1.2.0",
     # PyArrow for data handling
-    "pyarrow>=15.0.0",
+    "pyarrow>=18.0.0",
     # Testing framework
-    "pytest>=8.0.0",
-    "pytest-asyncio>=0.23.0",
-    "pytest-timeout>=2.3.0",
+    "pytest>=9.0.0",
+    "pytest-asyncio>=1.0.0",
+    "pytest-timeout>=2.4.0",
     # HTTP client
-    "httpx>=0.27.0",
+    "httpx>=0.28.0",
+    # Testcontainers for Docker-based testing
+    "testcontainers>=4.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "ruff>=0.4.0",
-    "mypy>=1.10.0",
+    "ruff>=0.14.0",
+    "mypy>=1.15.0",
 ]
 
 # =============================================================================
@@ -55,7 +57,7 @@ markers = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "B", "C4", "UP"]
@@ -65,13 +67,13 @@ ignore = ["E501"]  # Line length handled by formatter
 quote-style = "double"
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 strict = true
 warn_return_any = true
 warn_unused_ignores = true
 
 [dependency-groups]
 dev = [
-    "ruff>=0.4.0",
-    "mypy>=1.10.0",
+    "ruff>=0.14.0",
+    "mypy>=1.15.0",
 ]

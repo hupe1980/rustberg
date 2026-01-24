@@ -52,6 +52,7 @@ class RustbergServer:
             [
                 self.binary_path,
                 "--insecure-http",
+                "--no-auth",
                 "--host", "127.0.0.1",
                 "--port", str(self.port),
             ],
@@ -72,13 +73,45 @@ class RustbergServer:
         start = time.time()
         
         while time.time() - start < RUSTBERG_STARTUP_TIMEOUT:
+            # Check if process has exited unexpectedly
+            if self.process and self.process.poll() is not None:
+                exit_code = self.process.returncode
+                stderr_output = ""
+                stdout_output = ""
+                if self.process.stderr:
+                    stderr_output = self.process.stderr.read().decode("utf-8", errors="replace")
+                if self.process.stdout:
+                    stdout_output = self.process.stdout.read().decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"Rustberg server exited unexpectedly with code {exit_code}\n"
+                    f"Binary: {self.binary_path}\n"
+                    f"Stdout: {stdout_output}\n"
+                    f"Stderr: {stderr_output}"
+                )
+            
             try:
                 urllib.request.urlopen(url, timeout=1)
                 return
             except (urllib.error.URLError, ConnectionRefusedError):
                 time.sleep(0.1)
-                
-        raise TimeoutError(f"Rustberg server did not start within {RUSTBERG_STARTUP_TIMEOUT}s")
+        
+        # On timeout, also try to get any output
+        stderr_output = ""
+        stdout_output = ""
+        if self.process:
+            if self.process.stderr:
+                # Non-blocking read attempt
+                import select
+                if hasattr(select, 'select'):
+                    readable, _, _ = select.select([self.process.stderr], [], [], 0)
+                    if readable:
+                        stderr_output = self.process.stderr.read().decode("utf-8", errors="replace")
+        
+        raise TimeoutError(
+            f"Rustberg server did not start within {RUSTBERG_STARTUP_TIMEOUT}s\n"
+            f"Binary: {self.binary_path}\n"
+            f"Stderr: {stderr_output}"
+        )
         
     def stop(self) -> None:
         """Stop the Rustberg server."""
@@ -250,6 +283,23 @@ def sample_sort_order():
 # PySpark Fixtures
 # =============================================================================
 
+def _is_java_available() -> bool:
+    """Check if Java is available locally."""
+    import shutil
+    if not shutil.which("java"):
+        return False
+    # Also verify it actually runs
+    try:
+        result = subprocess.run(
+            ["java", "-version"],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 @pytest.fixture(scope="session")
 def spark_session(rustberg_server: str, warehouse_path: str):
     """
@@ -257,7 +307,13 @@ def spark_session(rustberg_server: str, warehouse_path: str):
     
     This fixture is session-scoped to avoid the overhead of creating
     multiple Spark sessions.
+    
+    Requires Java 11+ to be installed. Skips tests if Java is not available.
     """
+    if not _is_java_available():
+        pytest.skip("PySpark tests require Java 11+ - install Java or run in CI")
+        return
+    
     from pyspark.sql import SparkSession
     
     spark = (

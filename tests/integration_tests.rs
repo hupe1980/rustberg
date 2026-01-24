@@ -1024,6 +1024,174 @@ async fn test_drop_table() {
     assert_eq!(get_status, StatusCode::NOT_FOUND);
 }
 
+/// Test that snapshot commits are properly persisted.
+/// This test catches the bug where commit_table returned 200 OK but
+/// didn't actually write the metadata to storage, causing snapshot loss.
+#[tokio::test]
+async fn test_commit_table_snapshot_persisted() {
+    let (app, _state) = create_test_app_no_auth().await;
+
+    // Create namespace
+    let create_ns_body = json!({
+        "namespace": ["snapshot-persist-test"],
+        "properties": {}
+    });
+
+    make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces",
+        None,
+        Some(create_ns_body),
+    )
+    .await;
+
+    // Create table
+    let create_table_body = json!({
+        "name": "snapshot_table",
+        "schema": {
+            "type": "struct",
+            "fields": [
+                {
+                    "id": 1,
+                    "name": "id",
+                    "required": true,
+                    "type": "long"
+                }
+            ]
+        }
+    });
+
+    let (status, body) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/snapshot-persist-test/tables",
+        None,
+        Some(create_table_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Parse table metadata to get UUID
+    let create_response: serde_json::Value = serde_json::from_str(&body).expect("Invalid JSON");
+    let table_uuid = create_response["metadata"]["table-uuid"]
+        .as_str()
+        .expect("No table UUID");
+
+    // Verify table starts with no snapshots
+    assert!(
+        create_response["metadata"]["snapshots"]
+            .as_array()
+            .is_none_or(|a| a.is_empty()),
+        "New table should have no snapshots"
+    );
+
+    // Commit: Add a snapshot
+    // Note: In real usage, PyIceberg/Spark send add-snapshot updates after writing data files
+    let snapshot_id: i64 = 1234567890123456789;
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    let commit_body = json!({
+        "requirements": [
+            {
+                "type": "assert-table-uuid",
+                "uuid": table_uuid
+            }
+        ],
+        "updates": [
+            {
+                "action": "add-snapshot",
+                "snapshot": {
+                    "snapshot-id": snapshot_id,
+                    "timestamp-ms": timestamp_ms,
+                    "summary": {
+                        "operation": "append"
+                    },
+                    "manifest-list": "file:///tmp/test-manifest-list.avro",
+                    "schema-id": 0
+                }
+            },
+            {
+                "action": "set-snapshot-ref",
+                "ref-name": "main",
+                "type": "branch",
+                "snapshot-id": snapshot_id
+            }
+        ]
+    });
+
+    let (commit_status, commit_body_str) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/snapshot-persist-test/tables/snapshot_table",
+        None,
+        Some(commit_body),
+    )
+    .await;
+
+    assert_eq!(
+        commit_status,
+        StatusCode::OK,
+        "Commit failed: {}",
+        commit_body_str
+    );
+
+    // Verify commit response has the snapshot
+    let commit_response: serde_json::Value =
+        serde_json::from_str(&commit_body_str).expect("Invalid JSON");
+    let commit_snapshots = commit_response["metadata"]["snapshots"]
+        .as_array()
+        .expect("No snapshots in commit response");
+    assert_eq!(
+        commit_snapshots.len(),
+        1,
+        "Expected 1 snapshot in commit response"
+    );
+
+    // CRITICAL: Reload table and verify snapshot persisted
+    let (reload_status, reload_body) = make_request(
+        &app,
+        Method::GET,
+        "/v1/namespaces/snapshot-persist-test/tables/snapshot_table",
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(reload_status, StatusCode::OK);
+
+    let reload_response: serde_json::Value =
+        serde_json::from_str(&reload_body).expect("Invalid JSON");
+
+    // Verify snapshot was persisted
+    let reloaded_snapshots = reload_response["metadata"]["snapshots"]
+        .as_array()
+        .expect("No snapshots array in reloaded table");
+
+    assert_eq!(
+        reloaded_snapshots.len(),
+        1,
+        "Snapshot was not persisted! Found {} snapshots after reload",
+        reloaded_snapshots.len()
+    );
+
+    assert_eq!(
+        reloaded_snapshots[0]["snapshot-id"].as_i64(),
+        Some(snapshot_id),
+        "Wrong snapshot ID after reload"
+    );
+
+    // Verify current-snapshot-id is set
+    assert_eq!(
+        reload_response["metadata"]["current-snapshot-id"].as_i64(),
+        Some(snapshot_id),
+        "current-snapshot-id was not persisted"
+    );
+}
+
 #[tokio::test]
 async fn test_commit_table_set_properties() {
     let (app, _state) = create_test_app_no_auth().await;
@@ -1116,6 +1284,48 @@ async fn test_commit_table_set_properties() {
     assert!(commit_response["metadata-location"].is_string());
     assert!(commit_response["metadata"]["properties"]["custom.prop1"].as_str() == Some("value1"));
     assert!(commit_response["metadata"]["properties"]["custom.prop2"].as_str() == Some("value2"));
+
+    // CRITICAL: Verify persistence by reloading the table
+    // This ensures the commit was actually persisted, not just returned in the response
+    let (reload_status, reload_body) = make_request(
+        &app,
+        Method::GET,
+        "/v1/namespaces/commit-test/tables/commit_table",
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        reload_status,
+        StatusCode::OK,
+        "Failed to reload table after commit"
+    );
+
+    let reload_response: serde_json::Value =
+        serde_json::from_str(&reload_body).expect("Invalid JSON");
+
+    // Verify the reloaded table has the committed properties
+    assert_eq!(
+        reload_response["metadata"]["properties"]["custom.prop1"].as_str(),
+        Some("value1"),
+        "Property custom.prop1 was not persisted after commit"
+    );
+    assert_eq!(
+        reload_response["metadata"]["properties"]["custom.prop2"].as_str(),
+        Some("value2"),
+        "Property custom.prop2 was not persisted after commit"
+    );
+
+    // Verify metadata location was updated (not the original v0)
+    let reloaded_metadata_loc = reload_response["metadata-location"]
+        .as_str()
+        .expect("No metadata location in reloaded table");
+    assert!(
+        reloaded_metadata_loc.contains("00001-"),
+        "Metadata location should be version 1 after commit, got: {}",
+        reloaded_metadata_loc
+    );
 }
 
 #[tokio::test]

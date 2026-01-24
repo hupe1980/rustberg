@@ -424,6 +424,17 @@ impl CatalogExt for EncryptedCatalog {
             .commit_table(table_ident, requirements, updates)
             .await
     }
+
+    async fn update_table_metadata_location(
+        &self,
+        table_ident: &TableIdent,
+        new_metadata_location: String,
+    ) -> Result<Table> {
+        // Delegate to inner catalog
+        self.inner
+            .update_table_metadata_location(table_ident, new_metadata_location)
+            .await
+    }
 }
 
 #[cfg(test)]

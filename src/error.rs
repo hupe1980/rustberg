@@ -14,7 +14,7 @@ use thiserror::Error;
 /// Result type alias using AppError.
 pub type Result<T, E = AppError> = std::result::Result<T, E>;
 
-/// Error response body following Iceberg REST Catalog specification.
+/// Inner error model following Iceberg REST Catalog specification.
 #[derive(Debug, Serialize)]
 pub struct ErrorModel {
     /// Human-readable error message.
@@ -27,6 +27,14 @@ pub struct ErrorModel {
     /// Optional stack trace (only in debug mode).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stack: Vec<String>,
+}
+
+/// Error response wrapper following Iceberg REST Catalog specification.
+/// All error responses are wrapped in an "error" key per the spec.
+#[derive(Debug, Serialize)]
+pub struct IcebergErrorResponse {
+    /// The error details.
+    pub error: ErrorModel,
 }
 
 /// Application error types.
@@ -372,7 +380,10 @@ impl IntoResponse for AppError {
             stack,
         };
 
-        (status, Json(body)).into_response()
+        // Wrap in IcebergErrorResponse per Iceberg REST Catalog spec
+        let response = IcebergErrorResponse { error: body };
+
+        (status, Json(response)).into_response()
     }
 }
 

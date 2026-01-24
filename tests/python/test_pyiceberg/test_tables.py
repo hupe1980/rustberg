@@ -43,7 +43,7 @@ class TestTableCreation:
         )
         
         assert table is not None
-        assert table.name() == ("simple_table",) or str(table.identifier) == table_name
+        assert table.name() == ("simple_table",) or "simple_table" in str(table.name())
         
         # Verify table exists
         tables = catalog.list_tables(temp_namespace)
