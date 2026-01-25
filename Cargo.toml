@@ -87,6 +87,9 @@ regex = "1.11"
 # HTTP client (for JWKS fetching)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
+# OpenSSL (vendored for cross-compilation - required by iceberg's native-tls dependency)
+openssl = { version = "0.10", features = ["vendored"] }
+
 # Validation
 validator = { version = "0.20", features = ["derive"] }
 
