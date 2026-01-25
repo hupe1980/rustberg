@@ -191,10 +191,10 @@ jobs:
           tool: cargo-zigbuild
       - name: Build release (zigbuild)
         if: matrix.zigbuild
-        run: cargo zigbuild --release --features slatedb-storage,cli,tls --target ${{ matrix.target }}
+        run: cargo zigbuild --release --all-features --target ${{ matrix.target }}
       - name: Build release (native)
         if: ${{ !matrix.zigbuild }}
-        run: cargo build --release --features slatedb-storage,cli,tls --target ${{ matrix.target }}
+        run: cargo build --release --all-features --target ${{ matrix.target }}
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
