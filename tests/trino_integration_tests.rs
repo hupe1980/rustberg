@@ -394,7 +394,7 @@ async fn trino_metadata_operations() {
 /// Verify Rustberg API compatibility with Iceberg REST spec
 /// These are the endpoints Trino calls
 #[tokio::test]
-async fn verify_iceberg_rest_api_compatibility() {
+async fn trino_verify_iceberg_rest_api_compatibility() {
     use rustberg::App;
 
     // Verify we can build the app - this validates the public API
