@@ -473,9 +473,8 @@ impl AppBuilder {
     /// let key = Aes256GcmProvider::generate_key();
     ///
     /// let (app, api_key_store) = App::builder()
-    ///     .with_storage_backend("file:///data/catalog")
     ///     .with_encryption_key(key)
-    ///     .build_with_persistent_api_key_auth_async()
+    ///     .build_with_api_key_auth_async()
     ///     .await;
     /// # }
     /// ```
