@@ -461,7 +461,6 @@ rustberg benchmark --iterations 10
 | Engine | Read | Write | Notes |
 |--------|------|-------|-------|
 | PyIceberg | ✅ | ✅ | Full support |
-| Spark | ✅ | ✅ | Full support |
 | Trino | ✅ | ✅ | Full support |
 | DuckDB | ✅ | - | Read-only |
 

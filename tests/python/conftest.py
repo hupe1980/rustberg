@@ -2,7 +2,7 @@
 Rustberg Python Integration Tests - Shared Fixtures
 
 This module provides pytest fixtures for testing Rustberg compatibility
-with PyIceberg and PySpark clients.
+with PyIceberg and DuckDB clients.
 """
 
 import os
@@ -277,93 +277,3 @@ def sample_sort_order():
     return SortOrder(
         SortField(source_id=1, transform=IdentityTransform()),
     )
-
-
-# =============================================================================
-# PySpark Fixtures
-# =============================================================================
-
-def _is_java_available() -> bool:
-    """Check if Java is available locally."""
-    import shutil
-    if not shutil.which("java"):
-        return False
-    # Also verify it actually runs
-    try:
-        result = subprocess.run(
-            ["java", "-version"],
-            capture_output=True,
-            timeout=5,
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
-
-
-@pytest.fixture(scope="session")
-def spark_session(rustberg_server: str, warehouse_path: str):
-    """
-    Create a PySpark session configured to use Rustberg as the catalog.
-    
-    This fixture is session-scoped to avoid the overhead of creating
-    multiple Spark sessions.
-    
-    Requires Java 11+ to be installed. Skips tests if Java is not available.
-    """
-    if not _is_java_available():
-        pytest.skip("PySpark tests require Java 11+ - install Java or run in CI")
-        return
-    
-    from pyspark.sql import SparkSession
-    
-    spark = (
-        SparkSession.builder
-        .appName("RustbergIntegrationTests")
-        .master("local[2]")
-        # Iceberg configuration
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-        .config("spark.sql.catalog.rustberg", "org.apache.iceberg.spark.SparkCatalog")
-        .config("spark.sql.catalog.rustberg.type", "rest")
-        .config("spark.sql.catalog.rustberg.uri", rustberg_server)
-        .config("spark.sql.catalog.rustberg.warehouse", warehouse_path)
-        # Use local warehouse for test data
-        .config("spark.sql.warehouse.dir", warehouse_path)
-        # Performance tuning for tests
-        .config("spark.driver.memory", "1g")
-        .config("spark.executor.memory", "1g")
-        .config("spark.sql.shuffle.partitions", "2")
-        # Disable UI for tests
-        .config("spark.ui.enabled", "false")
-        .getOrCreate()
-    )
-    
-    yield spark
-    
-    spark.stop()
-
-
-@pytest.fixture
-def spark_temp_namespace(spark_session) -> Generator[str, None, None]:
-    """
-    Create a temporary namespace in Spark for testing.
-    
-    Yields the fully qualified namespace name (catalog.namespace).
-    """
-    import uuid
-    
-    namespace = f"test_ns_{uuid.uuid4().hex[:8]}"
-    full_namespace = f"rustberg.{namespace}"
-    
-    spark_session.sql(f"CREATE NAMESPACE {full_namespace}")
-    
-    yield full_namespace
-    
-    # Cleanup
-    try:
-        # Drop all tables in namespace
-        tables = spark_session.sql(f"SHOW TABLES IN {full_namespace}").collect()
-        for table in tables:
-            spark_session.sql(f"DROP TABLE IF EXISTS {full_namespace}.{table.tableName}")
-        spark_session.sql(f"DROP NAMESPACE IF EXISTS {full_namespace}")
-    except Exception:
-        pass  # Best effort cleanup

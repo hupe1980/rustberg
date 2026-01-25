@@ -16,8 +16,6 @@ license = { text = "Apache-2.0" }
 dependencies = [
     # PyIceberg for REST catalog testing
     "pyiceberg>=0.10.0",
-    # PySpark for Spark integration tests  
-    "pyspark>=4.0.0",
     # DuckDB for embedded analytics
     "duckdb>=1.2.0",
     # PyArrow for data handling
@@ -50,7 +48,6 @@ timeout = 300  # 5 minute timeout per test
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
-    "spark: marks tests requiring PySpark",
     "pyiceberg: marks tests using PyIceberg client",
     "duckdb: marks tests using DuckDB client",
 ]

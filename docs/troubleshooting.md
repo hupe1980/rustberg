@@ -389,16 +389,6 @@ from pyiceberg.catalog import load_catalog
 catalog = load_catalog("rustberg", uri="http://localhost:8181")
 ```
 
-### Spark Connection Failed
-
-```scala
-// Enable debug logging
-spark.sparkContext.setLogLevel("DEBUG")
-
-// Test connection
-spark.sql("SHOW NAMESPACES IN rustberg")
-```
-
 ### Trino Connection Failed
 
 ```sql
