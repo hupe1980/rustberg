@@ -163,7 +163,7 @@ async fn test_aws_kms_envelope_encryption() {
         .post(format!("{}/", endpoint_url))
         .header("Content-Type", "application/x-amz-json-1.1")
         .header("X-Amz-Target", "TrentService.CreateKey")
-        .body(r#"{"Description": "Envelope test key", "KeyUsage": "ENCRYPT_DECRYPT"}"#)
+        .body(r#"{"Description": "Envelope test key", "KeyUsage": "ENCRYPT_DECRYPT", "KeySpec": "SYMMETRIC_DEFAULT"}"#)
         .send()
         .await
         .expect("Failed to create KMS key")
