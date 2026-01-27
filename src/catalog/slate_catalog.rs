@@ -183,7 +183,9 @@ impl SlateCatalog {
 
         // Extract path from file:// URL or use as-is
         let path = if warehouse_location.starts_with("file://") {
-            warehouse_location.strip_prefix("file://").unwrap_or(warehouse_location)
+            warehouse_location
+                .strip_prefix("file://")
+                .unwrap_or(warehouse_location)
         } else {
             warehouse_location
         };
