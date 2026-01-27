@@ -303,7 +303,7 @@ OPTIONS:
     -c, --config <FILE>      Configuration file path
         --host <HOST>        Bind address [default: 0.0.0.0]
     -p, --port <PORT>        Listen port [default: 8000]
-    -w, --warehouse <URL>    Warehouse location for table storage
+    -w, --warehouse <URL>    Warehouse location for table storage (see below)
     -t, --tenant-id <ID>     Default tenant ID [default: default]
         --no-auth            Disable authentication (NOT RECOMMENDED)
         --log-level <LEVEL>  Log level [default: info]
@@ -312,6 +312,37 @@ OPTIONS:
         --insecure-http      Allow HTTP (no TLS)
     -V, --version            Print version
     -h, --help               Print help
+```
+
+### Warehouse Location
+
+The `--warehouse` option specifies where table data files are stored. Supported formats:
+
+| Format | Example | Description |
+|--------|---------|-------------|
+| Relative path | `file://warehouse` | Resolves to `file://<current_dir>/warehouse` |
+| Absolute path | `file:///var/lib/data` | Local filesystem (absolute) |
+| S3 | `s3://bucket/prefix` | Amazon S3 |
+| GCS | `gs://bucket/prefix` | Google Cloud Storage |
+| Azure | `az://container/prefix` | Azure Blob Storage |
+
+{: .note }
+> For local filesystem paths, Rustberg automatically creates the directory if it doesn't exist and converts relative paths to absolute paths.
+
+**Examples:**
+
+```bash
+# Local development with relative path (creates ./warehouse directory)
+./rustberg --no-auth --insecure-http --warehouse file://warehouse
+
+# Local development with absolute path
+./rustberg --no-auth --insecure-http --warehouse file:///tmp/rustberg-warehouse
+
+# S3 backend
+./rustberg --warehouse s3://my-bucket/iceberg-warehouse
+
+# GCS backend
+./rustberg --warehouse gs://my-bucket/iceberg-warehouse
 ```
 
 ---

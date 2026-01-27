@@ -126,6 +126,9 @@ impl SlateCatalog {
     ///
     /// Returns error if FileIO cannot be created for the warehouse location.
     pub async fn new(db: Arc<Db>, warehouse_location: String) -> Result<Self> {
+        // Normalize and ensure warehouse directory exists for local paths
+        let warehouse_location = Self::normalize_and_ensure_local_directory(&warehouse_location)?;
+
         // Create FileIO from warehouse location
         let file_io = FileIO::from_path(&warehouse_location)?.build()?;
 
@@ -144,6 +147,9 @@ impl SlateCatalog {
         warehouse_location: String,
         props: HashMap<String, String>,
     ) -> Result<Self> {
+        // Normalize and ensure warehouse directory exists for local paths
+        let warehouse_location = Self::normalize_and_ensure_local_directory(&warehouse_location)?;
+
         let file_io = FileIO::from_path(&warehouse_location)?
             .with_props(props)
             .build()?;
@@ -153,6 +159,70 @@ impl SlateCatalog {
             file_io,
             warehouse_location,
         })
+    }
+
+    /// Normalizes the warehouse location and ensures the directory exists for local paths.
+    ///
+    /// This handles:
+    /// - `file://relative/path` → converts to absolute and creates directory
+    /// - `file:///absolute/path` → creates directory  
+    /// - `/absolute/path` → creates directory
+    /// - `relative/path` → converts to absolute and creates directory
+    /// - `s3://`, `gs://`, `az://` → returned unchanged (cloud storage)
+    ///
+    /// Returns the normalized warehouse location.
+    fn normalize_and_ensure_local_directory(warehouse_location: &str) -> Result<String> {
+        // Check for cloud storage schemes - return unchanged
+        if warehouse_location.starts_with("s3://")
+            || warehouse_location.starts_with("gs://")
+            || warehouse_location.starts_with("az://")
+            || warehouse_location.starts_with("memory://")
+        {
+            return Ok(warehouse_location.to_string());
+        }
+
+        // Extract path from file:// URL or use as-is
+        let path = if warehouse_location.starts_with("file://") {
+            warehouse_location.strip_prefix("file://").unwrap_or(warehouse_location)
+        } else {
+            warehouse_location
+        };
+
+        // Convert relative paths to absolute
+        let absolute_path = if std::path::Path::new(path).is_absolute() {
+            std::path::PathBuf::from(path)
+        } else {
+            std::env::current_dir()
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!("Failed to get current directory: {}", e),
+                    )
+                })?
+                .join(path)
+        };
+
+        // Create the directory
+        std::fs::create_dir_all(&absolute_path).map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "Failed to create warehouse directory '{}': {}",
+                    absolute_path.display(),
+                    e
+                ),
+            )
+        })?;
+
+        // Return normalized file:// URL with absolute path
+        let normalized = format!("file://{}", absolute_path.display());
+        tracing::info!(
+            original = %warehouse_location,
+            normalized = %normalized,
+            "Normalized warehouse location"
+        );
+
+        Ok(normalized)
     }
 
     /// Generates a namespace key for SlateDB storage.

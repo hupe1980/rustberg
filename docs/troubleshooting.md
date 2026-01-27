@@ -22,6 +22,30 @@ Solutions for common issues and debugging techniques.
 
 ## Startup Issues
 
+### macOS: "Cannot Be Opened" or "Unverified Developer"
+
+**Symptom:** macOS blocks the binary with a security warning when trying to run it.
+
+```
+"rustberg-darwin-aarch64" cannot be opened because the developer cannot be verified.
+```
+
+**Solution:** Remove the quarantine attribute from the downloaded binary:
+
+```bash
+# Remove quarantine attribute
+xattr -cr ./rustberg-darwin-aarch64
+
+# Make executable
+chmod +x ./rustberg-darwin-aarch64
+
+# Now run it
+./rustberg-darwin-aarch64
+```
+
+{: .note }
+> This is required because the binary was downloaded from the internet and macOS Gatekeeper quarantines it by default.
+
 ### Server Won't Start
 
 **Symptom:** Server exits immediately after starting.
@@ -146,6 +170,44 @@ grep "authz_deny" /var/log/rustberg/audit.log | tail -10 | jq
 ---
 
 ## Storage Issues
+
+### Local Filesystem Errors
+
+**Symptom:** `read-only filesystem or storage medium` error when using `file://` warehouse.
+
+```
+opendal::layers::retry: will retry after 2s because: Unexpected (temporary) at write, 
+context: { service: fs, path: warehouse/... } => read-only filesystem or storage medium, 
+source: Read-only file system (os error 30)
+```
+
+**Cause:** The warehouse directory doesn't exist or the path is malformed.
+
+**Solution:** Rustberg automatically creates local directories and supports relative paths:
+
+```bash
+# Relative path (creates ./warehouse in current directory)
+./rustberg --warehouse file://warehouse
+
+# Absolute path
+./rustberg --warehouse file:///var/lib/rustberg/warehouse
+
+# Bare relative path also works
+./rustberg --warehouse warehouse
+```
+
+{: .note }
+> Rustberg automatically converts relative paths to absolute paths and creates the directory if it doesn't exist.
+
+**Check directory permissions:**
+
+```bash
+# Verify the resolved path
+ls -la $(pwd)/warehouse
+
+# If permission denied, fix ownership
+sudo chown -R $(whoami) /path/to/warehouse
+```
 
 ### S3 Access Denied
 

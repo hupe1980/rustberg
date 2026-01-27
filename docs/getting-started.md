@@ -303,35 +303,7 @@ SELECT * FROM rustberg.analytics.events LIMIT 10;
 
 ## Troubleshooting
 
-### Common Issues
-
-**Port already in use:**
-```bash
-# Find process using port
-lsof -i :8181
-
-# Use different port
-./rustberg --port 8182
-```
-
-**Permission denied on storage:**
-```bash
-# Check directory permissions
-ls -la /var/lib/rustberg
-
-# Fix permissions
-sudo chown -R $(whoami) /var/lib/rustberg
-```
-
-**S3 authentication failed:**
-```bash
-# Verify AWS credentials
-aws sts get-caller-identity
-
-# Set credentials explicitly
-export AWS_ACCESS_KEY_ID=your_key
-export AWS_SECRET_ACCESS_KEY=your_secret
-```
+Having issues? See the [Troubleshooting Guide](/rustberg/docs/troubleshooting) for solutions to common problems.
 
 ---
 
