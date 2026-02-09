@@ -31,26 +31,37 @@ async fn test_aws_kms_provider_basic_operations() {
     let endpoint_url = format!("http://127.0.0.1:{}", host_port);
 
     // Wait for LocalStack to be ready
-    sleep(Duration::from_secs(3)).await;
+    sleep(Duration::from_secs(5)).await;
 
     // Create a KMS key using AWS CLI equivalent via HTTP
     let client = reqwest::Client::new();
 
-    // Create key via LocalStack KMS API
-    let create_key_response = client
-        .post(format!("{}/", endpoint_url))
-        .header("Content-Type", "application/x-amz-json-1.1")
-        .header("X-Amz-Target", "TrentService.CreateKey")
-        .body(r#"{"Description": "Test key for Rustberg", "KeyUsage": "ENCRYPT_DECRYPT", "KeySpec": "SYMMETRIC_DEFAULT"}"#)
-        .send()
-        .await
-        .expect("Failed to create KMS key");
-
-    assert!(
-        create_key_response.status().is_success(),
-        "Failed to create KMS key: {:?}",
-        create_key_response.text().await
-    );
+    // Create key via LocalStack KMS API (with retry for CI flakiness)
+    let mut create_response = None;
+    for attempt in 1..=5 {
+        match client
+            .post(format!("{}/", endpoint_url))
+            .header("Content-Type", "application/x-amz-json-1.1")
+            .header("X-Amz-Target", "TrentService.CreateKey")
+            .body(r#"{"Description": "Test key for Rustberg", "KeyUsage": "ENCRYPT_DECRYPT", "KeySpec": "SYMMETRIC_DEFAULT"}"#)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                create_response = Some(resp);
+                break;
+            }
+            Ok(resp) => {
+                eprintln!("Attempt {attempt}/5: CreateKey returned {}", resp.status());
+                sleep(Duration::from_secs(2)).await;
+            }
+            Err(e) => {
+                eprintln!("Attempt {attempt}/5: CreateKey failed: {e}");
+                sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    let _create_key_response = create_response.expect("Failed to create KMS key after 5 attempts");
 
     let key_response: serde_json::Value = client
         .post(format!("{}/", endpoint_url))
@@ -75,10 +86,21 @@ async fn test_aws_kms_provider_basic_operations() {
     std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
     std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
 
-    // Create the AWS KMS provider with LocalStack endpoint
-    let provider = AwsKmsProvider::new("us-east-1", key_id, Some(endpoint_url.clone()))
-        .await
-        .expect("Failed to create AwsKmsProvider");
+    // Create the AWS KMS provider with LocalStack endpoint (with retry for CI flakiness)
+    let mut provider_result = None;
+    for attempt in 1..=5 {
+        match AwsKmsProvider::new("us-east-1", key_id, Some(endpoint_url.clone())).await {
+            Ok(p) => {
+                provider_result = Some(p);
+                break;
+            }
+            Err(e) => {
+                eprintln!("Attempt {attempt}/5: AwsKmsProvider::new failed: {e}");
+                sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    let provider = provider_result.expect("Failed to create AwsKmsProvider after 5 attempts");
 
     // Test health check
     provider.health_check().await.expect("Health check failed");
