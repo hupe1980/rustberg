@@ -48,12 +48,24 @@ impl PaginationQuery {
     }
 
     /// Decodes a page token to extract the last seen key.
+    ///
+    /// Returns `None` for missing, malformed, or non-UTF-8 tokens
+    /// (treated as "start from beginning").
     pub fn decode_cursor(&self) -> Option<String> {
         self.page_token.as_ref().and_then(|token| {
-            URL_SAFE_NO_PAD
-                .decode(token)
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
+            match URL_SAFE_NO_PAD.decode(token) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(cursor) => Some(cursor),
+                    Err(e) => {
+                        tracing::warn!(token = %token, error = %e, "Invalid UTF-8 in page token, ignoring");
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(token = %token, error = %e, "Invalid base64 page token, ignoring");
+                    None
+                }
+            }
         })
     }
 
@@ -121,7 +133,6 @@ pub struct PagedResponse<T> {
     pub next_page_token: Option<String>,
 }
 
-#[allow(dead_code)]
 impl<T> PagedResponse<T> {
     /// Creates a new paged response.
     pub fn new(items: Vec<T>, next_page_token: Option<String>) -> Self {
@@ -148,8 +159,7 @@ impl<T> PagedResponse<T> {
     }
 }
 
-/// Response for list namespaces endpoint.
-#[allow(dead_code)]
+/// Response for list namespaces endpoint (Iceberg REST spec).
 #[derive(Debug, Clone, Serialize)]
 pub struct ListNamespacesResponse {
     /// List of namespace identifiers.
@@ -160,8 +170,7 @@ pub struct ListNamespacesResponse {
     pub next_page_token: Option<String>,
 }
 
-/// Response for list tables endpoint.
-#[allow(dead_code)]
+/// Response for list tables endpoint (Iceberg REST spec).
 #[derive(Debug, Clone, Serialize)]
 pub struct ListTablesResponse {
     /// List of table identifiers.
@@ -172,8 +181,7 @@ pub struct ListTablesResponse {
     pub next_page_token: Option<String>,
 }
 
-/// Table identifier in list response.
-#[allow(dead_code)]
+/// Table identifier in list response (Iceberg REST spec).
 #[derive(Debug, Clone, Serialize)]
 pub struct TableIdentifierResponse {
     /// Namespace path.
@@ -324,6 +332,18 @@ mod tests {
     fn test_decode_cursor_invalid() {
         let query = PaginationQuery {
             page_token: Some("!!!invalid!!!".to_string()),
+            page_size: None,
+        };
+
+        assert_eq!(query.decode_cursor(), None);
+    }
+
+    #[test]
+    fn test_decode_cursor_invalid_utf8() {
+        // Encode raw bytes that are not valid UTF-8
+        let token = URL_SAFE_NO_PAD.encode([0xFF, 0xFE, 0xFD]);
+        let query = PaginationQuery {
+            page_token: Some(token),
             page_size: None,
         };
 

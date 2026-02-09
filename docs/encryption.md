@@ -179,6 +179,9 @@ key_name = "rustberg-key"
 transit_mount = "transit"
 ```
 
+> **Important:** The `VAULT_TOKEN` environment variable **must** be set when using the Vault provider.
+> Rustberg will refuse to start if this variable is missing — there is no fallback to a default token.
+
 ---
 
 ## GCP Cloud KMS
@@ -269,6 +272,34 @@ Rustberg uses **envelope encryption** for efficiency:
 | **Reduced KMS calls** | One wrap/unwrap per DEK, not per record |
 | **Key rotation** | Re-wrap DEKs without re-encrypting data |
 | **Cost** | Fewer KMS API calls |
+| **Integrity** | DEK cache keyed by SHA-256 of ciphertext for collision resistance |
+
+---
+
+## KMS Monitoring
+
+When table encryption is enabled, Rustberg exports KMS metrics to the `/metrics` endpoint:
+
+```text
+# KMS operation counts
+rustberg_kms_operations_total{operation="generate_key"} 42
+rustberg_kms_operations_total{operation="decrypt_key"} 1234
+rustberg_kms_operations_total{operation="encrypt_key"} 0
+
+# Cache efficiency
+rustberg_kms_cache_total{result="hit"} 1192
+rustberg_kms_cache_total{result="miss"} 42
+
+# Error and retry tracking
+rustberg_kms_errors_total 3
+rustberg_kms_retries_total 5
+```
+
+These metrics help you:
+- Monitor KMS API usage for cost optimization
+- Track cache hit rates (higher is better)
+- Alert on elevated error rates
+- Debug KMS connectivity issues
 
 ---
 

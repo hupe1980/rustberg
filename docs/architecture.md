@@ -507,6 +507,101 @@ graph LR
 
 ---
 
+## Known Limitations
+
+### Concurrency & Atomicity
+
+| Operation | Status | Notes |
+|-----------|--------|-------|
+| Table Commit | ✅ CAS with version numbers | Returns 409 Conflict on concurrent modification |
+| Table Rename | ✅ Atomic via WriteBatch | Single atomic operation |
+| Multi-table Transaction | ✅ Atomic via WriteBatch | Atomic commit with retry on conflict |
+
+**Optimistic Concurrency Control:** Table commits use version-based CAS. When multiple writers attempt concurrent updates, one succeeds and others receive `409 Conflict`. Clients should implement retry with exponential backoff.
+
+**Multi-Table Atomicity:** The `commit_tables_atomic` API ensures all-or-nothing semantics across multiple tables using SlateDB's WriteBatch for atomic registry updates.
+
+### Persistence
+
+| Component | Storage | Status |
+|-----------|---------|--------|
+| Tables | SlateDB | ✅ Persistent |
+| Namespaces | SlateDB | ✅ Persistent |
+| Views | SlateDB | ✅ Persistent |
+| Idempotency Keys | SlateDB | ✅ Persistent |
+| API Keys | SlateDB | ✅ Persistent |
+
+**Production Ready:** All catalog metadata persists across restarts. SlateDB backend provides durability and consistency for all operations.
+
+### Horizontal Scaling & Multi-Pod Deployment
+
+Rustberg supports horizontal scaling with multiple pods/instances using **optimistic concurrency control** instead of traditional distributed locking.
+
+#### Architecture
+
+```
+┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+│   Pod 1     │   │   Pod 2     │   │   Pod 3     │
+│ (Writer)    │   │ (Writer)    │   │ (Writer)    │
+└──────┬──────┘   └──────┬──────┘   └──────┬──────┘
+       │                 │                 │
+       └─────────────────┼─────────────────┘
+                         │
+                    ┌────▼────┐
+                    │ SlateDB │ ← Single source of truth
+                    │   on    │   (S3/GCS/Azure)
+                    │ Object  │
+                    │ Storage │
+                    └─────────┘
+```
+
+#### How It Works
+
+1. **No Leader Election Required:** All pods can accept writes simultaneously
+2. **Version-Based CAS:** Each table has a version number in the catalog
+3. **Conflict Detection:** When two pods try to update the same table:
+   - Pod A reads version 5, applies updates
+   - Pod B reads version 5, applies updates
+   - Pod A writes first → version becomes 6
+   - Pod B attempts write → version mismatch → 409 Conflict
+4. **Client Retry:** Client receives 409 and retries with exponential backoff
+
+#### Deployment Configuration
+
+**Kubernetes Example:**
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rustberg
+spec:
+  replicas: 3  # Multiple pods for HA
+  template:
+    spec:
+      containers:
+      - name: rustberg
+        env:
+        - name: RUSTBERG_STORAGE_TYPE
+          value: "s3"
+        - name: RUSTBERG_STORAGE_S3_BUCKET
+          value: "my-catalog-metadata"
+```
+
+#### Best Practices
+
+- **Multiple read replicas:** ✅ Supported (no conflicts on reads)
+- **Multiple writers:** ✅ Supported with optimistic concurrency (409 on conflict)
+- **Leader election:** ⚠️ Not required (OCC handles conflicts)
+- **Rate limiting:** Configure per-pod limits (distributed rate limiting via MEDIUM-003 in backlog)
+
+**For High-Throughput Workloads:**
+- Implement client-side retry with exponential backoff
+- Use multi-table atomic commits when possible (reduces conflicts)
+- Monitor `409 Conflict` rate in metrics
+- Consider AWS DynamoDB or etcd for more complex coordination (future enhancement)
+
+---
+
 ## Security Layers
 
 ```mermaid

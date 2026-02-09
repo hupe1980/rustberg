@@ -38,7 +38,9 @@ pub enum StorageCredentialVendingError {
 ///
 /// Clients should select the credential with the longest matching prefix
 /// for a given storage location.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Note: Custom Debug implementation redacts secret values in config.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageCredential {
     /// Storage location prefix where this credential is valid (e.g., "s3://bucket/prefix/").
     pub prefix: String,
@@ -56,6 +58,30 @@ pub struct StorageCredential {
     /// For Azure, this typically includes:
     /// - `adls.sas-token.<account>` - SAS token for the storage account
     pub config: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for StorageCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact sensitive config values while keeping keys visible
+        let redacted_config: HashMap<&str, &str> = self
+            .config
+            .keys()
+            .map(|k| {
+                let v = if k.contains("secret") || k.contains("token") || k.contains("password") {
+                    "[REDACTED]"
+                } else {
+                    // Keep access-key-id visible (non-sensitive identifier)
+                    self.config.get(k).map(|s| s.as_str()).unwrap_or("")
+                };
+                (k.as_str(), v)
+            })
+            .collect();
+
+        f.debug_struct("StorageCredential")
+            .field("prefix", &self.prefix)
+            .field("config", &redacted_config)
+            .finish()
+    }
 }
 
 impl StorageCredential {
@@ -295,5 +321,68 @@ mod tests {
         let credentials = provider.vend_credentials(&request).await.unwrap();
         assert!(credentials.is_empty());
         assert!(!provider.supports_location("s3://bucket/"));
+    }
+
+    #[test]
+    fn test_credential_debug_redacts_secrets() {
+        let cred = StorageCredential::s3(
+            "s3://bucket/",
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            Some("session-token-value".to_string()),
+        );
+
+        let debug_output = format!("{:?}", cred);
+
+        // Access key ID should be visible (non-sensitive identifier)
+        assert!(
+            debug_output.contains("AKIAIOSFODNN7EXAMPLE"),
+            "access-key-id should be visible in debug output"
+        );
+        // Secret access key must be redacted
+        assert!(
+            !debug_output.contains("wJalrXUtnFEMI"),
+            "secret-access-key must be redacted"
+        );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "redacted placeholder must appear"
+        );
+        // Session token must be redacted
+        assert!(
+            !debug_output.contains("session-token-value"),
+            "session-token must be redacted"
+        );
+    }
+
+    #[test]
+    fn test_credential_debug_redacts_gcs_token() {
+        let cred = StorageCredential::gcs("gs://bucket/", "ya29.super-secret-token");
+
+        let debug_output = format!("{:?}", cred);
+
+        assert!(
+            !debug_output.contains("ya29.super-secret-token"),
+            "GCS OAuth2 token must be redacted"
+        );
+        assert!(debug_output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_credential_debug_redacts_azure_sas() {
+        let cred = StorageCredential::azure(
+            "abfss://container@account.dfs.core.windows.net/",
+            "account",
+            "?sv=2021-06-08&ss=bfqt&srt=sco&sp=rwdlacupitfx",
+        );
+
+        let debug_output = format!("{:?}", cred);
+
+        // SAS token key contains "token" so it should be redacted
+        assert!(
+            !debug_output.contains("sv=2021-06-08"),
+            "Azure SAS token must be redacted"
+        );
+        assert!(debug_output.contains("[REDACTED]"));
     }
 }

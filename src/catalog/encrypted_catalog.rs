@@ -183,7 +183,6 @@ impl EncryptedCatalog {
     }
 
     /// Decrypts table metadata properties.
-    #[allow(dead_code)] // Will be used when full encryption pipeline is wired
     async fn decrypt_properties(
         &self,
         table: &TableIdent,
@@ -370,14 +369,30 @@ impl Catalog for EncryptedCatalog {
         Ok(table)
     }
 
-    /// Loads a table and decrypts its properties.
+    /// Loads a table and verifies encrypted property integrity.
     async fn load_table(&self, table: &TableIdent) -> Result<Table> {
         let loaded = self.inner.load_table(table).await?;
 
-        // Decrypt properties
-        // Note: Table metadata is immutable, so we can't modify it in place
-        // The encryption is primarily for at-rest protection in storage
-        // Properties are decrypted for inspection but the table struct is unchanged
+        // Verify that encrypted properties can be decrypted successfully.
+        // The Table struct from iceberg-rust is immutable, so we cannot replace
+        // properties in-place. Encryption protects at-rest metadata in the
+        // storage backend; the decrypted values are used for integrity
+        // verification and are available via decrypt_properties() for callers
+        // that need the plaintext.
+        let props = loaded.metadata().properties();
+        if props.contains_key("__encrypted_properties") {
+            // Validate decryption works — surfaces KMS issues immediately on load
+            self.decrypt_properties(table, props).await.map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!(
+                        "Failed to verify encrypted properties for table {}: {}",
+                        table, e
+                    ),
+                )
+            })?;
+            tracing::debug!(table = %table, "Encrypted table properties verified");
+        }
 
         Ok(loaded)
     }
@@ -434,6 +449,19 @@ impl CatalogExt for EncryptedCatalog {
         self.inner
             .update_table_metadata_location(table_ident, new_metadata_location)
             .await
+    }
+
+    async fn commit_tables_atomic(
+        &self,
+        table_changes: Vec<(TableIdent, Vec<TableRequirement>, Vec<TableUpdate>)>,
+    ) -> Result<Vec<Table>> {
+        // Delegate to inner catalog's atomic commit implementation
+        self.inner.commit_tables_atomic(table_changes).await
+    }
+
+    async fn storage_health_check(&self) -> Result<super::StorageHealthStatus> {
+        // Delegate to inner catalog's storage health check
+        self.inner.storage_health_check().await
     }
 }
 

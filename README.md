@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/tests-460%20passing-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-511%20passing-brightgreen" alt="Tests">
   <img src="https://img.shields.io/badge/clippy-0%20warnings-brightgreen" alt="Clippy">
   <img src="https://img.shields.io/badge/memory-~9MB-blue" alt="Memory">
   <img src="https://img.shields.io/badge/binary-7.4MB-blue" alt="Binary Size">
@@ -113,32 +113,36 @@ cargo build --release --all-features
 ### Core Iceberg API
 
 - ✅ **Namespace CRUD** - Create, list, update, delete namespaces
-- ✅ **Table CRUD** - Full table lifecycle management
-- ✅ **Table Commits** - Optimistic concurrency with requirements
+- ✅ **Table CRUD** - Full table lifecycle management with optional data purge
+- ✅ **Table Commits** - Optimistic concurrency with version-based CAS (409 on conflict)
+- ✅ **Atomic Rename** - Crash-safe table rename via WriteBatch
 - ✅ **Register Table** - Import existing tables from metadata location
-- ✅ **Multi-table Transactions** - Atomic commits across multiple tables
+- ✅ **Multi-table Transactions** - Atomic commit with WriteBatch
 - ✅ **Metrics Reporting** - Client telemetry collection
 - ✅ **Credential Vending** - AWS STS + GCS + Azure temporary credentials
 - ✅ **Pagination** - Cursor-based with configurable page size
-- ✅ **Idempotency** - Request deduplication via idempotency keys
+- ✅ **Views** - Full CRUD with persistent storage (SlateDB)
+- ✅ **Idempotency** - Request deduplication with persistent storage (SlateDB)
 
 ### Security
 
-- ✅ **API Key Authentication** - Argon2id hashed, constant-time validation
-- ✅ **JWT/OIDC Authentication** - JWKS validation, configurable claims
+- ✅ **API Key Authentication** - Argon2id hashed with in-memory caching (moka)
+- ✅ **JWT/OIDC Authentication** - JWKS validation with auto-purge on rotation, configurable claims
 - ✅ **Cedar Policy Authorization** - Fine-grained ABAC beyond simple RBAC
 - ✅ **Multi-Tenancy** - Hard isolation between tenants
-- ✅ **Rate Limiting** - Token bucket per IP/tenant
-- ✅ **Encryption at Rest** - AES-256-GCM with envelope encryption + AWS KMS
+- ✅ **Rate Limiting** - Token bucket per IP/tenant with non-consuming header peek
+- ✅ **Encryption at Rest** - AES-256-GCM with envelope encryption + AWS KMS/Vault/Azure KV
 - ✅ **TLS/HTTPS** - TLS 1.2/1.3 via rustls
+- ✅ **Secret Redaction** - Sensitive data redacted in debug output and logs
 - ✅ **Security Headers** - CSP, X-Frame-Options, X-Content-Type-Options
 - ✅ **CORS Support** - Configurable cross-origin resource sharing
 - ✅ **Audit Logging** - Structured JSON for SIEM
+- ✅ **Idempotency Guard** - RAII-based in-flight deduplication with auto-cleanup
 
 ### Operations
 
-- ✅ **Health Checks** - `/health` and `/ready` endpoints
-- ✅ **Metrics** - Prometheus-compatible `/metrics` with 25+ counters
+- ✅ **Health Checks** - `/health` and `/ready` endpoints with storage backend verification
+- ✅ **Metrics** - Prometheus-compatible `/metrics` with KMS operations, cache stats, and 30+ counters
 - ✅ **Request Tracing** - X-Request-Id propagation for distributed tracing
 - ✅ **Response Compression** - Gzip/deflate/brotli automatic compression
 - ✅ **Graceful Shutdown** - SIGTERM handling with connection drain

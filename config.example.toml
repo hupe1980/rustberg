@@ -64,6 +64,11 @@ insecure_http = true
 backend = "file:///var/lib/rustberg/data"
 # Warehouse location for table data (S3, GCS, HDFS, or local path)
 # warehouse_location = "s3://my-bucket/warehouse"
+# Timeout for metadata read operations in seconds (default: 60)
+# Increase for high-latency or cross-region storage backends.
+# read_timeout_secs = 60
+# Timeout for metadata write operations in seconds (default: 30)
+# write_timeout_secs = 30
 
 # =============================================================================
 # KMS Configuration (Key Management Service)

@@ -22,6 +22,8 @@ target/
 
 # Custom
 .DS_Store
+BACKLOG.md
+CONCEPT.md
 FINDINGS.md
 _prompts
 

@@ -40,6 +40,12 @@ struct Cli {
     #[arg(long, env = "RUSTBERG_NO_AUTH")]
     no_auth: bool,
 
+    /// Enable development mode - relaxes security requirements
+    /// Allows: wildcard CORS origins, self-signed TLS, insecure HTTP
+    /// Production mode (default) requires: explicit CORS origins, proper TLS
+    #[arg(long, env = "RUSTBERG_DEV")]
+    dev: bool,
+
     /// Log level
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     log_level: String,
@@ -249,6 +255,52 @@ async fn main() {
         }
     }
 
+    // Security validation (secure by default)
+    let cors_config = file_config.as_ref().map(|c| &c.server.cors);
+    let has_wildcard_cors = cors_config
+        .map(|c| c.allowed_origins.iter().any(|o| o == "*"))
+        .unwrap_or(true); // Default CORS allows "*"
+
+    if cli.dev {
+        tracing::warn!("⚠️  Running in DEVELOPMENT mode - security requirements relaxed");
+
+        if has_wildcard_cors {
+            tracing::warn!("   CORS allows all origins (\"*\")");
+        }
+        if cli.no_auth {
+            tracing::warn!("   Authentication DISABLED");
+        }
+        if cli.insecure_http {
+            tracing::warn!("   Running over insecure HTTP");
+        }
+    } else {
+        // Production mode (default) - enforce security
+        tracing::info!("🔒 Running in PRODUCTION mode (default) - enforcing security requirements");
+
+        // Check CORS configuration
+        if has_wildcard_cors {
+            tracing::error!("❌ CORS allows all origins (\"*\") - not allowed in production");
+            tracing::error!("   Configure server.cors.allowed_origins in your config file");
+            tracing::error!("   Example: allowed_origins = [\"https://your-domain.com\"]");
+            tracing::error!("   Use --dev to bypass this check for local development");
+            std::process::exit(1);
+        }
+
+        // Check authentication
+        if cli.no_auth {
+            tracing::error!("❌ --no-auth is not allowed in production mode");
+            tracing::error!("   Use --dev to bypass this check for local development");
+            std::process::exit(1);
+        }
+
+        // Warn if no TLS but allow it (may be behind load balancer)
+        if cli.insecure_http {
+            tracing::warn!("⚠️  Running without TLS - ensure TLS termination at load balancer");
+        }
+
+        tracing::info!("✅ Security checks passed");
+    }
+
     // Validate TLS configuration
     let tls_config = match (&cli.tls_cert, &cli.tls_key) {
         (Some(cert), Some(key)) => {
@@ -317,7 +369,8 @@ async fn main() {
                 builder = builder.with_storage_backend(&config.storage.backend);
             }
             // KMS configuration
-            let kms_config = rustberg::crypto::KmsConfig::from_file_config(&config.kms);
+            let kms_config = rustberg::crypto::KmsConfig::from_file_config(&config.kms)
+                .expect("Failed to create KMS configuration (check environment variables)");
             builder = builder.with_kms_config(kms_config);
             // Rate limiting
             if let Some(rate_config) =
@@ -327,6 +380,14 @@ async fn main() {
             }
             // CORS
             builder = builder.with_cors_config(config.server.cors.clone());
+            // IO timeouts for storage operations
+            #[cfg(feature = "slatedb-storage")]
+            {
+                builder = builder.with_io_timeouts(
+                    std::time::Duration::from_secs(config.storage.read_timeout_secs),
+                    std::time::Duration::from_secs(config.storage.write_timeout_secs),
+                );
+            }
         }
 
         // CLI overrides take precedence
@@ -355,7 +416,8 @@ async fn main() {
                     builder = builder.with_storage_backend(&config.storage.backend);
                 }
                 // KMS configuration
-                let kms_config = rustberg::crypto::KmsConfig::from_file_config(&config.kms);
+                let kms_config = rustberg::crypto::KmsConfig::from_file_config(&config.kms)
+                    .expect("Failed to create KMS configuration (check environment variables)");
                 builder = builder.with_kms_config(kms_config);
                 // Rate limiting
                 if let Some(rate_config) =
@@ -370,6 +432,14 @@ async fn main() {
                     if let Some(ref jwt_serde) = config.server.auth.jwt {
                         builder = builder.with_jwt_config(jwt_serde.clone().into());
                     }
+                }
+                // IO timeouts for storage operations
+                #[cfg(feature = "slatedb-storage")]
+                {
+                    builder = builder.with_io_timeouts(
+                        std::time::Duration::from_secs(config.storage.read_timeout_secs),
+                        std::time::Duration::from_secs(config.storage.write_timeout_secs),
+                    );
                 }
             }
 
@@ -442,6 +512,10 @@ fn generate_api_key(name: &str, tenant: &str, roles_str: &str, description: Opti
     }
     println!("\n⚠️  Store this key in your environment as:");
     println!("   export X_API_KEY=\"{}\"", plaintext);
+    println!();
+    println!("🔒 Security reminder: clear your shell history to avoid leaking the key:");
+    println!("   history -d $(history 1 | awk '{{print $1}}')   # bash");
+    println!("   fc -W                                         # zsh");
     println!();
 }
 

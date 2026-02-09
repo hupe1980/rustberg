@@ -204,7 +204,17 @@ impl StorageCredentialProvider for AwsStsCredentialProvider {
 ///
 /// This builder allows configuring role ARNs per tenant or using a pattern
 /// to derive role ARNs from tenant IDs.
-#[allow(dead_code)]
+///
+/// # Example
+///
+/// ```no_run
+/// use rustberg::credentials::aws::AwsStsCredentialProviderBuilder;
+///
+/// let builder = AwsStsCredentialProviderBuilder::new("us-east-1")
+///     .with_role_pattern("arn:aws:iam::123456789012:role/iceberg-{tenant_id}")
+///     .with_external_id("my-external-id")
+///     .with_duration_seconds(3600);
+/// ```
 #[derive(Debug, Clone)]
 pub struct AwsStsCredentialProviderBuilder {
     region: String,
@@ -217,7 +227,6 @@ pub struct AwsStsCredentialProviderBuilder {
     allowed_prefixes: Vec<String>,
 }
 
-#[allow(dead_code)]
 impl AwsStsCredentialProviderBuilder {
     /// Creates a new builder with the specified AWS region.
     pub fn new(region: impl Into<String>) -> Self {

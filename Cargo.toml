@@ -73,7 +73,7 @@ hex = "0.4"
 zeroize = { version = "1.8", features = ["derive"] }
 
 # Caching
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 dashmap = "6"
 
 # Utilities
@@ -147,6 +147,7 @@ axum-test = "17"
 tokio = { version = "1", features = ["test-util", "macros"] }
 reqwest = { version = "0.12", features = ["json"] }
 http = "1.1"
+http-body-util = "0.1"
 tempfile = "3"
 serial_test = "3.2"
 tower = { version = "0.5", features = ["util"] }

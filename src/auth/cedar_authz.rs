@@ -437,7 +437,6 @@ impl CedarAuthorizer {
 
 #[async_trait]
 impl Authorizer for CedarAuthorizer {
-    #[allow(clippy::clone_on_copy)]
     async fn authorize(&self, ctx: &AuthzContext) -> AuthzDecision {
         // Build Cedar request and entities
         let (request, entities) = match Self::build_cedar_request(ctx) {
@@ -448,14 +447,13 @@ impl Authorizer for CedarAuthorizer {
             }
         };
 
-        // Get policies and evaluate - using clone() since Decision::clone() returns owned value
-        // needed for proper lifetime handling
+        // Get policies and evaluate
         let decision = {
             let policies = self.policy_store.policies().await;
             let response = self
                 .authorizer
                 .is_authorized(&request, &policies, &entities);
-            response.decision().clone()
+            response.decision()
         };
 
         match decision {

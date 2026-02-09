@@ -79,6 +79,32 @@ aws s3 ls s3://my-bucket/
 ./rustberg --config config.toml 2>&1 | head -20
 ```
 
+### CORS Origin Not Allowed
+
+**Symptom:** Server exits with "CORS allows all origins" error.
+
+```
+❌ CORS allows all origins ("*") - not allowed in production
+   Configure server.cors.allowed_origins in your config file
+```
+
+**Solution 1: Configure explicit CORS origins in config.toml**
+
+```toml
+[server.cors]
+allowed_origins = ["https://your-app.example.com"]
+```
+
+**Solution 2: Use development mode for local testing**
+
+```bash
+# For local development only
+./rustberg --dev --insecure-http
+```
+
+{: .warning }
+> Never use `--dev` in production. Always configure explicit CORS origins.
+
 ### TLS Certificate Errors
 
 **Symptom:** `error: failed to load TLS certificate`
@@ -476,16 +502,19 @@ RUSTBERG_LOG_LEVEL=debug ./rustberg
 level = "debug"
 ```
 
+{: .note }
+> **Debug output is safe**: Rustberg uses custom `Debug` trait implementations that automatically redact sensitive data like API key hashes, secret access keys, and tokens. You can safely enable debug logging without leaking credentials.
+
 ### Health Checks
 
 ```bash
 # Liveness
 curl http://localhost:8181/health
 
-# Readiness
+# Readiness (includes storage health)
 curl http://localhost:8181/ready
 
-# Metrics
+# Metrics (including KMS metrics if encryption is enabled)
 curl http://localhost:8181/metrics
 ```
 

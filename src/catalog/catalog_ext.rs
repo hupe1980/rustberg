@@ -44,6 +44,73 @@ pub trait CatalogExt: Catalog {
         table_ident: &TableIdent,
         new_metadata_location: String,
     ) -> Result<Table>;
+
+    /// Atomically commits changes to multiple tables in a single transaction.
+    ///
+    /// This is the atomic multi-table commit implementation that ensures
+    /// all changes succeed or all fail together. It uses optimistic concurrency control
+    /// with retry logic to handle concurrent modifications.
+    ///
+    /// # Arguments
+    /// * `table_changes` - A list of (table_ident, requirements, updates) tuples
+    ///
+    /// # Returns
+    /// * `Ok(Vec<Table>)` - The updated tables after successful commit
+    /// * `Err` - If any requirement fails or if the commit cannot be applied atomically
+    ///
+    /// # Atomicity Guarantee
+    /// Either all table changes are applied atomically, or none are. If a conflict
+    /// is detected (another transaction modified any of the tables), this method
+    /// will retry with exponential backoff up to a configured number of retries.
+    async fn commit_tables_atomic(
+        &self,
+        table_changes: Vec<(TableIdent, Vec<TableRequirement>, Vec<TableUpdate>)>,
+    ) -> Result<Vec<Table>>;
+
+    /// Performs a storage backend health check.
+    ///
+    /// This method validates connectivity to the underlying storage backend (S3/GCS/Azure/local).
+    /// Used by the `/ready` endpoint to ensure the catalog can read and write table metadata.
+    ///
+    /// # Returns
+    /// * `Ok(StorageHealthStatus)` - Storage health details including backend type and latency
+    /// * `Err` - If the storage backend is unreachable or misconfigured
+    async fn storage_health_check(&self) -> Result<StorageHealthStatus>;
+}
+
+/// Storage backend health status.
+#[derive(Debug, Clone)]
+pub struct StorageHealthStatus {
+    /// Backend type (e.g., "s3", "gcs", "azure", "file", "memory")
+    pub backend_type: String,
+    /// Whether the backend is healthy
+    pub healthy: bool,
+    /// Health check latency in milliseconds
+    pub latency_ms: u64,
+    /// Optional status message
+    pub message: Option<String>,
+}
+
+impl StorageHealthStatus {
+    /// Creates a healthy status.
+    pub fn healthy(backend_type: impl Into<String>, latency_ms: u64) -> Self {
+        Self {
+            backend_type: backend_type.into(),
+            healthy: true,
+            latency_ms,
+            message: None,
+        }
+    }
+
+    /// Creates an unhealthy status with a message.
+    pub fn unhealthy(backend_type: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            backend_type: backend_type.into(),
+            healthy: false,
+            latency_ms: 0,
+            message: Some(message.into()),
+        }
+    }
 }
 
 /// Wrapper around any `Catalog` that implements `CatalogExt`.
@@ -190,15 +257,90 @@ impl<C: Catalog + Send + Sync> CatalogExt for ExtendedCatalog<C> {
         table_ident: &TableIdent,
         new_metadata_location: String,
     ) -> Result<Table> {
-        // For the generic ExtendedCatalog, we use a drop-and-register approach.
-        // This is not ideal for concurrent access, but works for MemoryCatalog.
+        // HIGH-004: Drop-and-register pattern for MemoryCatalog compatibility.
         //
-        // Note: SlateCatalog has a more efficient implementation that directly
-        // updates the registry atomically.
+        // ⚠️ WARNING: NOT PRODUCTION SAFE!
+        //
+        // This implementation uses drop-then-register because MemoryCatalog's
+        // register_table returns an error if the table already exists, and there's
+        // no update_table_location method in the Catalog trait.
+        //
+        // RISKS:
+        // - If server crashes between drop and register, the table entry is lost
+        // - The metadata file still exists in storage, allowing manual recovery
+        // - For production, use SlateCatalog which has atomic update_table support
+        //
+        // The order MUST be drop-first because:
+        // 1. MemoryCatalog.register_table fails if table exists
+        // 2. We cannot use a temp name because metadata file path must match
+        //
+        // MITIGATION:
+        // - Log extensively for crash recovery forensics
+        // - SlateCatalog is recommended for all production deployments
+
+        tracing::debug!(
+            table = %table_ident,
+            new_location = %new_metadata_location,
+            "Updating table metadata location using drop-and-register pattern"
+        );
+
+        // Drop the existing table entry
         self.inner.drop_table(table_ident).await?;
-        self.inner
-            .register_table(table_ident, new_metadata_location)
+
+        // Register with the new metadata location
+        // If this fails, the table entry is lost but metadata file remains in storage
+        match self
+            .inner
+            .register_table(table_ident, new_metadata_location.clone())
             .await
+        {
+            Ok(table) => Ok(table),
+            Err(e) => {
+                tracing::error!(
+                    table = %table_ident,
+                    metadata_location = %new_metadata_location,
+                    error = %e,
+                    "CRITICAL: Table dropped but re-registration failed. \
+                     Table entry is lost. Metadata file still exists at the \
+                     specified location and can be manually recovered."
+                );
+                Err(e)
+            }
+        }
+    }
+
+    async fn commit_tables_atomic(
+        &self,
+        table_changes: Vec<(TableIdent, Vec<TableRequirement>, Vec<TableUpdate>)>,
+    ) -> Result<Vec<Table>> {
+        // Single-table commits are trivially atomic — delegate normally
+        if table_changes.len() <= 1 {
+            let mut results = Vec::with_capacity(table_changes.len());
+            for (ident, reqs, updates) in table_changes {
+                let table = self.commit_table(&ident, reqs, updates).await?;
+                results.push(table);
+            }
+            return Ok(results);
+        }
+
+        // Multi-table atomic commits are NOT supported by the MemoryCatalog backend.
+        // Rather than silently degrading to non-atomic sequential commits (which
+        // could leave partial state on failure), we reject the request explicitly.
+        // Use SlateCatalog with slatedb-storage feature for true atomic multi-table commits.
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!(
+                "Atomic multi-table commit ({} tables) not supported by this catalog backend. \
+                 Enable slatedb-storage feature and use a persistent storage backend for true atomic commits.",
+                table_changes.len()
+            ),
+        ))
+    }
+
+    async fn storage_health_check(&self) -> Result<StorageHealthStatus> {
+        // ExtendedCatalog wraps MemoryCatalog which has no external storage.
+        // We report it as healthy since there's nothing to check.
+        Ok(StorageHealthStatus::healthy("memory", 0))
     }
 }
 

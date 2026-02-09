@@ -353,6 +353,14 @@ pub trait KeyManagementService: Send + Sync + std::fmt::Debug {
 
     /// Health check for the KMS connection.
     async fn health_check(&self) -> Result<()>;
+
+    /// Returns shared reference to KMS metrics if available.
+    ///
+    /// Only wrappers that track metrics (CachedKms, RetryKms, CircuitBreakerKms)
+    /// return Some. Raw providers return None.
+    fn kms_metrics(&self) -> Option<Arc<KmsMetrics>> {
+        None
+    }
 }
 
 // ============================================================================
@@ -444,12 +452,20 @@ impl CachedKms {
         Self::new(kms, KmsCacheConfig::default())
     }
 
-    /// Computes a cache key from ciphertext.
+    /// Computes a cache key from ciphertext using SHA-256.
+    ///
+    /// SECURITY: Uses a cryptographic hash instead of `DefaultHasher` to ensure
+    /// collision resistance. A hash collision here would return the wrong
+    /// plaintext DEK, leading to silent data corruption.
     fn cache_key(key_id: &str, ciphertext: &[u8]) -> (String, u64) {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        ciphertext.hash(&mut hasher);
-        (key_id.to_string(), hasher.finish())
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(ciphertext);
+        let hash = hasher.finalize();
+        // Take the first 8 bytes as a u64 — SHA-256's collision resistance
+        // makes this astronomically unlikely to collide.
+        let truncated = u64::from_le_bytes(hash[..8].try_into().unwrap());
+        (key_id.to_string(), truncated)
     }
 
     /// Invalidates all cached entries for a key.
@@ -578,6 +594,10 @@ impl KeyManagementService for CachedKms {
 
     async fn health_check(&self) -> Result<()> {
         self.inner.health_check().await
+    }
+
+    fn kms_metrics(&self) -> Option<Arc<KmsMetrics>> {
+        Some(self.metrics.clone())
     }
 }
 
@@ -728,6 +748,10 @@ impl KeyManagementService for RetryKms {
 
     async fn health_check(&self) -> Result<()> {
         self.inner.health_check().await
+    }
+
+    fn kms_metrics(&self) -> Option<Arc<KmsMetrics>> {
+        Some(self.metrics.clone())
     }
 }
 
@@ -1059,6 +1083,10 @@ impl KeyManagementService for CircuitBreakerKms {
             ));
         }
         self.inner.health_check().await
+    }
+
+    fn kms_metrics(&self) -> Option<Arc<KmsMetrics>> {
+        Some(self.metrics.clone())
     }
 }
 
@@ -2515,20 +2543,26 @@ impl KeyManagementService for AzureKeyVaultProvider {
 
     #[instrument(skip(self), fields(provider = "azure-keyvault"))]
     async fn current_version(&self, key_id: &str) -> Result<u32> {
-        // Verify the key exists by attempting to get it
-        let _key = self.key_client.get(key_id).await.map_err(|e| {
+        // Get the key to inspect its version properties
+        let key = self.key_client.get(key_id).await.map_err(|e| {
             KmsError::OperationFailed(format!("Azure Key Vault get key failed: {}", e))
         })?;
 
-        // Azure Key Vault uses UUID-based versions rather than numeric versions.
-        // The version is embedded in the key URL path, but since we're using the
-        // latest version by default (when no version is specified in the key name),
-        // we return 1 as a placeholder. For actual version tracking, use the
-        // key.properties.attributes or the key URL.
-        //
-        // Azure automatically uses the latest enabled version when the version
-        // isn't specified in the key identifier.
-        Ok(1)
+        // Azure Key Vault embeds the version as a UUID segment in the key URL
+        // (e.g., https://vault.vault.azure.net/keys/my-key/<version-uuid>).
+        // We hash the URL-based version identifier into a deterministic u32
+        // so callers can detect version changes after rotation.
+        let version_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            // key.key.id contains the full key URL including the version segment
+            key.key.id.hash(&mut hasher);
+            // Truncate to u32 — sufficient for change detection
+            (hasher.finish() & 0xFFFF_FFFF) as u32
+        };
+
+        // Ensure we never return 0 (reserved for "unknown")
+        Ok(if version_hash == 0 { 1 } else { version_hash })
     }
 
     #[instrument(skip(self), fields(provider = "azure-keyvault"))]
@@ -2625,8 +2659,13 @@ pub enum VaultAuth {
 
 impl KmsConfig {
     /// Creates KmsConfig from file-based configuration.
-    pub fn from_file_config(file_config: &crate::config::KmsConfigFile) -> Self {
-        match file_config.provider.as_str() {
+    ///
+    /// # Errors
+    ///
+    /// Returns `KmsError::ConfigurationError` if required environment variables
+    /// are missing (e.g., `VAULT_TOKEN` for the Vault provider).
+    pub fn from_file_config(file_config: &crate::config::KmsConfigFile) -> Result<Self> {
+        Ok(match file_config.provider.as_str() {
             "env" => KmsConfig::Env,
             "aws-kms" => KmsConfig::AwsKms {
                 region: file_config
@@ -2648,8 +2687,14 @@ impl KmsConfig {
                     .vault_key_name
                     .clone()
                     .unwrap_or_else(|| "rustberg".to_string());
-                // For now, use token auth from environment variable
-                let token = std::env::var("VAULT_TOKEN").unwrap_or_else(|_| "myroot".to_string());
+                // SECURITY: Require VAULT_TOKEN from environment — never fall back to a default.
+                let token = std::env::var("VAULT_TOKEN").map_err(|_| {
+                    KmsError::ConfigurationError(
+                        "VAULT_TOKEN environment variable is required for Vault KMS provider. \
+                         Set VAULT_TOKEN to a valid Vault token before starting the server."
+                            .to_string(),
+                    )
+                })?;
 
                 KmsConfig::Vault {
                     address,
@@ -2693,7 +2738,7 @@ impl KmsConfig {
                 );
                 KmsConfig::Env
             }
-        }
+        })
     }
 }
 

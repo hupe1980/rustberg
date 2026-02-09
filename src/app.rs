@@ -22,7 +22,8 @@ use crate::auth::{
     RateLimitConfig, RateLimiter, RbacAuthorizer, TenantIsolationAuthorizer,
 };
 use crate::catalog::{
-    self, CatalogExt, EncryptedCatalog, ExtendedCatalog, IdempotencyCache, ViewStorage,
+    self, CatalogExt, EncryptedCatalog, ExtendedCatalog, IdempotencyCache, MemoryViewStore,
+    ViewStorage, ViewStore,
 };
 use crate::config;
 use crate::config::CorsConfig;
@@ -54,8 +55,9 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     /// Idempotency cache for preventing duplicate request processing.
     pub idempotency_cache: Arc<IdempotencyCache>,
-    /// In-memory view storage for view CRUD operations.
-    pub view_storage: Arc<ViewStorage>,
+    /// View storage for view CRUD operations.
+    /// Can be backed by in-memory (development) or SlateDB (production).
+    pub view_storage: Arc<dyn ViewStore>,
     /// Prometheus metrics registry for observability.
     pub metrics: Arc<MetricsRegistry>,
     /// Base warehouse location for table storage.
@@ -298,6 +300,9 @@ pub struct AppBuilder {
     enable_table_encryption: bool,
     /// KMS key ID for table metadata encryption
     kms_key_id: Option<String>,
+    /// IO timeout configuration for storage operations
+    #[cfg(feature = "slatedb-storage")]
+    io_timeout_config: Option<crate::catalog::IoTimeoutConfig>,
 }
 
 impl AppBuilder {
@@ -514,7 +519,34 @@ impl AppBuilder {
         self
     }
 
+    /// Sets IO timeout configuration for storage operations.
+    ///
+    /// Controls how long FileIO operations (metadata reads/writes) are allowed
+    /// to take before being cancelled. Useful for preventing stalled cloud
+    /// storage connections from blocking workers indefinitely.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use rustberg::App;
+    /// use std::time::Duration;
+    ///
+    /// let app = App::builder()
+    ///     .with_io_timeouts(Duration::from_secs(90), Duration::from_secs(45))
+    ///     .build();
+    /// ```
+    #[cfg(feature = "slatedb-storage")]
+    pub fn with_io_timeouts(mut self, read_timeout: Duration, write_timeout: Duration) -> Self {
+        self.io_timeout_config = Some(crate::catalog::IoTimeoutConfig::new(
+            read_timeout,
+            write_timeout,
+        ));
+        self
+    }
+
     /// Creates a catalog based on the storage backend URL.
+    /// Creates both a catalog and view store based on the storage backend URL.
+    /// Uses the same SlateDB instance for both, ensuring persistent views.
     ///
     /// Supported backends:
     /// - `memory://` or None → MemoryCatalog (development/testing)
@@ -523,11 +555,33 @@ impl AppBuilder {
     /// - `gs://bucket/path` → SlateCatalog with GCS
     /// - `az://container/path` → SlateCatalog with Azure Blob
     #[cfg(feature = "slatedb-storage")]
-    async fn create_catalog(
+    async fn create_catalog_and_view_store(
         backend_url: Option<&str>,
         warehouse_location: &str,
-    ) -> Result<Arc<dyn CatalogExt + Send + Sync>, crate::error::AppError> {
-        use crate::catalog::SlateCatalog;
+        io_timeout_config: Option<crate::catalog::IoTimeoutConfig>,
+    ) -> Result<(Arc<dyn CatalogExt + Send + Sync>, Arc<dyn ViewStore>), crate::error::AppError>
+    {
+        let (catalog, view_storage, _) =
+            Self::create_all_stores(backend_url, warehouse_location, io_timeout_config).await?;
+        Ok((catalog, view_storage))
+    }
+
+    /// Creates catalog, view store, and idempotency store based on storage backend URL.
+    /// Uses the same SlateDB instance for all, ensuring persistence across restarts.
+    #[cfg(feature = "slatedb-storage")]
+    async fn create_all_stores(
+        backend_url: Option<&str>,
+        warehouse_location: &str,
+        io_timeout_config: Option<crate::catalog::IoTimeoutConfig>,
+    ) -> Result<
+        (
+            Arc<dyn CatalogExt + Send + Sync>,
+            Arc<dyn ViewStore>,
+            Option<Arc<dyn crate::catalog::IdempotencyStore>>,
+        ),
+        crate::error::AppError,
+    > {
+        use crate::catalog::{SlateCatalog, SlateDbIdempotencyStore, SlateDbViewStore};
         use object_store::local::LocalFileSystem;
         use object_store::ObjectStore;
         use slatedb::Db;
@@ -556,24 +610,34 @@ impl AppBuilder {
                     })?);
 
                 // Create SlateDB instance at "catalog" path within the object store
-                let db = Db::builder("catalog", object_store)
-                    .build()
-                    .await
-                    .map_err(|e| {
-                        crate::error::AppError::Internal(format!("Failed to open SlateDB: {}", e))
-                    })?;
+                let db = Arc::new(Db::builder("catalog", object_store).build().await.map_err(
+                    |e| crate::error::AppError::Internal(format!("Failed to open SlateDB: {}", e)),
+                )?);
+
+                // Create SlateDbViewStore with shared db instance
+                let view_storage: Arc<dyn ViewStore> = Arc::new(SlateDbViewStore::new(db.clone()));
+
+                // Create SlateDbIdempotencyStore with shared db instance
+                let idempotency_store: Arc<dyn crate::catalog::IdempotencyStore> =
+                    Arc::new(SlateDbIdempotencyStore::new(db.clone()));
 
                 // Create SlateCatalog with FileIO pointed at warehouse location
-                let slate_catalog = SlateCatalog::new(Arc::new(db), warehouse_location.to_string())
-                    .await
-                    .map_err(|e| {
-                        crate::error::AppError::Internal(format!(
-                            "Failed to create SlateCatalog: {}",
-                            e
-                        ))
-                    })?;
+                let io_timeouts = io_timeout_config.clone().unwrap_or_default();
+                let slate_catalog =
+                    SlateCatalog::with_timeouts(db, warehouse_location.to_string(), io_timeouts)
+                        .await
+                        .map_err(|e| {
+                            crate::error::AppError::Internal(format!(
+                                "Failed to create SlateCatalog: {}",
+                                e
+                            ))
+                        })?;
 
-                Ok(Arc::new(ExtendedCatalog::new(slate_catalog)))
+                Ok((
+                    Arc::new(ExtendedCatalog::new(slate_catalog)),
+                    view_storage,
+                    Some(idempotency_store),
+                ))
             }
             Some(url)
                 if url.starts_with("s3://")
@@ -596,24 +660,42 @@ impl AppBuilder {
 
                 // Create SlateDB instance at "catalog" path within the cloud path
                 let catalog_path = format!("{}/catalog", cloud_path);
-                let db = Db::builder(catalog_path, Arc::new(object_store))
-                    .build()
-                    .await
-                    .map_err(|e| {
-                        crate::error::AppError::Internal(format!("Failed to open SlateDB: {}", e))
-                    })?;
+                let db = Arc::new(
+                    Db::builder(catalog_path, Arc::new(object_store))
+                        .build()
+                        .await
+                        .map_err(|e| {
+                            crate::error::AppError::Internal(format!(
+                                "Failed to open SlateDB: {}",
+                                e
+                            ))
+                        })?,
+                );
+
+                // Create SlateDbViewStore with shared db instance
+                let view_storage: Arc<dyn ViewStore> = Arc::new(SlateDbViewStore::new(db.clone()));
+
+                // Create SlateDbIdempotencyStore with shared db instance
+                let idempotency_store: Arc<dyn crate::catalog::IdempotencyStore> =
+                    Arc::new(SlateDbIdempotencyStore::new(db.clone()));
 
                 // Create SlateCatalog with FileIO pointed at warehouse location
-                let slate_catalog = SlateCatalog::new(Arc::new(db), warehouse_location.to_string())
-                    .await
-                    .map_err(|e| {
-                        crate::error::AppError::Internal(format!(
-                            "Failed to create SlateCatalog: {}",
-                            e
-                        ))
-                    })?;
+                let io_timeouts = io_timeout_config.unwrap_or_default();
+                let slate_catalog =
+                    SlateCatalog::with_timeouts(db, warehouse_location.to_string(), io_timeouts)
+                        .await
+                        .map_err(|e| {
+                            crate::error::AppError::Internal(format!(
+                                "Failed to create SlateCatalog: {}",
+                                e
+                            ))
+                        })?;
 
-                Ok(Arc::new(ExtendedCatalog::new(slate_catalog)))
+                Ok((
+                    Arc::new(ExtendedCatalog::new(slate_catalog)),
+                    view_storage,
+                    Some(idempotency_store),
+                ))
             }
             Some("memory://") | None => {
                 tracing::info!("Creating MemoryCatalog for development/testing");
@@ -631,7 +713,15 @@ impl AppBuilder {
                         ))
                     })?;
 
-                Ok(Arc::new(ExtendedCatalog::new(memory_catalog)))
+                // Use in-memory view storage for MemoryCatalog
+                let view_storage: Arc<dyn ViewStore> = Arc::new(ViewStorage::new());
+
+                // No persistent idempotency store for memory backend
+                Ok((
+                    Arc::new(ExtendedCatalog::new(memory_catalog)),
+                    view_storage,
+                    None,
+                ))
             }
             Some(url) => Err(crate::error::AppError::Internal(format!(
                 "Unsupported storage backend: {}",
@@ -646,6 +736,18 @@ impl AppBuilder {
         backend_url: Option<&str>,
         warehouse_location: &str,
     ) -> Result<Arc<dyn CatalogExt + Send + Sync>, crate::error::AppError> {
+        let (catalog, _) =
+            Self::create_catalog_and_view_store(backend_url, warehouse_location).await?;
+        Ok(catalog)
+    }
+
+    /// Creates both a catalog and view store when SlateDB feature is disabled.
+    #[cfg(not(feature = "slatedb-storage"))]
+    async fn create_catalog_and_view_store(
+        backend_url: Option<&str>,
+        warehouse_location: &str,
+    ) -> Result<(Arc<dyn CatalogExt + Send + Sync>, Arc<dyn ViewStore>), crate::error::AppError>
+    {
         if let Some(url) = backend_url {
             if !url.starts_with("memory://") {
                 tracing::warn!(
@@ -665,7 +767,10 @@ impl AppBuilder {
                 crate::error::AppError::Internal(format!("Failed to create MemoryCatalog: {}", e))
             })?;
 
-        Ok(Arc::new(ExtendedCatalog::new(memory_catalog)))
+        // Always use in-memory view storage when slatedb-storage is disabled
+        let view_storage: Arc<dyn ViewStore> = Arc::new(ViewStorage::new());
+
+        Ok((Arc::new(ExtendedCatalog::new(memory_catalog)), view_storage))
     }
 
     /// Creates an App with API key authentication pre-configured (async version).
@@ -678,36 +783,59 @@ impl AppBuilder {
             .default_tenant_id
             .unwrap_or_else(|| "default".to_string());
 
-        let base_catalog = if let Some(catalog) = self.catalog {
-            catalog
+        let (base_catalog, view_storage) = if let Some(catalog) = self.catalog {
+            // When custom catalog is provided, use in-memory view storage
+            (catalog, Arc::new(ViewStorage::new()) as Arc<dyn ViewStore>)
         } else {
-            // Create catalog based on storage backend URL
-            Self::create_catalog(self.storage_backend_url.as_deref(), &warehouse_location)
-                .await
-                .expect("Failed to create catalog")
+            // Create catalog and view storage based on storage backend URL
+            #[cfg(feature = "slatedb-storage")]
+            let result = Self::create_catalog_and_view_store(
+                self.storage_backend_url.as_deref(),
+                &warehouse_location,
+                self.io_timeout_config.clone(),
+            )
+            .await
+            .expect("Failed to create catalog");
+            #[cfg(not(feature = "slatedb-storage"))]
+            let result = Self::create_catalog_and_view_store(
+                self.storage_backend_url.as_deref(),
+                &warehouse_location,
+            )
+            .await
+            .expect("Failed to create catalog");
+            result
         };
 
-        // Wrap catalog with encryption if enabled
-        let catalog: Arc<dyn CatalogExt + Send + Sync> = if self.enable_table_encryption {
+        // Wrap catalog with encryption if enabled, and capture KMS metrics
+        let (catalog, kms_metrics): (
+            Arc<dyn CatalogExt + Send + Sync>,
+            Option<Arc<crate::crypto::KmsMetrics>>,
+        ) = if self.enable_table_encryption {
             if let Some(kms_config) = self.kms_config {
                 let kms = create_kms(kms_config, None)
                     .await
                     .expect("Failed to create KMS for table encryption");
 
+                // Extract KMS metrics before moving kms into EncryptedCatalog
+                let kms_metrics = kms.kms_metrics();
+
                 let key_id = self
                     .kms_key_id
                     .unwrap_or_else(|| "rustberg-master".to_string());
                 tracing::info!(key_id = %key_id, "Table metadata encryption enabled with KMS");
-                Arc::new(EncryptedCatalog::new(base_catalog, kms, key_id))
+                (
+                    Arc::new(EncryptedCatalog::new(base_catalog, kms, key_id)),
+                    kms_metrics,
+                )
             } else {
                 tracing::warn!(
                     "Table encryption requested but no KMS configured. \
-                     Use with_kms_config() to configure KMS. Proceeding without encryption."
+                         Use with_kms_config() to configure KMS. Proceeding without encryption."
                 );
-                base_catalog
+                (base_catalog, None)
             }
         } else {
-            base_catalog
+            (base_catalog, None)
         };
 
         // Create API key store
@@ -748,11 +876,13 @@ impl AppBuilder {
             self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL),
         ));
 
-        // Create view storage
-        let view_storage = Arc::new(ViewStorage::new());
-
-        // Create metrics registry
-        let metrics = Arc::new(MetricsRegistry::new());
+        // Create metrics registry with optional KMS metrics
+        let mut registry = MetricsRegistry::new();
+        if let Some(kms_m) = kms_metrics {
+            registry.set_kms_metrics(kms_m);
+            tracing::debug!("KMS metrics integrated with /metrics endpoint");
+        }
+        let metrics = Arc::new(registry);
 
         let app_state = AppState {
             authenticator,
@@ -830,35 +960,54 @@ impl AppBuilder {
         let enable_table_encryption = self.enable_table_encryption;
         let kms_config = self.kms_config.clone();
         let kms_key_id = self.kms_key_id.clone();
+        let idempotency_ttl = self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL);
 
-        // Create base catalog
-        let base_catalog = if let Some(catalog) = self.catalog {
-            catalog
+        // Create catalog, view storage, and idempotency store based on storage backend URL
+        let (base_catalog, view_storage, idempotency_store) = if let Some(catalog) = self.catalog {
+            // When custom catalog is provided, use in-memory stores
+            (
+                catalog,
+                Arc::new(ViewStorage::new()) as Arc<dyn ViewStore>,
+                None,
+            )
         } else {
-            Self::create_catalog(storage_backend_url.as_deref(), &warehouse_location)
-                .await
-                .expect("Failed to create catalog")
+            Self::create_all_stores(
+                storage_backend_url.as_deref(),
+                &warehouse_location,
+                self.io_timeout_config.clone(),
+            )
+            .await
+            .expect("Failed to create catalog and storage")
         };
 
-        // Wrap catalog with encryption if enabled
-        let catalog: Arc<dyn CatalogExt + Send + Sync> = if enable_table_encryption {
+        // Wrap catalog with encryption if enabled, and capture KMS metrics
+        let (catalog, kms_metrics): (
+            Arc<dyn CatalogExt + Send + Sync>,
+            Option<Arc<crate::crypto::KmsMetrics>>,
+        ) = if enable_table_encryption {
             if let Some(kms_config) = kms_config {
                 let kms = create_kms(kms_config, None)
                     .await
                     .expect("Failed to create KMS for table encryption");
 
+                // Extract KMS metrics before moving kms into EncryptedCatalog
+                let kms_metrics = kms.kms_metrics();
+
                 let key_id = kms_key_id.unwrap_or_else(|| "rustberg-master".to_string());
                 tracing::info!(key_id = %key_id, "Table metadata encryption enabled with KMS");
-                Arc::new(EncryptedCatalog::new(base_catalog, kms, key_id))
+                (
+                    Arc::new(EncryptedCatalog::new(base_catalog, kms, key_id)),
+                    kms_metrics,
+                )
             } else {
                 tracing::warn!(
                     "Table encryption requested but no KMS configured. \
-                     Use with_kms_config() to configure KMS. Proceeding without encryption."
+                         Use with_kms_config() to configure KMS. Proceeding without encryption."
                 );
-                base_catalog
+                (base_catalog, None)
             }
         } else {
-            base_catalog
+            (base_catalog, None)
         };
 
         // Create KvStore for API key storage
@@ -941,16 +1090,25 @@ impl AppBuilder {
         // Create rate limiter (enabled by default for API key auth)
         let rate_limiter = Arc::new(RateLimiter::new(self.rate_limit_config.unwrap_or_default()));
 
-        // Create idempotency cache
-        let idempotency_cache = Arc::new(IdempotencyCache::new(
-            self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL),
-        ));
+        // Create idempotency cache with optional persistent backing store
+        let idempotency_cache = if let Some(store) = idempotency_store {
+            let cache = IdempotencyCache::with_persistent_store(idempotency_ttl, store);
+            // Bootstrap from persistent store
+            if let Err(e) = cache.bootstrap_from_store().await {
+                tracing::warn!(error = %e, "Failed to bootstrap idempotency cache from persistent store");
+            }
+            Arc::new(cache)
+        } else {
+            Arc::new(IdempotencyCache::new(idempotency_ttl))
+        };
 
-        // Create view storage
-        let view_storage = Arc::new(ViewStorage::new());
-
-        // Create metrics registry
-        let metrics = Arc::new(MetricsRegistry::new());
+        // Create metrics registry with optional KMS metrics
+        let mut registry = MetricsRegistry::new();
+        if let Some(kms_m) = kms_metrics {
+            registry.set_kms_metrics(kms_m);
+            tracing::debug!("KMS metrics integrated with /metrics endpoint");
+        }
+        let metrics = Arc::new(registry);
 
         let app_state = AppState {
             authenticator,
@@ -979,6 +1137,11 @@ impl AppBuilder {
     /// Creates an App with API key authentication pre-configured.
     ///
     /// Returns both the App and the API key store for management.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from within an async context (use `build_with_api_key_auth_async` instead).
+    /// Also panics if the Tokio runtime, catalog, or KMS cannot be created.
     pub fn build_with_api_key_auth(self) -> (App, Arc<InMemoryApiKeyStore>) {
         let warehouse_location = self.warehouse_location.unwrap_or_else(temp_path);
         let default_tenant_id = self
@@ -992,39 +1155,61 @@ impl AppBuilder {
         let enable_table_encryption = self.enable_table_encryption;
         let kms_config = self.kms_config.clone();
 
-        let base_catalog: Arc<dyn CatalogExt + Send + Sync> = self.catalog.unwrap_or_else(|| {
-            // Create catalog using tokio runtime
-            tokio::runtime::Runtime::new().unwrap().block_on(async {
-                Self::create_catalog(storage_backend_url.as_deref(), &warehouse_clone)
-                    .await
-                    .expect("Failed to create catalog")
-            })
-        });
+        let (base_catalog, view_storage): (Arc<dyn CatalogExt + Send + Sync>, Arc<dyn ViewStore>) =
+            if let Some(catalog) = self.catalog {
+                (catalog, Arc::new(ViewStorage::new()))
+            } else {
+                // Create catalog and view storage using tokio runtime
+                tokio::runtime::Runtime::new()
+                    .expect("Failed to create Tokio runtime — do not call from async context, use build_with_api_key_auth_async() instead")
+                    .block_on(async {
+                    #[cfg(feature = "slatedb-storage")]
+                    let result = Self::create_catalog_and_view_store(storage_backend_url.as_deref(), &warehouse_clone, self.io_timeout_config.clone())
+                        .await
+                        .expect("Failed to create catalog");
+                    #[cfg(not(feature = "slatedb-storage"))]
+                    let result = Self::create_catalog_and_view_store(storage_backend_url.as_deref(), &warehouse_clone)
+                        .await
+                        .expect("Failed to create catalog");
+                    result
+                })
+            };
 
-        // Wrap catalog with encryption if enabled
-        let catalog: Arc<dyn CatalogExt + Send + Sync> = if enable_table_encryption {
+        // Wrap catalog with encryption if enabled, and capture KMS metrics
+        let (catalog, kms_metrics): (
+            Arc<dyn CatalogExt + Send + Sync>,
+            Option<Arc<crate::crypto::KmsMetrics>>,
+        ) = if enable_table_encryption {
             if let Some(kms_config) = kms_config {
                 // Create KMS using tokio runtime
-                let kms = tokio::runtime::Runtime::new().unwrap().block_on(async {
-                    create_kms(kms_config, None)
-                        .await
-                        .expect("Failed to create KMS for table encryption")
-                });
+                let kms = tokio::runtime::Runtime::new()
+                    .expect("Failed to create Tokio runtime for KMS")
+                    .block_on(async {
+                        create_kms(kms_config, None)
+                            .await
+                            .expect("Failed to create KMS for table encryption")
+                    });
+
+                // Extract KMS metrics before moving kms into EncryptedCatalog
+                let kms_metrics = kms.kms_metrics();
 
                 let key_id = self
                     .kms_key_id
                     .unwrap_or_else(|| "rustberg-master".to_string());
                 tracing::info!(key_id = %key_id, "Table metadata encryption enabled with KMS");
-                Arc::new(EncryptedCatalog::new(base_catalog, kms, key_id))
+                (
+                    Arc::new(EncryptedCatalog::new(base_catalog, kms, key_id)),
+                    kms_metrics,
+                )
             } else {
                 tracing::warn!(
                     "Table encryption requested but no KMS configured. \
-                     Use with_kms_config() to configure KMS. Proceeding without encryption."
+                         Use with_kms_config() to configure KMS. Proceeding without encryption."
                 );
-                base_catalog
+                (base_catalog, None)
             }
         } else {
-            base_catalog
+            (base_catalog, None)
         };
 
         // Create API key store
@@ -1065,11 +1250,13 @@ impl AppBuilder {
             idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL),
         ));
 
-        // Create view storage
-        let view_storage = Arc::new(ViewStorage::new());
-
-        // Create metrics registry
-        let metrics = Arc::new(MetricsRegistry::new());
+        // Create metrics registry with optional KMS metrics
+        let mut registry = MetricsRegistry::new();
+        if let Some(kms_m) = kms_metrics {
+            registry.set_kms_metrics(kms_m);
+            tracing::debug!("KMS metrics integrated with /metrics endpoint");
+        }
+        let metrics = Arc::new(registry);
 
         let app_state = AppState {
             authenticator,
@@ -1104,13 +1291,30 @@ impl AppBuilder {
             .default_tenant_id
             .unwrap_or_else(|| "default".to_string());
 
-        let catalog = if let Some(catalog) = self.catalog {
-            catalog
+        let (catalog, view_storage) = if let Some(catalog) = self.catalog {
+            // If custom catalog provided, use MemoryViewStore
+            (
+                catalog,
+                Arc::new(MemoryViewStore::new()) as Arc<dyn ViewStore>,
+            )
         } else {
-            // Create catalog based on storage backend URL
-            Self::create_catalog(self.storage_backend_url.as_deref(), &warehouse_location)
-                .await
-                .expect("Failed to create catalog")
+            // Create catalog and view store based on storage backend URL
+            #[cfg(feature = "slatedb-storage")]
+            let result = Self::create_catalog_and_view_store(
+                self.storage_backend_url.as_deref(),
+                &warehouse_location,
+                self.io_timeout_config.clone(),
+            )
+            .await
+            .expect("Failed to create catalog and view store");
+            #[cfg(not(feature = "slatedb-storage"))]
+            let result = Self::create_catalog_and_view_store(
+                self.storage_backend_url.as_deref(),
+                &warehouse_location,
+            )
+            .await
+            .expect("Failed to create catalog and view store");
+            result
         };
 
         let (authenticator, authorizer): (Arc<dyn Authenticator>, Arc<dyn Authorizer>) = if self
@@ -1175,9 +1379,6 @@ impl AppBuilder {
             self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL),
         ));
 
-        // Create view storage
-        let view_storage = Arc::new(ViewStorage::new());
-
         // Create metrics registry
         let metrics = Arc::new(MetricsRegistry::new());
 
@@ -1203,6 +1404,11 @@ impl AppBuilder {
     }
 
     /// Builds the App with the configured options.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from within an async context (use `build_async` instead).
+    /// Also panics if the Tokio runtime, catalog, or KMS cannot be created.
     pub fn build(self) -> App {
         let warehouse_location = self.warehouse_location.unwrap_or_else(temp_path);
         let default_tenant_id = self
@@ -1213,40 +1419,66 @@ impl AppBuilder {
         let enable_table_encryption = self.enable_table_encryption;
         let kms_config = self.kms_config.clone();
 
-        let base_catalog: Arc<dyn CatalogExt + Send + Sync> = self.catalog.unwrap_or_else(|| {
-            // Create catalog using tokio runtime
-            tokio::runtime::Runtime::new().unwrap().block_on(async {
-                Self::create_catalog(storage_backend_url.as_deref(), &warehouse_clone)
+        let (base_catalog, view_storage): (Arc<dyn CatalogExt + Send + Sync>, Arc<dyn ViewStore>) =
+            if let Some(catalog) = self.catalog {
+                // If custom catalog provided, use MemoryViewStore
+                (
+                    catalog,
+                    Arc::new(MemoryViewStore::new()) as Arc<dyn ViewStore>,
+                )
+            } else {
+                // Create catalog and view store using tokio runtime
+                tokio::runtime::Runtime::new()
+                .expect("Failed to create Tokio runtime — do not call from async context, use build_async() instead")
+                .block_on(async {
+                #[cfg(feature = "slatedb-storage")]
+                let result = Self::create_catalog_and_view_store(storage_backend_url.as_deref(), &warehouse_clone, self.io_timeout_config.clone())
                     .await
-                    .expect("Failed to create catalog")
+                    .expect("Failed to create catalog and view store");
+                #[cfg(not(feature = "slatedb-storage"))]
+                let result = Self::create_catalog_and_view_store(storage_backend_url.as_deref(), &warehouse_clone)
+                    .await
+                    .expect("Failed to create catalog and view store");
+                result
             })
-        });
+            };
 
-        // Wrap catalog with encryption if enabled
-        let catalog: Arc<dyn CatalogExt + Send + Sync> = if enable_table_encryption {
+        // Wrap catalog with encryption if enabled, and capture KMS metrics
+        let (catalog, kms_metrics): (
+            Arc<dyn CatalogExt + Send + Sync>,
+            Option<Arc<crate::crypto::KmsMetrics>>,
+        ) = if enable_table_encryption {
             if let Some(kms_config) = kms_config {
                 // Create KMS using tokio runtime
-                let kms = tokio::runtime::Runtime::new().unwrap().block_on(async {
-                    create_kms(kms_config, None)
-                        .await
-                        .expect("Failed to create KMS for table encryption")
-                });
+                let kms = tokio::runtime::Runtime::new()
+                    .expect("Failed to create Tokio runtime for KMS")
+                    .block_on(async {
+                        create_kms(kms_config, None)
+                            .await
+                            .expect("Failed to create KMS for table encryption")
+                    });
+
+                // Extract KMS metrics before moving kms into EncryptedCatalog
+                let kms_metrics = kms.kms_metrics();
 
                 let key_id = self
                     .kms_key_id
                     .clone()
                     .unwrap_or_else(|| "rustberg-master".to_string());
                 tracing::info!(key_id = %key_id, "Table metadata encryption enabled with KMS");
-                Arc::new(EncryptedCatalog::new(base_catalog, kms, key_id))
+                (
+                    Arc::new(EncryptedCatalog::new(base_catalog, kms, key_id)),
+                    kms_metrics,
+                )
             } else {
                 tracing::warn!(
                     "Table encryption requested but no KMS configured. \
-                     Use with_kms_config() to configure KMS. Proceeding without encryption."
+                         Use with_kms_config() to configure KMS. Proceeding without encryption."
                 );
-                base_catalog
+                (base_catalog, None)
             }
         } else {
-            base_catalog
+            (base_catalog, None)
         };
 
         let (authenticator, authorizer): (Arc<dyn Authenticator>, Arc<dyn Authorizer>) = if self
@@ -1311,11 +1543,13 @@ impl AppBuilder {
             self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL),
         ));
 
-        // Create view storage
-        let view_storage = Arc::new(ViewStorage::new());
-
-        // Create metrics registry
-        let metrics = Arc::new(MetricsRegistry::new());
+        // Create metrics registry with optional KMS metrics
+        let mut registry = MetricsRegistry::new();
+        if let Some(kms_m) = kms_metrics {
+            registry.set_kms_metrics(kms_m);
+            tracing::debug!("KMS metrics integrated with /metrics endpoint");
+        }
+        let metrics = Arc::new(registry);
 
         let app_state = AppState {
             authenticator,

@@ -5,4 +5,3 @@ mod table;
 pub mod view;
 
 pub use routes::create_routes;
-pub use view::ViewStorage;

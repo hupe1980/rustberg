@@ -93,17 +93,21 @@ cargo build --release --all-features
 ### 1. Start the Server
 
 ```bash
-# Development mode (in-memory, auto-generated API key)
-./rustberg
+# Development mode (relaxed security, in-memory storage)
+./rustberg --dev --insecure-http
 
 # Output:
-# ⚠️  DEMO MODE: Using auto-generated API key
-# Demo API Key: rustberg_xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-# 🚀 Rustberg listening on https://127.0.0.1:8181
+# ⚠️  Running in DEVELOPMENT mode - security requirements relaxed
+# ⚠️  CORS allows all origins ("*")
+# 🚀 Rustberg listening on http://127.0.0.1:8000
 ```
 
+{: .note }
+> The `--dev` flag relaxes security checks (allows wildcard CORS, self-signed TLS).
+> Without `--dev`, Rustberg runs in production mode which requires explicit CORS origins.
+
 {: .warning }
-> Demo mode generates a new API key on each restart. For production, use persistent storage.
+> Development mode is NOT suitable for production. Use proper configuration for production deployments.
 
 ### 2. Test the Connection
 
@@ -194,6 +198,8 @@ spec:
 | `RUSTBERG_STORAGE` | Storage backend URL | `memory://` |
 | `RUSTBERG_LOG_LEVEL` | Log verbosity | `info` |
 | `RUSTBERG_MASTER_KEY` | Encryption key (base64) | None |
+| `RUSTBERG_DEV` | Enable development mode | `false` |
+| `RUSTBERG_NO_AUTH` | Disable authentication (dev only) | `false` |
 
 ### TOML Configuration
 

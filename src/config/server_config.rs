@@ -302,6 +302,16 @@ pub struct StorageConfig {
     /// Local cache directory for SlateDB (optional, improves read latency).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<String>,
+
+    /// Timeout in seconds for metadata read operations (e.g., loading table metadata).
+    /// Default: 60 seconds. Increase for high-latency storage backends.
+    #[serde(default = "default_read_timeout_secs")]
+    pub read_timeout_secs: u64,
+
+    /// Timeout in seconds for metadata write operations (e.g., committing table changes).
+    /// Default: 30 seconds.
+    #[serde(default = "default_write_timeout_secs")]
+    pub write_timeout_secs: u64,
 }
 
 impl Default for StorageConfig {
@@ -311,12 +321,22 @@ impl Default for StorageConfig {
             warehouse_location: None,
             aws_region: None,
             cache_dir: None,
+            read_timeout_secs: default_read_timeout_secs(),
+            write_timeout_secs: default_write_timeout_secs(),
         }
     }
 }
 
 fn default_storage_type() -> String {
     "file:///var/lib/rustberg/data".to_string()
+}
+
+fn default_read_timeout_secs() -> u64 {
+    60
+}
+
+fn default_write_timeout_secs() -> u64 {
+    30
 }
 
 /// KMS configuration from file.
@@ -657,6 +677,8 @@ impl RustbergConfig {
                 warehouse_location: Some("s3://my-bucket/warehouse".to_string()),
                 aws_region: None,
                 cache_dir: None,
+                read_timeout_secs: default_read_timeout_secs(),
+                write_timeout_secs: default_write_timeout_secs(),
             },
             kms: KmsConfigFile {
                 provider: "env".to_string(),

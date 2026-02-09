@@ -695,11 +695,44 @@ kubectl exec -it deployment/rustberg -n rustberg -- \
 
 ### High Availability
 
+Rustberg achieves high availability through **optimistic concurrency control** rather than leader election:
+
+```yaml
+# Deploy 3+ replicas for HA
+replicaCount: 3
+
+# Use pod anti-affinity to spread across nodes
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        labelSelector:
+          matchExpressions:
+          - key: app.kubernetes.io/name
+            operator: In
+            values:
+            - rustberg
+        topologyKey: kubernetes.io/hostname
+```
+
+**How It Works:**
+- All pods accept writes simultaneously (no active/passive)
+- Version-based CAS prevents conflicting updates
+- Conflicts return `409` status and clients retry
+- No coordination overhead for reads
+
+**Benefits:**
+- **No split-brain:** Version numbers prevent dual writes
+- **No leader failover:** All pods are equal
+- **Linear read scaling:** N replicas = N× read throughput
+- **Automatic recovery:** Pod restarts have no impact
+
 {: .important }
-> - Run **minimum 3 replicas**
-> - Use **PodDisruptionBudget**
-> - Spread across **availability zones**
-> - Use **pod anti-affinity**
+> - Run **minimum 3 replicas** for fault tolerance
+> - Use **PodDisruptionBudget** to prevent simultaneous pod loss
+> - Spread across **availability zones** with topology constraints
+> - Monitor **409 Conflict** rate in metrics (should be low)
 
 ### Performance
 

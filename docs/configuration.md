@@ -92,6 +92,11 @@ aws_endpoint = ""  # Custom endpoint for MinIO
 
 # Azure configuration
 azure_storage_account = ""
+
+# IO timeout configuration (seconds)
+# Prevents stalled cloud storage connections from blocking workers indefinitely.
+read_timeout_secs = 60   # Timeout for metadata reads (default: 60)
+write_timeout_secs = 30  # Timeout for metadata writes (default: 30)
 ```
 
 ### Authentication Section

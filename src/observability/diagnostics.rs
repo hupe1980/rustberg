@@ -59,13 +59,17 @@ impl StartupDiagnostics {
     }
 
     /// Prints the startup banner with configuration summary.
+    ///
+    /// Uses `tracing::info!` for structured logging so log aggregators
+    /// capture startup configuration. The ASCII banner goes to stdout
+    /// for terminal visibility.
     pub fn print_banner(&self) {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        // ASCII art logo
+        // ASCII art logo — stdout for terminal visibility
         let logo = r#"
   ██████╗ ██╗   ██╗███████╗████████╗██████╗ ███████╗██████╗  ██████╗ 
   ██╔══██╗██║   ██║██╔════╝╚══██╔══╝██╔══██╗██╔════╝██╔══██╗██╔════╝ 
@@ -77,18 +81,44 @@ impl StartupDiagnostics {
 "#;
 
         println!("{}", logo);
+
+        // Log startup configuration via tracing for structured capture
+        let protocol = if self.tls_enabled { "https" } else { "http" };
+        let listen_url = format!("{}://{}:{}", protocol, self.bind_address, self.port);
+
+        let auth_status = match self.auth_mode.as_str() {
+            "disabled" => "disabled (INSECURE)",
+            "api_key" => "API key",
+            "jwt" => "JWT/OIDC",
+            "api_key+jwt" => "API key + JWT",
+            other => other,
+        };
+
+        tracing::info!(
+            service = %self.service_name,
+            version = %self.version,
+            listen_url = %listen_url,
+            tls = self.tls_enabled,
+            auth_mode = %auth_status,
+            storage_backend = %self.storage_backend,
+            warehouse = self.warehouse_location.as_deref().unwrap_or("(none)"),
+            kms_provider = self.kms_provider.as_deref().unwrap_or("none"),
+            default_tenant = %self.default_tenant_id,
+            started_at = now,
+            "Server starting"
+        );
+
+        if let Some(ref commit) = self.git_commit {
+            tracing::info!(commit = %&commit[..commit.len().min(8)], "Build info");
+        }
+
+        // Also print a compact table to stdout for terminal readability
         println!("╔════════════════════════════════════════════════════════════════════╗");
         println!("║  {} v{:<54}║", self.service_name, self.version);
         if let Some(ref commit) = self.git_commit {
             println!("║  Commit: {:<57}║", &commit[..commit.len().min(8)]);
         }
         println!("╠════════════════════════════════════════════════════════════════════╣");
-        println!("║  CONFIGURATION                                                     ║");
-        println!("╠════════════════════════════════════════════════════════════════════╣");
-
-        // Network configuration
-        let protocol = if self.tls_enabled { "https" } else { "http" };
-        let listen_url = format!("{}://{}:{}", protocol, self.bind_address, self.port);
         println!("║  Listen URL:      {:<48}║", listen_url);
         println!(
             "║  TLS:             {:<48}║",
@@ -98,18 +128,7 @@ impl StartupDiagnostics {
                 "✗ disabled (INSECURE)"
             }
         );
-
-        // Authentication
-        let auth_status = match self.auth_mode.as_str() {
-            "disabled" => "✗ disabled (INSECURE)",
-            "api_key" => "✓ API key",
-            "jwt" => "✓ JWT/OIDC",
-            "api_key+jwt" => "✓ API key + JWT",
-            other => other,
-        };
         println!("║  Authentication:  {:<48}║", auth_status);
-
-        // Storage
         println!("║  Storage Backend: {:<48}║", self.storage_backend);
         if let Some(ref warehouse) = self.warehouse_location {
             let truncated = if warehouse.len() > 45 {
@@ -119,22 +138,17 @@ impl StartupDiagnostics {
             };
             println!("║  Warehouse:       {:<48}║", truncated);
         }
-
-        // KMS
         if let Some(ref kms) = self.kms_provider {
             println!("║  KMS Provider:    {:<48}║", kms);
         }
-
-        // Tenant
         println!("║  Default Tenant:  {:<48}║", self.default_tenant_id);
-
-        println!("╠════════════════════════════════════════════════════════════════════╣");
-        println!("║  ENDPOINTS                                                         ║");
         println!("╠════════════════════════════════════════════════════════════════════╣");
         println!("║  Health:  GET /health                                              ║");
         println!("║  Ready:   GET /ready                                               ║");
         println!("║  Metrics: GET /metrics                                             ║");
         println!("║  API:     /v1/namespaces, /v1/{{namespace}}/tables                  ║");
+        println!("║  Views:   /v1/{{namespace}}/views                                   ║");
+        println!("║  Search:  GET /v1/search                                           ║");
         println!("╠════════════════════════════════════════════════════════════════════╣");
         println!("║  Started at Unix timestamp: {:<38}║", now);
         println!("╚════════════════════════════════════════════════════════════════════╝");

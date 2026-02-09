@@ -243,6 +243,9 @@ POST /v1/namespaces/{namespace}/tables
 
 **Response:** `200 OK` with table metadata
 
+{: .note }
+> **Staged table creation** (`stage-create: true`) is not supported. If sent, the server returns `400 Bad Request`. Omit the field or set it to `false`.
+
 ### Load Table
 
 ```http
@@ -321,9 +324,29 @@ DELETE /v1/namespaces/{namespace}/tables/{table}
 
 **Query Parameters:**
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `purgeRequested` | boolean | Also delete data files |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `purgeRequested` | boolean | `false` | When `true`, also delete all underlying data files |
+
+**Purge Behavior:**
+
+When `purgeRequested=true`:
+1. Table metadata is loaded to determine the storage location
+2. Table is removed from the catalog registry
+3. All files in the table's location are recursively deleted (data files, manifest files, metadata files)
+
+**Example:**
+
+```bash
+# Drop table (keep data files)
+curl -X DELETE "$CATALOG_URL/v1/namespaces/analytics/tables/events"
+
+# Drop table and purge all data
+curl -X DELETE "$CATALOG_URL/v1/namespaces/analytics/tables/events?purgeRequested=true"
+```
+
+{: .warning }
+Purge is a destructive operation and cannot be undone. All data files will be permanently deleted from storage.
 
 **Response:** `204 No Content`
 
@@ -417,7 +440,10 @@ POST /v1/views/rename
 
 ### Commit Transaction
 
-Atomically commit changes to multiple tables.
+Commit changes to multiple tables atomically.
+
+{: .note }
+> **Multi-table transactions are atomic.** All table changes are applied together or none are. The implementation uses optimistic concurrency control with version tracking and WriteBatch for atomic registry updates. On conflict, the operation is automatically retried with exponential backoff.
 
 ```http
 POST /v1/transactions/commit
@@ -449,6 +475,19 @@ POST /v1/transactions/commit
 ```
 
 **Response:** `204 No Content` on success
+
+**Atomicity Guarantee:**
+- All requirements validated across all tables BEFORE any changes
+- All metadata files written (orphan files are safe)
+- All registry entries updated atomically via WriteBatch
+- Automatic retry with exponential backoff on conflicts (up to 10 retries)
+
+**On Failure:**
+
+- HTTP 409 for commit conflicts (after max retries exhausted)
+- HTTP 500 for other failures
+- Error message indicates all-or-nothing semantics
+- No partial commits - either all tables are updated or none are
 
 ---
 

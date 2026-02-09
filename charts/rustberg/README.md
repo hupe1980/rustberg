@@ -2,6 +2,8 @@
 
 A Helm chart for deploying [Rustberg](https://github.com/hupe1980/rustberg) - a production-ready Apache Iceberg REST Catalog written in Rust.
 
+> ⚠️ **Important:** Rustberg currently supports **single-writer deployments only**. Set `replicaCount: 1` for write workloads. Multiple replicas can be used for read-heavy workloads with leader election (not yet implemented).
+
 ## Prerequisites
 
 - Kubernetes 1.25+
@@ -38,7 +40,8 @@ rustberg:
 #### Production with S3
 
 ```yaml
-replicaCount: 3
+# IMPORTANT: Use replicaCount: 1 until distributed coordination is implemented
+replicaCount: 1
 
 rustberg:
   storage:
@@ -75,9 +78,9 @@ ingress:
       hosts:
         - iceberg.example.com
 
+# Disable autoscaling until multi-writer support is added
 autoscaling:
-  enabled: true
-  minReplicas: 3
+  enabled: false
   maxReplicas: 10
 
 podDisruptionBudget:

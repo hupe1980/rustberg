@@ -138,7 +138,8 @@ impl SlateDbStore {
             type Target = Db;
 
             fn deref(&self) -> &Self::Target {
-                self.0.as_ref().unwrap()
+                // SAFETY: callers must check is_none() before constructing DbGuard
+                self.0.as_ref().expect("DbGuard created with None db")
             }
         }
 
@@ -304,13 +305,13 @@ fn parse_object_store_url(url: &str) -> KvResult<(Arc<dyn ObjectStore>, String)>
     use slatedb::object_store::memory::InMemory;
 
     if url.starts_with("memory://") {
-        let path = url.strip_prefix("memory://").unwrap_or("/");
+        let path = url.strip_prefix("memory://").unwrap_or("/"); // safe: guarded by starts_with
         return Ok((Arc::new(InMemory::new()), path.to_string()));
     }
 
     if url.starts_with("file://") || url.starts_with("/") {
         let path = if url.starts_with("file://") {
-            url.strip_prefix("file://").unwrap()
+            url.strip_prefix("file://").expect("guarded by starts_with")
         } else {
             url
         };
@@ -325,7 +326,7 @@ fn parse_object_store_url(url: &str) -> KvResult<(Arc<dyn ObjectStore>, String)>
         use slatedb::object_store::gcp::GoogleCloudStorageBuilder;
 
         if url.starts_with("s3://") {
-            let without_scheme = url.strip_prefix("s3://").unwrap();
+            let without_scheme = url.strip_prefix("s3://").expect("guarded by starts_with");
             let (bucket, path) = without_scheme
                 .split_once('/')
                 .unwrap_or((without_scheme, ""));
@@ -339,7 +340,7 @@ fn parse_object_store_url(url: &str) -> KvResult<(Arc<dyn ObjectStore>, String)>
         }
 
         if url.starts_with("gs://") {
-            let without_scheme = url.strip_prefix("gs://").unwrap();
+            let without_scheme = url.strip_prefix("gs://").expect("guarded by starts_with");
             let (bucket, path) = without_scheme
                 .split_once('/')
                 .unwrap_or((without_scheme, ""));
@@ -354,9 +355,10 @@ fn parse_object_store_url(url: &str) -> KvResult<(Arc<dyn ObjectStore>, String)>
 
         if url.starts_with("az://") || url.starts_with("azure://") {
             let without_scheme = if url.starts_with("az://") {
-                url.strip_prefix("az://").unwrap()
+                url.strip_prefix("az://").expect("guarded by starts_with")
             } else {
-                url.strip_prefix("azure://").unwrap()
+                url.strip_prefix("azure://")
+                    .expect("guarded by starts_with")
             };
             let (container, path) = without_scheme
                 .split_once('/')

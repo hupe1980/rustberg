@@ -22,7 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
 /// Represents an API key with associated metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Note: Custom Debug implementation redacts `key_hash` for security.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ApiKey {
     /// Unique identifier for this API key.
     pub id: Uuid,
@@ -61,6 +63,25 @@ pub struct ApiKey {
 
     /// Description/notes about this key.
     pub description: Option<String>,
+}
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKey")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("key_prefix", &self.key_prefix)
+            .field("key_hash", &"[REDACTED]")
+            .field("tenant_id", &self.tenant_id)
+            .field("roles", &self.roles)
+            .field("enabled", &self.enabled)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("last_used_at", &self.last_used_at)
+            .field("usage_count", &self.usage_count)
+            .field("description", &self.description)
+            .finish()
+    }
 }
 
 impl ApiKey {

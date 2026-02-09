@@ -150,8 +150,13 @@ const ALLOWED: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234
 | Protection | Implementation |
 |------------|----------------|
 | Zeroize | Secrets cleared on drop |
-| No Debug | Secrets never printed |
+| Redacted Debug | Custom Debug traits redact sensitive fields |
 | No Clone | Controlled copies |
+
+Structs with custom Debug implementations that redact secrets:
+- `ApiKey` - redacts `key_hash`
+- `StorageCredential` - redacts config values containing `secret`, `token`, or `password`
+- `DataEncryptionKey` - redacts `plaintext` key material
 
 ---
 
@@ -219,12 +224,28 @@ All security events are logged:
 
 ## Secure Defaults
 
+Rustberg is **secure by default**. Production mode (default) enforces:
+
 | Setting | Default | Rationale |
 |---------|---------|-----------|
 | TLS | Required | Prevent eavesdropping |
 | Authentication | Required | Prevent unauthorized access |
+| CORS origins | Must be explicit | Prevent cross-origin attacks |
 | trust_proxy_headers | false | Prevent IP spoofing |
 | Rate limiting | Enabled | Prevent DoS |
+
+### Development Mode
+
+Use `--dev` flag or `RUSTBERG_DEV=1` to relax security for local development:
+
+```bash
+# Local development only
+./rustberg --dev --insecure-http
+```
+
+{: .warning }
+> Development mode allows wildcard CORS and disables some security checks.
+> **Never use `--dev` in production.**
 
 ---
 
@@ -305,18 +326,22 @@ We will:
 
 ---
 
-## Security Audit Results
+## Security Hardening
 
-Last audit: January 24, 2026
+Rustberg includes the following security hardening measures:
 
-| Severity | Count |
-|----------|-------|
-| Critical | 0 |
-| High | 0 |
-| Medium | 0 |
-| Low | 1 |
+| Feature | Area | Detail |
+|---------|------|--------|
+| **JWKS key cache purge** | JWT Auth | Revoked signing keys are rejected within JWKS cache TTL |
+| **Rate-limit peek** | Middleware | Response headers no longer consume a second rate-limit token per request |
+| **DEK cache SHA-256** | KMS | Cryptographic hash for DEK cache keys eliminates collision risk |
+| **Azure KV version** | KMS | Version detection uses key URL hash for reliable rotation detection |
+| **IdempotencyGuard** | Idempotency | RAII guard auto-cleans in-flight entries on failure/drop |
+| **JWT size limit** | JWT Auth | Tokens >16 KB rejected before parsing (DoS prevention) |
+| **Optimistic concurrency** | Catalog | Table commits use version-based CAS; returns 409 on conflict |
+| **Atomic transactions** | Catalog | Multi-table commits are atomic via WriteBatch |
 
-**Finding (Low)**: SystemTime unwrap could theoretically fail if clock is before UNIX epoch. Fixed with `.unwrap_or_default()`.
+**Deployment:** Suitable for production with single or multiple concurrent writers. Implement client-side retry with backoff for commit conflicts.
 
 ---
 

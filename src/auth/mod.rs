@@ -24,8 +24,9 @@ mod store;
 
 // Re-export authenticators
 pub use authn::{
-    AllowAllAuthenticator, ApiKeyAuthenticator, Authenticator, ChainAuthenticator,
-    DenyAllAuthenticator, API_KEY_HEADER, AUTHORIZATION_HEADER,
+    AllowAllAuthenticator, ApiKeyAuthenticator, ApiKeyCache, Authenticator,
+    CachedApiKeyAuthenticator, ChainAuthenticator, DenyAllAuthenticator, API_KEY_HEADER,
+    AUTHORIZATION_HEADER,
 };
 
 // Re-export JWT/OIDC authentication

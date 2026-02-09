@@ -160,7 +160,7 @@ pub struct CreateTablePayload {
     /// Optional write ordering.
     pub write_order: Option<WriteOrder>,
     /// Whether to stage the table (not yet committed).
-    #[allow(dead_code)]
+    /// When `true`, returns 400 — staged creates are not supported.
     pub stage_create: Option<bool>,
     /// Table properties.
     pub properties: Option<HashMap<String, String>>,
@@ -327,6 +327,21 @@ pub struct ListTablesQuery {
     pub page_size: Option<usize>,
 }
 
+/// Query parameters for dropping a table.
+#[derive(Debug, Default, Deserialize)]
+pub struct DropTableQuery {
+    /// Whether to purge underlying data files in addition to removing the table from the catalog.
+    ///
+    /// When `true`, this operation will:
+    /// 1. Load the table to get its data location
+    /// 2. Drop the table from the catalog
+    /// 3. Delete all files in the table's location (data files, metadata files, manifests)
+    ///
+    /// Default is `false` (only remove from catalog, leave data intact).
+    #[serde(rename = "purgeRequested", default)]
+    pub purge_requested: bool,
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -399,6 +414,14 @@ pub async fn create_table(
     validate_table_name(&payload.name)?;
     if let Some(ref props) = payload.properties {
         validate_properties(props)?;
+    }
+
+    // Reject staged table creation (not implemented per Iceberg spec optional feature)
+    if payload.stage_create == Some(true) {
+        return Err(AppError::BadRequest(
+            "Staged table creation is not supported. Omit 'stage-create' or set it to false."
+                .into(),
+        ));
     }
 
     // Build the endpoint path for idempotency scoping
@@ -661,10 +684,26 @@ pub async fn load_table_credentials(
 /// Drops a table from the catalog.
 ///
 /// DELETE /v1/namespaces/{namespace}/tables/{table}
+///
+/// # Query Parameters
+///
+/// - `purgeRequested` (optional, boolean): When true, purges all underlying data files
+///   in addition to removing the table from the catalog. Default is false.
+///
+/// # Purge Behavior
+///
+/// When `purgeRequested=true`:
+/// 1. The table is loaded to determine its storage location
+/// 2. The table is dropped from the catalog registry
+/// 3. All files in the table's location are recursively deleted (data files, manifests, metadata)
+///
+/// **Warning**: Purge is a destructive operation and cannot be undone. The data files
+/// will be permanently deleted from the storage backend.
 pub async fn drop_table(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
     Path((namespace_str, table_name)): Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<DropTableQuery>,
 ) -> Result<StatusCode> {
     let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
     let namespace = NamespaceIdent::from_vec(namespace_parts.clone())?;
@@ -680,8 +719,72 @@ pub async fn drop_table(
     // Record metric
     state.metrics.catalog_delete_table.inc();
 
-    let table_ident = TableIdent::new(namespace, table_name);
+    let table_ident = TableIdent::new(namespace.clone(), table_name.clone());
+
+    // If purge is requested, we need to load the table first to get:
+    // 1. The table's data location (from metadata)
+    // 2. The FileIO instance to delete files
+    let purge_info = if query.purge_requested {
+        match state.catalog.load_table(&table_ident).await {
+            Ok(table) => {
+                let location = table.metadata().location().to_string();
+                let file_io = table.file_io().clone();
+                tracing::info!(
+                    table = %table_ident,
+                    location = %location,
+                    "Table loaded for purge operation"
+                );
+                Some((location, file_io))
+            }
+            Err(e) => {
+                // Table might not be loadable but still exists in catalog
+                // Log warning and proceed with catalog-only drop
+                tracing::warn!(
+                    table = %table_ident,
+                    error = %e,
+                    "Failed to load table for purge; proceeding with catalog-only drop"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Drop the table from the catalog
     state.catalog.drop_table(&table_ident).await?;
+
+    // If purge was requested and we have the table's location, delete the data
+    if let Some((location, file_io)) = purge_info {
+        tracing::info!(
+            table = %table_ident,
+            location = %location,
+            "Purging table data"
+        );
+
+        // Delete all files in the table's location recursively
+        // This includes: data files, manifest files, manifest lists, metadata files
+        if let Err(e) = file_io.remove_dir_all(&location).await {
+            // Log error but don't fail the request - the table is already dropped from catalog
+            // The data files are now orphaned and can be cleaned up manually
+            tracing::error!(
+                table = %table_ident,
+                location = %location,
+                error = %e,
+                "Failed to purge table data; table removed from catalog but data files may remain"
+            );
+            // Note: We intentionally don't return an error here because:
+            // 1. The table has already been dropped from the catalog
+            // 2. The purge operation is "best effort"
+            // 3. Orphaned files can be cleaned up separately
+        } else {
+            tracing::info!(
+                table = %table_ident,
+                location = %location,
+                "Table data purged successfully"
+            );
+        }
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1026,8 +1129,13 @@ pub async fn report_metrics(
 
 /// Commits multiple table updates atomically.
 ///
-/// This endpoint allows atomic commits across multiple tables in a single
-/// transaction. If any commit fails, all changes are rolled back.
+/// Uses an atomic commit model with:
+/// - Optimistic concurrency control with version tracking
+/// - WriteBatch for atomic multi-key registry updates
+/// - Exponential backoff retry on conflicts
+///
+/// All table changes are applied atomically: either all succeed or none do.
+/// If a conflict is detected, the operation is retried with exponential backoff.
 ///
 /// POST /v1/transactions/commit
 pub async fn commit_transaction(
@@ -1082,57 +1190,38 @@ pub async fn commit_transaction(
         ));
     }
 
-    // Execute all commits
-    // Note: True atomic multi-table transactions require catalog support.
-    // For now, we commit sequentially with best-effort rollback on failure.
-    let mut committed = Vec::new();
-
-    for (table_ident, requirements, updates) in table_commits {
-        match state
-            .catalog
-            .commit_table(&table_ident, requirements, updates)
-            .await
-        {
-            Ok(_) => {
-                committed.push(table_ident);
+    // Execute ATOMIC multi-table commit
+    // Using OCC with WriteBatch for true atomicity across all tables
+    match state.catalog.commit_tables_atomic(table_commits).await {
+        Ok(_tables) => {
+            // Cache success if idempotency key was provided
+            if let Some(key) = idempotency_key {
+                if let Some(cached) = CachedResponse::from_json(StatusCode::NO_CONTENT, &()) {
+                    state.idempotency_cache.set(key, cached);
+                }
             }
-            Err(e) => {
-                // Log the failure and tables that were committed
-                tracing::error!(
-                    table = %table_ident,
-                    committed_tables = ?committed,
-                    error = %e,
-                    "Transaction commit failed, partial commits may exist"
-                );
 
-                return Err(if e.kind() == iceberg::ErrorKind::CatalogCommitConflicts {
-                    AppError::CommitConflict(format!(
-                        "Commit conflict on table {}: {}. {} tables were already committed.",
-                        table_ident,
-                        e,
-                        committed.len()
-                    ))
-                } else {
-                    AppError::Internal(format!(
-                        "Transaction failed on table {}: {}. {} tables were already committed.",
-                        table_ident,
-                        e,
-                        committed.len()
-                    ))
-                });
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Atomic transaction commit failed"
+            );
+
+            if e.kind() == iceberg::ErrorKind::CatalogCommitConflicts {
+                Err(AppError::CommitConflict(format!(
+                    "Commit conflict: {}. Transaction was not applied (all-or-nothing).",
+                    e,
+                )))
+            } else {
+                Err(AppError::Internal(format!(
+                    "Transaction failed: {}. Transaction was not applied (all-or-nothing).",
+                    e,
+                )))
             }
         }
     }
-
-    // Cache success if idempotency key was provided
-    if let Some(key) = idempotency_key {
-        // Store minimal cached response
-        if let Some(cached) = CachedResponse::from_json(StatusCode::NO_CONTENT, &()) {
-            state.idempotency_cache.set(key, cached);
-        }
-    }
-
-    Ok(StatusCode::NO_CONTENT)
 }
 
 // ============================================================================
@@ -1643,5 +1732,58 @@ mod tests {
         let payload: RenameTablePayload = serde_json::from_str(json).unwrap();
         assert_eq!(payload.source.namespace, payload.destination.namespace);
         assert_ne!(payload.source.name, payload.destination.name);
+    }
+
+    // ========================================================================
+    // DropTableQuery Tests
+    // ========================================================================
+
+    #[test]
+    fn test_drop_table_query_defaults() {
+        let query = DropTableQuery::default();
+        assert!(!query.purge_requested);
+    }
+
+    #[test]
+    fn test_drop_table_query_purge_false() {
+        let json = r#"{"purgeRequested": false}"#;
+        let query: DropTableQuery = serde_json::from_str(json).unwrap();
+        assert!(!query.purge_requested);
+    }
+
+    #[test]
+    fn test_drop_table_query_purge_true() {
+        let json = r#"{"purgeRequested": true}"#;
+        let query: DropTableQuery = serde_json::from_str(json).unwrap();
+        assert!(query.purge_requested);
+    }
+
+    #[test]
+    fn test_drop_table_query_empty() {
+        // Empty JSON should default purge_requested to false
+        let json = r#"{}"#;
+        let query: DropTableQuery = serde_json::from_str(json).unwrap();
+        assert!(!query.purge_requested);
+    }
+
+    #[test]
+    fn test_stage_create_false_is_accepted() {
+        let json = r#"{
+            "name": "test",
+            "schema": {"type": "struct", "fields": []},
+            "stage-create": false
+        }"#;
+        let payload: CreateTablePayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.stage_create, Some(false));
+    }
+
+    #[test]
+    fn test_stage_create_omitted_defaults_to_none() {
+        let json = r#"{
+            "name": "test",
+            "schema": {"type": "struct", "fields": []}
+        }"#;
+        let payload: CreateTablePayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.stage_create, None);
     }
 }

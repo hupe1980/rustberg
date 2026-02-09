@@ -33,6 +33,20 @@ Rustberg uses **SlateDB** (100% pure Rust) for catalog metadata storage:
 | Azure Blob | `az://container/prefix` | ✅ | Cloud production |
 | MinIO | `s3://bucket` + endpoint | ✅ | Air-gapped |
 
+### What Gets Stored
+
+SlateDB stores all catalog metadata, including:
+
+| Data Type | Key Pattern | Persistence |
+|-----------|-------------|-------------|
+| Namespaces | `namespace:{name}` | ✅ Durable |
+| Tables | `table:{namespace}:{name}` | ✅ Durable |
+| Views | `view:{namespace}:{name}` | ✅ Durable |
+| Idempotency Keys | `idempotency:{scope}:{key}` | ✅ Durable |
+| API Keys | `apikey:{prefix}` | ✅ Durable (with slatedb-storage) |
+
+All data survives server restarts when using persistent backends (file, S3, GCS, Azure).
+
 ---
 
 ## Quick Start

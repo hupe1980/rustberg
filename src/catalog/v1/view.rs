@@ -14,7 +14,6 @@ use iceberg::spec::{
     NestedFieldRef, Schema as IcebergSchema, ViewMetadata, ViewMetadataBuilder, ViewRepresentations,
 };
 use iceberg::{NamespaceIdent, ViewCreation, ViewUpdate};
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -117,7 +116,7 @@ pub struct CreateViewPayload {
 pub struct CreateViewVersion {
     /// Schema ID for this view version (reserved for future use).
     #[serde(default)]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Deserialized per Iceberg REST spec; reserved for future use
     schema_id: Option<i32>,
     /// SQL representations of the view.
     pub representations: Vec<SqlRepresentation>,
@@ -155,7 +154,7 @@ pub struct RenameViewPayload {
 pub struct CommitViewRequest {
     /// Optional view identifier (for future multi-view commits).
     #[serde(default)]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Deserialized per Iceberg REST spec; reserved for multi-view commits
     identifier: Option<ViewIdentifier>,
     /// Requirements that must be met for the commit to succeed.
     #[serde(default)]
@@ -198,158 +197,6 @@ pub struct ListViewsQuery {
 }
 
 // ============================================================================
-// In-Memory View Storage
-// ============================================================================
-
-/// Type alias for view storage map: (namespace, name) -> (metadata_location, metadata).
-type ViewMap = HashMap<(Vec<String>, String), (String, ViewMetadata)>;
-
-/// In-memory view storage for development/testing.
-///
-/// For production, this should be backed by SlateDB or similar persistent storage.
-#[derive(Debug, Default)]
-pub struct ViewStorage {
-    /// Views indexed by (namespace, name) -> (metadata_location, metadata).
-    views: RwLock<ViewMap>,
-}
-
-impl ViewStorage {
-    /// Creates a new view storage.
-    pub fn new() -> Self {
-        Self {
-            views: RwLock::new(HashMap::new()),
-        }
-    }
-
-    /// Lists all views in a namespace.
-    pub fn list_views(&self, namespace: &[String]) -> Vec<String> {
-        let views = self.views.read();
-        views
-            .keys()
-            .filter(|(ns, _)| ns == namespace)
-            .map(|(_, name)| name.clone())
-            .collect()
-    }
-
-    /// Checks if a view exists.
-    pub fn view_exists(&self, namespace: &[String], name: &str) -> bool {
-        let views = self.views.read();
-        views.contains_key(&(namespace.to_vec(), name.to_string()))
-    }
-
-    /// Loads a view by namespace and name.
-    pub fn load_view(&self, namespace: &[String], name: &str) -> Option<(String, ViewMetadata)> {
-        let views = self.views.read();
-        views.get(&(namespace.to_vec(), name.to_string())).cloned()
-    }
-
-    /// Creates a new view. Returns error if view already exists.
-    pub fn create_view(
-        &self,
-        namespace: &[String],
-        name: &str,
-        metadata_location: String,
-        metadata: ViewMetadata,
-    ) -> Result<()> {
-        use std::collections::hash_map::Entry;
-
-        let mut views = self.views.write();
-        let key = (namespace.to_vec(), name.to_string());
-
-        if let Entry::Vacant(e) = views.entry(key) {
-            e.insert((metadata_location, metadata));
-            Ok(())
-        } else {
-            Err(AppError::ViewAlreadyExists(format!(
-                "{}.{}",
-                namespace.join("."),
-                name
-            )))
-        }
-    }
-
-    /// Updates an existing view. Returns error if view doesn't exist.
-    pub fn update_view(
-        &self,
-        namespace: &[String],
-        name: &str,
-        metadata_location: String,
-        metadata: ViewMetadata,
-    ) -> Result<()> {
-        use std::collections::hash_map::Entry;
-
-        let mut views = self.views.write();
-        let key = (namespace.to_vec(), name.to_string());
-
-        if let Entry::Occupied(mut e) = views.entry(key) {
-            e.insert((metadata_location, metadata));
-            Ok(())
-        } else {
-            Err(AppError::NoSuchView(format!(
-                "{}.{}",
-                namespace.join("."),
-                name
-            )))
-        }
-    }
-
-    /// Drops a view. Returns error if view doesn't exist.
-    pub fn drop_view(&self, namespace: &[String], name: &str) -> Result<()> {
-        let mut views = self.views.write();
-        let key = (namespace.to_vec(), name.to_string());
-
-        if views.remove(&key).is_some() {
-            Ok(())
-        } else {
-            Err(AppError::NoSuchView(format!(
-                "{}.{}",
-                namespace.join("."),
-                name
-            )))
-        }
-    }
-
-    /// Renames a view. Returns error if source doesn't exist or dest exists.
-    pub fn rename_view(
-        &self,
-        src_namespace: &[String],
-        src_name: &str,
-        dest_namespace: &[String],
-        dest_name: &str,
-    ) -> Result<()> {
-        let mut views = self.views.write();
-        let src_key = (src_namespace.to_vec(), src_name.to_string());
-        let dest_key = (dest_namespace.to_vec(), dest_name.to_string());
-
-        if views.contains_key(&dest_key) {
-            return Err(AppError::ViewAlreadyExists(format!(
-                "{}.{}",
-                dest_namespace.join("."),
-                dest_name
-            )));
-        }
-
-        if let Some((loc, metadata)) = views.remove(&src_key) {
-            // Update location if moving to different namespace
-            let new_location = if src_namespace != dest_namespace {
-                loc.replace(&src_namespace.join("/"), &dest_namespace.join("/"))
-            } else {
-                loc.replace(src_name, dest_name)
-            };
-
-            views.insert(dest_key, (new_location, metadata));
-            Ok(())
-        } else {
-            Err(AppError::NoSuchView(format!(
-                "{}.{}",
-                src_namespace.join("."),
-                src_name
-            )))
-        }
-    }
-}
-
-// ============================================================================
 // Handlers
 // ============================================================================
 
@@ -375,7 +222,7 @@ pub async fn list_views(
     state.authorizer.check(&ctx).await?;
 
     // List views from storage
-    let view_names = state.view_storage.list_views(&namespace_parts);
+    let view_names = state.view_storage.list_views(&namespace_parts).await?;
 
     let mut identifiers: Vec<ViewIdentifier> = view_names
         .into_iter()
@@ -514,12 +361,15 @@ pub async fn create_view(
     let view_metadata = build_result.metadata;
 
     // Store the view
-    state.view_storage.create_view(
-        &namespace_parts,
-        &payload.name,
-        metadata_location.clone(),
-        view_metadata.clone(),
-    )?;
+    state
+        .view_storage
+        .create_view(
+            &namespace_parts,
+            &payload.name,
+            metadata_location.clone(),
+            view_metadata.clone(),
+        )
+        .await?;
 
     tracing::info!(
         namespace = %namespace_ident,
@@ -581,6 +431,7 @@ pub async fn load_view(
     let (metadata_location, metadata) = state
         .view_storage
         .load_view(&namespace_parts, &view_name)
+        .await?
         .ok_or_else(|| {
             AppError::NoSuchView(format!("{}.{}", namespace_parts.join("."), view_name))
         })?;
@@ -615,7 +466,11 @@ pub async fn view_exists(
     state.authorizer.check(&ctx).await?;
 
     // Check if view exists
-    if state.view_storage.view_exists(&namespace_parts, &view_name) {
+    if state
+        .view_storage
+        .view_exists(&namespace_parts, &view_name)
+        .await?
+    {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NoSuchView(format!(
@@ -650,7 +505,10 @@ pub async fn drop_view(
     state.authorizer.check(&ctx).await?;
 
     // Drop the view
-    state.view_storage.drop_view(&namespace_parts, &view_name)?;
+    state
+        .view_storage
+        .drop_view(&namespace_parts, &view_name)
+        .await?;
 
     tracing::info!(
         namespace = namespace_parts.join("."),
@@ -707,6 +565,7 @@ pub async fn commit_view(
     let (current_metadata_location, current_metadata) = state
         .view_storage
         .load_view(&namespace_parts, &view_name)
+        .await?
         .ok_or_else(|| {
             AppError::NoSuchView(format!("{}.{}", namespace_parts.join("."), view_name))
         })?;
@@ -742,12 +601,15 @@ pub async fn commit_view(
     let new_metadata_location = generate_new_view_metadata_location(&current_metadata_location)?;
 
     // Update storage
-    state.view_storage.update_view(
-        &namespace_parts,
-        &view_name,
-        new_metadata_location.clone(),
-        new_metadata.clone(),
-    )?;
+    state
+        .view_storage
+        .update_view(
+            &namespace_parts,
+            &view_name,
+            new_metadata_location.clone(),
+            new_metadata.clone(),
+        )
+        .await?;
 
     tracing::info!(
         namespace = namespace_parts.join("."),
@@ -853,12 +715,15 @@ pub async fn rename_view(
     state.authorizer.check(&create_ctx).await?;
 
     // Perform the rename
-    state.view_storage.rename_view(
-        &payload.source.namespace,
-        &payload.source.name,
-        &payload.destination.namespace,
-        &payload.destination.name,
-    )?;
+    state
+        .view_storage
+        .rename_view(
+            &payload.source.namespace,
+            &payload.source.name,
+            &payload.destination.namespace,
+            &payload.destination.name,
+        )
+        .await?;
 
     tracing::info!(
         source = format!(
@@ -916,6 +781,7 @@ fn generate_new_view_metadata_location(current_location: &str) -> Result<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{MemoryViewStore, ViewStore};
 
     #[test]
     fn test_view_identifier_serialization() {
@@ -929,14 +795,14 @@ mod tests {
         assert!(json.contains("\"name\""));
     }
 
-    #[test]
-    fn test_view_storage_basic_operations() {
-        let storage = ViewStorage::new();
+    #[tokio::test]
+    async fn test_view_storage_basic_operations() {
+        let storage = MemoryViewStore::new();
         let namespace = vec!["test".to_string()];
 
         // Initially empty
-        assert!(storage.list_views(&namespace).is_empty());
-        assert!(!storage.view_exists(&namespace, "view1"));
+        assert!(storage.list_views(&namespace).await.unwrap().is_empty());
+        assert!(!storage.view_exists(&namespace, "view1").await.unwrap());
 
         // Create representations using serde (since ViewRepresentations has private constructor)
         let representations: ViewRepresentations = serde_json::from_value(serde_json::json!([
@@ -972,32 +838,40 @@ mod tests {
                 "/test/metadata.json".to_string(),
                 metadata.clone(),
             )
+            .await
             .unwrap();
 
         // Verify exists
-        assert!(storage.view_exists(&namespace, "view1"));
-        assert_eq!(storage.list_views(&namespace), vec!["view1".to_string()]);
+        assert!(storage.view_exists(&namespace, "view1").await.unwrap());
+        let views = storage.list_views(&namespace).await.unwrap();
+        assert_eq!(views, vec!["view1".to_string()]);
 
         // Load view
-        let (loc, loaded) = storage.load_view(&namespace, "view1").unwrap();
+        let (loc, loaded) = storage
+            .load_view(&namespace, "view1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(loc, "/test/metadata.json");
         assert_eq!(loaded.uuid(), metadata.uuid());
 
         // Cannot create duplicate
-        let result = storage.create_view(
-            &namespace,
-            "view1",
-            "/other.json".to_string(),
-            metadata.clone(),
-        );
+        let result = storage
+            .create_view(
+                &namespace,
+                "view1",
+                "/other.json".to_string(),
+                metadata.clone(),
+            )
+            .await;
         assert!(result.is_err());
 
         // Drop view
-        storage.drop_view(&namespace, "view1").unwrap();
-        assert!(!storage.view_exists(&namespace, "view1"));
+        storage.drop_view(&namespace, "view1").await.unwrap();
+        assert!(!storage.view_exists(&namespace, "view1").await.unwrap());
 
         // Cannot drop non-existent
-        let result = storage.drop_view(&namespace, "view1");
+        let result = storage.drop_view(&namespace, "view1").await;
         assert!(result.is_err());
     }
 

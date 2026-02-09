@@ -10,16 +10,27 @@ pub struct ApiDoc;
 
 impl ApiDoc {
     /// Returns the OpenAPI specification as JSON.
+    ///
+    /// Note: For the full specification with all paths and schemas,
+    /// use `yaml()`. The JSON output provides metadata (info, tags, servers)
+    /// but paths/components are served from the YAML spec.
     pub fn json() -> String {
-        serde_json::to_string_pretty(&Self::spec()).unwrap()
+        serde_json::to_string_pretty(&Self::spec())
+            .expect("OpenAPI spec serialization must succeed")
     }
 
     /// Returns the OpenAPI specification as YAML.
+    ///
+    /// This is the authoritative, complete specification including all paths,
+    /// schemas, and security definitions.
     pub fn yaml() -> String {
         OPENAPI_YAML.replace("{{VERSION}}", env!("CARGO_PKG_VERSION"))
     }
 
     /// Returns the OpenAPI specification as a struct.
+    ///
+    /// Contains metadata (info, tags, servers). For the full path/schema
+    /// definitions, use the YAML output which is the canonical source.
     pub fn spec() -> OpenApiSpec {
         OpenApiSpec {
             openapi: "3.0.3".to_string(),
@@ -44,6 +55,9 @@ impl ApiDoc {
                 Tag { name: "config".to_string(), description: "Server configuration endpoints".to_string() },
                 Tag { name: "namespaces".to_string(), description: "Namespace management operations".to_string() },
                 Tag { name: "tables".to_string(), description: "Table management operations".to_string() },
+                Tag { name: "views".to_string(), description: "View management operations".to_string() },
+                Tag { name: "search".to_string(), description: "Catalog search and discovery".to_string() },
+                Tag { name: "auth".to_string(), description: "Authentication introspection endpoints".to_string() },
                 Tag { name: "health".to_string(), description: "Health check endpoints".to_string() },
                 Tag { name: "metrics".to_string(), description: "Observability endpoints".to_string() },
             ],
@@ -86,6 +100,8 @@ tags:
     description: Namespace management operations
   - name: tables
     description: Table management operations
+  - name: views
+    description: View management operations
   - name: search
     description: Catalog search and discovery
   - name: auth
@@ -602,6 +618,216 @@ paths:
           description: Table not found
         "406":
           description: Credential vending not supported for this table's storage location
+
+  /v1/namespaces/{namespace}/views:
+    get:
+      tags: [views]
+      summary: List views in a namespace
+      operationId: listViews
+      security:
+        - api_key: []
+        - bearer_auth: []
+      parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: pageToken
+          in: query
+          schema:
+            type: string
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: List of views
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListTablesResponse"
+        "401":
+          description: Unauthorized
+        "404":
+          description: Namespace not found
+    post:
+      tags: [views]
+      summary: Create a view
+      operationId: createView
+      security:
+        - api_key: []
+        - bearer_auth: []
+      parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateViewRequest"
+      responses:
+        "200":
+          description: Created view
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoadViewResponse"
+        "400":
+          description: Invalid request
+        "401":
+          description: Unauthorized
+        "404":
+          description: Namespace not found
+        "409":
+          description: View already exists
+
+  /v1/namespaces/{namespace}/views/{view}:
+    get:
+      tags: [views]
+      summary: Load view metadata
+      operationId: loadView
+      security:
+        - api_key: []
+        - bearer_auth: []
+      parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: view
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: View metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoadViewResponse"
+        "401":
+          description: Unauthorized
+        "404":
+          description: View not found
+    head:
+      tags: [views]
+      summary: Check if view exists
+      operationId: viewExists
+      security:
+        - api_key: []
+        - bearer_auth: []
+      parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: view
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: View exists
+        "404":
+          description: View not found
+    post:
+      tags: [views]
+      summary: Commit view changes
+      operationId: commitView
+      security:
+        - api_key: []
+        - bearer_auth: []
+      parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: view
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommitViewRequest"
+      responses:
+        "200":
+          description: Updated view metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoadViewResponse"
+        "400":
+          description: Invalid request
+        "401":
+          description: Unauthorized
+        "404":
+          description: View not found
+        "409":
+          description: Commit conflict
+    delete:
+      tags: [views]
+      summary: Delete a view
+      operationId: dropView
+      security:
+        - api_key: []
+        - bearer_auth: []
+      parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: view
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: View deleted
+        "401":
+          description: Unauthorized
+        "404":
+          description: View not found
+
+  /v1/views/rename:
+    post:
+      tags: [views]
+      summary: Rename a view
+      operationId: renameView
+      security:
+        - api_key: []
+        - bearer_auth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RenameViewRequest"
+      responses:
+        "204":
+          description: View renamed
+        "400":
+          description: Invalid request
+        "401":
+          description: Unauthorized
+        "404":
+          description: View not found
 
   /v1/transactions/commit:
     post:
@@ -1173,6 +1399,89 @@ components:
             $ref: "#/components/schemas/CommitTableRequest"
           description: List of table commits to apply atomically
 
+    CreateViewRequest:
+      type: object
+      required: [name, schema, view-version]
+      properties:
+        name:
+          type: string
+          description: Name of the view
+        location:
+          type: string
+          description: Optional custom view location
+        schema:
+          type: object
+          description: View schema definition
+        view-version:
+          type: object
+          description: View version with SQL representations
+          required: [representations, default-namespace]
+          properties:
+            schema-id:
+              type: integer
+              description: Schema ID for this view version
+            representations:
+              type: array
+              items:
+                type: object
+                required: [type, sql, dialect]
+                properties:
+                  type:
+                    type: string
+                    enum: [sql]
+                  sql:
+                    type: string
+                  dialect:
+                    type: string
+            default-catalog:
+              type: string
+            default-namespace:
+              type: array
+              items:
+                type: string
+            summary:
+              type: object
+              additionalProperties:
+                type: string
+        properties:
+          type: object
+          additionalProperties:
+            type: string
+
+    LoadViewResponse:
+      type: object
+      required: [metadata-location, metadata]
+      properties:
+        metadata-location:
+          type: string
+        metadata:
+          type: object
+          description: Full view metadata
+
+    CommitViewRequest:
+      type: object
+      required: [updates]
+      properties:
+        identifier:
+          $ref: "#/components/schemas/TableIdentifier"
+        requirements:
+          type: array
+          items:
+            type: object
+        updates:
+          type: array
+          items:
+            type: object
+
+    RenameViewRequest:
+      type: object
+      required: [source, destination]
+      properties:
+        source:
+          $ref: "#/components/schemas/TableIdentifier"
+        destination:
+          $ref: "#/components/schemas/TableIdentifier"
+
     HealthResponse:
       type: object
       required: [status]
@@ -1324,6 +1633,10 @@ mod tests {
         let json = ApiDoc::json();
         assert!(json.contains("Rustberg"));
         assert!(json.contains("Apache Iceberg"));
+        // Tags should include all API categories
+        assert!(json.contains("views"));
+        assert!(json.contains("search"));
+        assert!(json.contains("auth"));
     }
 
     #[test]
@@ -1334,5 +1647,34 @@ mod tests {
         assert!(yaml.contains("/v1/config"));
         assert!(yaml.contains("api_key"));
         assert!(!yaml.contains("{{VERSION}}")); // Version should be replaced
+    }
+
+    #[test]
+    fn test_openapi_yaml_contains_view_endpoints() {
+        let yaml = ApiDoc::yaml();
+        assert!(yaml.contains("/v1/namespaces/{namespace}/views"));
+        assert!(yaml.contains("/v1/namespaces/{namespace}/views/{view}"));
+        assert!(yaml.contains("/v1/views/rename"));
+        assert!(yaml.contains("listViews"));
+        assert!(yaml.contains("createView"));
+        assert!(yaml.contains("loadView"));
+        assert!(yaml.contains("commitView"));
+        assert!(yaml.contains("viewExists"));
+        assert!(yaml.contains("dropView"));
+        assert!(yaml.contains("renameView"));
+    }
+
+    #[test]
+    fn test_openapi_spec_tags_are_complete() {
+        let spec = ApiDoc::spec();
+        let tag_names: Vec<&str> = spec.tags.iter().map(|t| t.name.as_str()).collect();
+        assert!(tag_names.contains(&"config"));
+        assert!(tag_names.contains(&"namespaces"));
+        assert!(tag_names.contains(&"tables"));
+        assert!(tag_names.contains(&"views"));
+        assert!(tag_names.contains(&"search"));
+        assert!(tag_names.contains(&"auth"));
+        assert!(tag_names.contains(&"health"));
+        assert!(tag_names.contains(&"metrics"));
     }
 }

@@ -132,9 +132,11 @@ pub async fn auth_middleware(
             // Continue to the next handler
             let mut response = next.run(request).await;
 
-            // Add rate limit headers to successful response
+            // Add rate limit headers to successful response.
+            // SECURITY: Use peek_ip_limit (read-only) instead of check_ip_limit
+            // to avoid consuming a second token from the bucket per request.
             if let Some(ip) = client_ip {
-                if let Ok(info) = auth_state.rate_limiter.check_ip_limit(&ip) {
+                if let Some(info) = auth_state.rate_limiter.peek_ip_limit(&ip) {
                     response = add_rate_limit_headers(response, Some(info));
                 }
             }
@@ -236,9 +238,11 @@ pub async fn require_auth_middleware(
             // Continue to the next handler
             let mut response = next.run(request).await;
 
-            // Add rate limit headers
+            // Add rate limit headers.
+            // SECURITY: Use peek_ip_limit (read-only) instead of check_ip_limit
+            // to avoid consuming a second token from the bucket per request.
             if let Some(ip) = client_ip {
-                if let Ok(info) = auth_state.rate_limiter.check_ip_limit(&ip) {
+                if let Some(info) = auth_state.rate_limiter.peek_ip_limit(&ip) {
                     response = add_rate_limit_headers(response, Some(info));
                 }
             }

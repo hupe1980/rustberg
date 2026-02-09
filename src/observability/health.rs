@@ -33,7 +33,7 @@ impl HealthStatus {
     pub fn healthy() -> Self {
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         Self {
@@ -51,7 +51,7 @@ impl HealthStatus {
             version: env!("CARGO_PKG_VERSION").to_string(),
             timestamp: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
             uptime_seconds: None,
         }
@@ -80,6 +80,8 @@ pub struct ReadinessStatus {
 pub struct ReadinessComponents {
     /// Catalog backend connectivity.
     pub catalog: ComponentStatus,
+    /// Storage backend (S3/GCS/Azure/local) connectivity.
+    pub storage: ComponentStatus,
     /// Authentication system status.
     pub authentication: ComponentStatus,
     /// Authorization system status.
@@ -137,7 +139,7 @@ impl ReadinessStatus {
 
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         // Health check timeout - if any check takes longer than this, it's degraded
@@ -156,6 +158,28 @@ impl ReadinessStatus {
             }
         };
 
+        // Storage backend health check (S3/GCS/Azure/local)
+        let storage = match timeout(check_timeout, state.catalog.storage_health_check()).await {
+            Ok(Ok(status)) if status.healthy => {
+                let mut comp = ComponentStatus::ready();
+                comp.message = Some(format!("{}:{}ms", status.backend_type, status.latency_ms));
+                comp
+            }
+            Ok(Ok(status)) => ComponentStatus::degraded(
+                status
+                    .message
+                    .unwrap_or_else(|| format!("{} unhealthy", status.backend_type)),
+            ),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "Storage health check failed");
+                ComponentStatus::degraded(format!("Storage error: {}", e))
+            }
+            Err(_) => {
+                tracing::warn!("Storage health check timed out");
+                ComponentStatus::degraded("Storage response timeout")
+            }
+        };
+
         // Authentication is considered ready if the authenticator trait is present
         // In practice, we don't have a separate health check method on the trait
         let authentication = ComponentStatus::ready();
@@ -169,6 +193,7 @@ impl ReadinessStatus {
 
         let components = ReadinessComponents {
             catalog,
+            storage,
             authentication,
             authorization,
             credentials,
@@ -177,6 +202,7 @@ impl ReadinessStatus {
         // Overall status is ready if all components are ready (not degraded or unavailable)
         let all_ready = [
             &components.catalog,
+            &components.storage,
             &components.authentication,
             &components.authorization,
             &components.credentials,

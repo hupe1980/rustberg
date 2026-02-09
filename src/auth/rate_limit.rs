@@ -511,6 +511,26 @@ impl RateLimiter {
         Ok(ip_result)
     }
 
+    /// Returns the current rate limit state for an IP without consuming a token.
+    ///
+    /// Use this to populate rate-limit response headers after the request has
+    /// already been admitted by `check_ip_limit`.
+    pub fn peek_ip_limit(&self, ip: &IpAddr) -> Option<RateLimitInfo> {
+        if !self.config.enabled {
+            return Some(RateLimitInfo::unlimited());
+        }
+
+        self.ip_limiters.get(ip).map(|entry| {
+            let bucket = entry.lock();
+            RateLimitInfo {
+                limit: self.config.per_ip_requests,
+                remaining: bucket.remaining(),
+                reset_secs: 60,
+                limit_type: LimitType::PerIp,
+            }
+        })
+    }
+
     /// Cleans up expired entries to prevent memory growth.
     /// Call this periodically (e.g., every few minutes).
     ///
@@ -942,5 +962,44 @@ mod tests {
         // Note: A full test of stale eviction would require waiting 5 minutes,
         // which isn't practical. The key verification is that cleanup() runs
         // without error and retains fresh entries.
+    }
+
+    #[test]
+    fn test_peek_ip_limit_does_not_consume_token() {
+        let config = RateLimitConfig::builder()
+            .enabled(true)
+            .per_ip_requests(10)
+            .per_ip_burst(10)
+            .build();
+
+        let limiter = RateLimiter::new(config);
+        let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+
+        // First consume a token so the bucket exists
+        let info = limiter.check_ip_limit(&ip).unwrap();
+        let remaining_after_check = info.remaining;
+
+        // Peek should return the same remaining count (no consumption)
+        let peek_info = limiter.peek_ip_limit(&ip).expect("bucket should exist");
+        assert_eq!(peek_info.remaining, remaining_after_check);
+
+        // Peek again — still no consumption
+        let peek_info2 = limiter.peek_ip_limit(&ip).expect("bucket should exist");
+        assert_eq!(peek_info2.remaining, remaining_after_check);
+    }
+
+    #[test]
+    fn test_peek_ip_limit_returns_none_for_unknown_ip() {
+        let config = RateLimitConfig::builder()
+            .enabled(true)
+            .per_ip_requests(10)
+            .per_ip_burst(10)
+            .build();
+
+        let limiter = RateLimiter::new(config);
+        let ip: std::net::IpAddr = "10.0.0.99".parse().unwrap();
+
+        // No bucket exists yet
+        assert!(limiter.peek_ip_limit(&ip).is_none());
     }
 }

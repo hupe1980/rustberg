@@ -74,8 +74,9 @@ enum StringOrVec {
     Vec(Vec<String>),
 }
 
-#[allow(dead_code)]
 impl StringOrVec {
+    /// Checks if the audience field contains a specific value.
+    #[cfg(test)]
     fn contains(&self, value: &str) -> bool {
         match self {
             StringOrVec::String(s) => s == value,
@@ -221,6 +222,16 @@ impl JwtAuthenticator {
         // Cache miss or expired - fetch new JWKS
         let jwks = self.fetch_jwks().await?;
 
+        // SECURITY: Clear stale decoding keys when JWKS is refreshed.
+        // This ensures revoked/rotated signing keys are not honored after
+        // the JWKS cache TTL expires. Without this, a compromised key that
+        // has been removed from the provider's JWKS would still be accepted.
+        self.decoding_keys.clear();
+        tracing::debug!(
+            jwks_keys = jwks.keys.len(),
+            "Refreshed JWKS and purged cached decoding keys"
+        );
+
         // Update cache
         {
             let mut cache = self.jwks_cache.write();
@@ -276,8 +287,21 @@ impl JwtAuthenticator {
         Ok(decoding_key)
     }
 
+    /// Maximum allowed JWT token size in bytes (16 KB).
+    /// Prevents denial-of-service via extremely large tokens.
+    const MAX_TOKEN_SIZE: usize = 16 * 1024;
+
     /// Validate and decode a JWT token
     async fn validate_token(&self, token: &str) -> Result<TokenData<CustomClaims>, AuthError> {
+        // SECURITY: Reject oversized tokens before any parsing to prevent
+        // memory exhaustion and CPU abuse from base64 decoding / JSON parsing.
+        if token.len() > Self::MAX_TOKEN_SIZE {
+            return Err(AuthError::InvalidToken(format!(
+                "Token exceeds maximum size of {} bytes",
+                Self::MAX_TOKEN_SIZE,
+            )));
+        }
+
         // Decode header to get key ID
         let header = decode_header(token)
             .map_err(|e| AuthError::InvalidToken(format!("Failed to decode header: {}", e)))?;

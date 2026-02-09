@@ -357,17 +357,29 @@ impl ApiKeyStore for KvApiKeyStore {
     async fn get_by_prefix(&self, key_prefix: &str) -> Vec<ApiKey> {
         self.get_by_prefix_internal(key_prefix)
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, key_prefix = key_prefix, "Failed to look up API key by prefix from storage");
+                Vec::new()
+            })
     }
 
     async fn get_by_id(&self, id: &Uuid) -> Option<ApiKey> {
-        self.get_by_id_internal(id).await.ok().flatten()
+        match self.get_by_id_internal(id).await {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!(error = %e, id = %id, "Failed to look up API key by ID from storage");
+                None
+            }
+        }
     }
 
     async fn list_for_tenant(&self, tenant_id: &str) -> Vec<ApiKey> {
         self.list_by_tenant_internal(tenant_id)
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, tenant_id = tenant_id, "Failed to list API keys for tenant from storage");
+                Vec::new()
+            })
     }
 
     async fn store(&self, key: ApiKey) -> Result<(), String> {

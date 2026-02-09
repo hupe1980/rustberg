@@ -41,7 +41,7 @@ pub struct IcebergErrorResponse {
 ///
 /// These errors are designed to match the Iceberg REST Catalog API
 /// specification for consistent client behavior.
-#[allow(dead_code)]
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AppError {

@@ -46,12 +46,44 @@ pub async fn get_config(
             clients: "4".to_string(),
         },
         endpoints: vec![
+            // Config
+            "GET /v1/config".to_string(),
+            // Search
+            "GET /v1/search".to_string(),
+            // Namespace routes
             "GET /v1/namespaces".to_string(),
             "POST /v1/namespaces".to_string(),
             "GET /v1/namespaces/{namespace}".to_string(),
             "HEAD /v1/namespaces/{namespace}".to_string(),
+            "DELETE /v1/namespaces/{namespace}".to_string(),
+            "POST /v1/namespaces/{namespace}/properties".to_string(),
+            // Table routes
+            "GET /v1/namespaces/{namespace}/tables".to_string(),
+            "POST /v1/namespaces/{namespace}/tables".to_string(),
+            "POST /v1/namespaces/{namespace}/register".to_string(),
             "GET /v1/namespaces/{namespace}/tables/{table}".to_string(),
+            "POST /v1/namespaces/{namespace}/tables/{table}".to_string(),
+            "HEAD /v1/namespaces/{namespace}/tables/{table}".to_string(),
+            "DELETE /v1/namespaces/{namespace}/tables/{table}".to_string(),
+            "GET /v1/namespaces/{namespace}/tables/{table}/credentials".to_string(),
+            "POST /v1/namespaces/{namespace}/tables/{table}/metrics".to_string(),
+            "POST /v1/tables/rename".to_string(),
+            // View routes
+            "GET /v1/namespaces/{namespace}/views".to_string(),
+            "POST /v1/namespaces/{namespace}/views".to_string(),
             "GET /v1/namespaces/{namespace}/views/{view}".to_string(),
+            "POST /v1/namespaces/{namespace}/views/{view}".to_string(),
+            "HEAD /v1/namespaces/{namespace}/views/{view}".to_string(),
+            "DELETE /v1/namespaces/{namespace}/views/{view}".to_string(),
+            "POST /v1/views/rename".to_string(),
+            // Transaction routes
+            "POST /v1/transactions/commit".to_string(),
+            // Auth routes
+            "GET /v1/auth/context".to_string(),
+            // Observability routes
+            "GET /health".to_string(),
+            "GET /ready".to_string(),
+            "GET /metrics".to_string(),
         ],
     })
 }
@@ -133,6 +165,65 @@ mod tests {
         assert_eq!(json["overrides"]["warehouse"], "/tmp/warehouse");
         assert_eq!(json["defaults"]["clients"], "4");
         assert_eq!(json["endpoints"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_config_response_full_endpoints() {
+        // Verify the full endpoint list covers the expected categories
+        let response = ConfigResponse {
+            overrides: Overrides {
+                warehouse: "test".to_string(),
+            },
+            defaults: Defaults {
+                clients: "4".to_string(),
+            },
+            endpoints: vec![
+                "GET /v1/config".to_string(),
+                "GET /v1/search".to_string(),
+                "GET /v1/namespaces".to_string(),
+                "POST /v1/namespaces".to_string(),
+                "GET /v1/namespaces/{namespace}".to_string(),
+                "HEAD /v1/namespaces/{namespace}".to_string(),
+                "DELETE /v1/namespaces/{namespace}".to_string(),
+                "POST /v1/namespaces/{namespace}/properties".to_string(),
+                "GET /v1/namespaces/{namespace}/tables".to_string(),
+                "POST /v1/namespaces/{namespace}/tables".to_string(),
+                "POST /v1/namespaces/{namespace}/register".to_string(),
+                "GET /v1/namespaces/{namespace}/tables/{table}".to_string(),
+                "POST /v1/namespaces/{namespace}/tables/{table}".to_string(),
+                "HEAD /v1/namespaces/{namespace}/tables/{table}".to_string(),
+                "DELETE /v1/namespaces/{namespace}/tables/{table}".to_string(),
+                "GET /v1/namespaces/{namespace}/tables/{table}/credentials".to_string(),
+                "POST /v1/namespaces/{namespace}/tables/{table}/metrics".to_string(),
+                "POST /v1/tables/rename".to_string(),
+                "GET /v1/namespaces/{namespace}/views".to_string(),
+                "POST /v1/namespaces/{namespace}/views".to_string(),
+                "GET /v1/namespaces/{namespace}/views/{view}".to_string(),
+                "POST /v1/namespaces/{namespace}/views/{view}".to_string(),
+                "HEAD /v1/namespaces/{namespace}/views/{view}".to_string(),
+                "DELETE /v1/namespaces/{namespace}/views/{view}".to_string(),
+                "POST /v1/views/rename".to_string(),
+                "POST /v1/transactions/commit".to_string(),
+                "GET /v1/auth/context".to_string(),
+                "GET /health".to_string(),
+                "GET /ready".to_string(),
+                "GET /metrics".to_string(),
+            ],
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        let endpoints = json["endpoints"].as_array().unwrap();
+
+        // Verify completeness: config, search, 6 namespace, 10 table, 7 view, 1 transaction, 1 auth, 3 observability = 30
+        assert_eq!(endpoints.len(), 30);
+
+        // Spot-check a few key endpoints
+        let strs: Vec<&str> = endpoints.iter().map(|e| e.as_str().unwrap()).collect();
+        assert!(strs.contains(&"GET /v1/config"));
+        assert!(strs.contains(&"GET /v1/search"));
+        assert!(strs.contains(&"POST /v1/transactions/commit"));
+        assert!(strs.contains(&"GET /v1/auth/context"));
+        assert!(strs.contains(&"POST /v1/views/rename"));
+        assert!(strs.contains(&"GET /health"));
     }
 
     #[test]

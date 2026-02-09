@@ -43,6 +43,7 @@ Rustberg supports multiple authentication mechanisms:
 2. Key is hashed using **Argon2id** (PHC winner, OWASP recommended)
 3. Client includes key in `Authorization: Bearer <key>` header
 4. Server verifies using constant-time comparison
+5. **Optional verification caching** avoids Argon2id overhead on repeat requests
 
 ### Security Properties
 
@@ -52,6 +53,28 @@ Rustberg supports multiple authentication mechanisms:
 | **Timing** | Constant-time verification |
 | **Storage** | Prefix-indexed, PHC format hash |
 | **Leakage** | Dummy hash prevents user enumeration |
+| **Caching** | Optional SHA-256 keyed cache (5 min TTL) |
+
+### Performance
+
+API key verification with Argon2id takes ~50-100ms per request. For high-throughput workloads, use `CachedApiKeyAuthenticator`:
+
+```rust
+use rustberg::auth::{CachedApiKeyAuthenticator, ApiKeyCache};
+use std::sync::Arc;
+
+// Default: 10,000 capacity, 5 minute TTL
+let auth = CachedApiKeyAuthenticator::with_defaults(store.clone());
+
+// Custom configuration
+let config = ApiKeyCache {
+    max_capacity: 50_000,
+    ttl: std::time::Duration::from_secs(120), // 2 minutes
+};
+let auth = CachedApiKeyAuthenticator::new(store, config);
+
+// Cache hit: <1ms (vs 50-100ms for uncached)
+```
 
 ### Creating API Keys
 
@@ -135,6 +158,9 @@ jwks_url = "https://auth.example.com/.well-known/jwks.json"
 issuer = "https://auth.example.com"
 audience = "rustberg-catalog"
 ```
+
+{: .note }
+> **Key Rotation Safety:** When the JWKS cache expires and is refreshed, all previously cached decoding keys are purged. This ensures revoked or rotated signing keys are rejected within one cache TTL cycle (default: 1 hour).
 
 ### Token Requirements
 
