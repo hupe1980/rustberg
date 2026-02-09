@@ -338,8 +338,47 @@ pub struct DropTableQuery {
     /// 3. Delete all files in the table's location (data files, metadata files, manifests)
     ///
     /// Default is `false` (only remove from catalog, leave data intact).
-    #[serde(rename = "purgeRequested", default)]
+    #[serde(
+        rename = "purgeRequested",
+        default,
+        deserialize_with = "deserialize_bool_from_string"
+    )]
     pub purge_requested: bool,
+}
+
+/// Deserializes a boolean from either a native bool or a string like `"true"` / `"false"`.
+///
+/// Query parameters arrive as strings, so `?purgeRequested=true` sends the string `"true"`,
+/// not the boolean `true`. This deserializer handles both representations.
+fn deserialize_bool_from_string<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct BoolOrStringVisitor;
+
+    impl<'de> de::Visitor<'de> for BoolOrStringVisitor {
+        type Value = bool;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a boolean or a string \"true\"/\"false\"")
+        }
+
+        fn visit_bool<E: de::Error>(self, v: bool) -> std::result::Result<bool, E> {
+            Ok(v)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<bool, E> {
+            match v.to_lowercase().as_str() {
+                "true" | "1" | "yes" => Ok(true),
+                "false" | "0" | "no" | "" => Ok(false),
+                _ => Err(E::invalid_value(de::Unexpected::Str(v), &self)),
+            }
+        }
+    }
+
+    deserializer.deserialize_any(BoolOrStringVisitor)
 }
 
 // ============================================================================
@@ -1756,6 +1795,21 @@ mod tests {
         let json = r#"{"purgeRequested": true}"#;
         let query: DropTableQuery = serde_json::from_str(json).unwrap();
         assert!(query.purge_requested);
+    }
+
+    #[test]
+    fn test_drop_table_query_purge_string_true() {
+        // Query strings send "true" as a string, not a native bool
+        let json = r#"{"purgeRequested": "true"}"#;
+        let query: DropTableQuery = serde_json::from_str(json).unwrap();
+        assert!(query.purge_requested);
+    }
+
+    #[test]
+    fn test_drop_table_query_purge_string_false() {
+        let json = r#"{"purgeRequested": "false"}"#;
+        let query: DropTableQuery = serde_json::from_str(json).unwrap();
+        assert!(!query.purge_requested);
     }
 
     #[test]
