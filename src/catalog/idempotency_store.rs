@@ -23,12 +23,11 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 
-use crate::error::{AppError, Result};
+use crate::error::Result;
 
 // ============================================================================
 // IdempotencyStore Trait
@@ -196,7 +195,9 @@ impl IdempotencyStore for MemoryIdempotencyStore {
 #[cfg(feature = "slatedb-storage")]
 mod slatedb_impl {
     use super::*;
+    use crate::error::AppError;
     use slatedb::Db;
+    use std::sync::Arc;
 
     /// Persistent idempotency store backed by SlateDB.
     ///
@@ -485,6 +486,7 @@ mod slatedb_tests {
     use object_store::local::LocalFileSystem;
     use object_store::ObjectStore;
     use slatedb::Db;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     async fn create_test_store() -> (SlateDbIdempotencyStore, TempDir) {

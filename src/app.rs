@@ -732,6 +732,7 @@ impl AppBuilder {
 
     /// Creates a catalog when SlateDB feature is disabled.
     #[cfg(not(feature = "slatedb-storage"))]
+    #[allow(dead_code)]
     async fn create_catalog(
         backend_url: Option<&str>,
         warehouse_location: &str,

@@ -51,6 +51,7 @@ class RustbergServer:
         self.process = subprocess.Popen(
             [
                 self.binary_path,
+                "--dev",
                 "--insecure-http",
                 "--no-auth",
                 "--host", "127.0.0.1",

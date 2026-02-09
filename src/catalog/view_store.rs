@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use iceberg::spec::ViewMetadata;
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, Result};
 
@@ -228,6 +227,7 @@ impl ViewStore for MemoryViewStore {
 #[cfg(feature = "slatedb-storage")]
 mod slatedb_impl {
     use super::*;
+    use serde::{Deserialize, Serialize};
     use slatedb::Db;
     use std::sync::Arc;
 
