@@ -1,6 +1,6 @@
 [package]
 name = "rustberg"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 authors = ["hupe1980"]
 description = "A production-grade, cross-platform, single-binary Apache Iceberg REST Catalog"
