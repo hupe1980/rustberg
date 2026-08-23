@@ -11,7 +11,7 @@
 # -----------------------------------------------------------------------------
 # Stage 1: Build (supports both amd64 and arm64)
 # -----------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM rust:1.89-bookworm AS builder
+FROM --platform=$BUILDPLATFORM rust:1.94-bookworm AS builder
 
 # Build arguments for cross-compilation
 ARG TARGETPLATFORM

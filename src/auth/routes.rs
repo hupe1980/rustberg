@@ -1,128 +1,67 @@
-//! Auth routes for introspection endpoints.
+//! Identity introspection: `GET /auth/context`.
 //!
-//! This module provides endpoints for clients to introspect their authentication
-//! and authorization context, enabling RBAC-aware UIs and CLI tools.
+//! One endpoint, answering one question: *who does this server think I am?* It
+//! reports the principal the authenticator established — id, tenant, roles, auth
+//! method, expiry — and nothing else.
+//!
+//! # Why it does not report capabilities
+//!
+//! Authorization is per-resource and may depend on request context, so there is
+//! no honest server-wide answer to "can this principal create tables". A summary
+//! that is right for one table is wrong for the next.
+//!
+//! Reporting a guess would be worse than reporting nothing: an operator reaches
+//! for introspection precisely when verifying that policy works. A client that
+//! needs to know about a specific table asks about that table.
 
-use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
+use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
 
 use super::middleware::AuthenticatedPrincipal;
 use super::principal::{AuthMethod, PrincipalType};
-use super::{Action, Authorizer, Resource};
 use crate::app::AppState;
 
-// ============================================================================
-// Auth Context Response Types
-// ============================================================================
-
-/// Response for `/auth/context` endpoint.
-///
-/// Provides the authenticated principal's identity and capabilities,
-/// enabling clients to adapt their behavior based on permissions.
+/// Response for `GET /auth/context`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthContextResponse {
-    /// The authenticated principal's information.
+    /// The authenticated principal's identity.
     pub principal: PrincipalInfo,
-    /// Capabilities the principal has in the current context.
-    pub capabilities: Capabilities,
-    /// Server-side feature flags that may affect available actions.
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub features: HashMap<String, bool>,
 }
 
-/// Information about the authenticated principal.
+/// The identity the authenticator established for this request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrincipalInfo {
-    /// Unique identifier for the principal.
+    /// Stable identifier for the principal.
     pub id: String,
     /// Human-readable display name.
     pub name: String,
-    /// Type of principal (user, service, api_key, etc.).
+    /// Kind of principal: `user`, `service`, `api_key`, `system`, `anonymous`.
     pub principal_type: String,
-    /// Tenant ID for multi-tenancy isolation.
+    /// Tenant this principal belongs to.
     pub tenant_id: String,
-    /// Roles assigned to this principal.
+    /// Roles carried by the credential. These become Cedar groups.
     pub roles: Vec<String>,
-    /// Authentication method used (api_key, jwt, etc.).
+    /// How the principal authenticated: `api_key`, `jwt`, `host`, `internal`
+    /// or `none`.
     pub auth_method: String,
-    /// When the authentication expires (ISO 8601), if applicable.
+    /// When the credential expires, RFC 3339, if it expires at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
 }
 
-/// Capabilities the principal has for various resource types.
+/// `GET /auth/context` — reports the caller's own identity.
 ///
-/// This allows clients (CLI, SDK, future UI) to know what actions
-/// are permitted without making trial requests.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Capabilities {
-    /// Actions allowed on the catalog itself.
-    pub catalog: ActionSet,
-    /// Actions allowed on namespaces.
-    pub namespaces: ActionSet,
-    /// Actions allowed on tables.
-    pub tables: ActionSet,
-    /// Whether the principal has admin privileges.
-    pub is_admin: bool,
-}
-
-/// Set of allowed actions for a resource type.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ActionSet {
-    pub list: bool,
-    pub read: bool,
-    pub create: bool,
-    pub update: bool,
-    pub delete: bool,
-    pub manage: bool,
-}
-
-impl ActionSet {
-    /// Creates an ActionSet with all permissions granted.
-    pub fn all() -> Self {
-        Self {
-            list: true,
-            read: true,
-            create: true,
-            update: true,
-            delete: true,
-            manage: true,
-        }
-    }
-
-    /// Creates an ActionSet with read-only permissions.
-    pub fn read_only() -> Self {
-        Self {
-            list: true,
-            read: true,
-            ..Default::default()
-        }
-    }
-}
-
-// ============================================================================
-// Route Handlers
-// ============================================================================
-
-/// Handler for `GET /auth/context`.
+/// Useful for confirming that a token or key is accepted, that it maps to the
+/// tenant expected, and that it carries the roles the policies name. That last
+/// one is the common misconfiguration: a policy naming
+/// `Rustberg::Group::"analysts"` matches nothing if the credential's roles say
+/// `analyst`.
 ///
-/// Returns the authenticated principal's identity and capabilities.
-/// This endpoint is useful for:
-/// - CLI tools to understand what operations are available
-/// - SDKs to adapt their behavior based on permissions
-/// - Future UIs to show/hide features based on RBAC
-///
-/// # Security
-///
-/// This endpoint requires authentication. It only reveals information
-/// about the authenticated principal, not about other users or the system.
+/// Requires authentication, and reveals nothing about any other principal.
 pub async fn get_auth_context(
-    State(app_state): State<AppState>,
+    State(_state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
 ) -> Result<Json<AuthContextResponse>, (StatusCode, &'static str)> {
-    // Convert principal type to string
     let principal_type = match principal.principal_type() {
         PrincipalType::User => "user",
         PrincipalType::Service => "service",
@@ -131,245 +70,155 @@ pub async fn get_auth_context(
         PrincipalType::Anonymous => "anonymous",
     };
 
-    // Convert auth method to string
     let auth_method = match principal.auth_method() {
         AuthMethod::ApiKey => "api_key",
         AuthMethod::Bearer => "jwt",
-        AuthMethod::MutualTls => "mtls",
-        AuthMethod::Basic => "basic",
         AuthMethod::Internal => "internal",
+        AuthMethod::External => "host",
         AuthMethod::None => "none",
     };
 
-    // Format expiration time
-    let expires_at = principal.expires_at().map(|dt| dt.to_rfc3339());
-
-    // Build principal info
-    let principal_info = PrincipalInfo {
-        id: principal.id().to_string(),
-        name: principal.name().to_string(),
-        principal_type: principal_type.to_string(),
-        tenant_id: principal.tenant_id().to_string(),
-        roles: principal.roles().iter().cloned().collect(),
-        auth_method: auth_method.to_string(),
-        expires_at,
-    };
-
-    // Evaluate capabilities for each resource type
-    let capabilities = evaluate_capabilities(&principal, &app_state).await;
-
-    // Build feature flags (currently empty, but extensible)
-    let features = HashMap::new();
+    // Sorted so the response is stable across requests: `roles` is a HashSet, and
+    // an order that changes between calls makes the output awkward to diff and
+    // impossible to assert on.
+    let mut roles: Vec<String> = principal.roles().iter().cloned().collect();
+    roles.sort_unstable();
 
     Ok(Json(AuthContextResponse {
-        principal: principal_info,
-        capabilities,
-        features,
+        principal: PrincipalInfo {
+            id: principal.id().to_string(),
+            name: principal.name().to_string(),
+            principal_type: principal_type.to_string(),
+            tenant_id: principal.tenant_id().to_string(),
+            roles,
+            auth_method: auth_method.to_string(),
+            expires_at: principal.expires_at().map(|dt| dt.to_rfc3339()),
+        },
     }))
 }
 
-/// Evaluates the principal's capabilities across resource types.
-///
-/// This queries the authorizer to determine what actions are allowed
-/// for catalog, namespace, and table resources.
-async fn evaluate_capabilities(principal: &super::Principal, app_state: &AppState) -> Capabilities {
-    let tenant_id = principal.tenant_id();
-
-    // Check if principal has admin/system role
-    let is_admin = principal.is_system()
-        || principal.has_role("admin")
-        || principal.has_role("system")
-        || principal.has_role("catalog-admin");
-
-    // For admin users, grant all capabilities
-    if is_admin {
-        return Capabilities {
-            catalog: ActionSet::all(),
-            namespaces: ActionSet::all(),
-            tables: ActionSet::all(),
-            is_admin: true,
-        };
-    }
-
-    // Evaluate catalog capabilities
-    let catalog = evaluate_resource_capabilities(
-        principal,
-        &app_state.authorizer,
-        Resource::catalog(tenant_id),
-    )
-    .await;
-
-    // Evaluate namespace capabilities (using a dummy namespace for capability check)
-    let namespaces = evaluate_resource_capabilities(
-        principal,
-        &app_state.authorizer,
-        Resource::namespace(tenant_id, vec!["*"]),
-    )
-    .await;
-
-    // Evaluate table capabilities (using a dummy table for capability check)
-    let tables = evaluate_resource_capabilities(
-        principal,
-        &app_state.authorizer,
-        Resource::table(tenant_id, vec!["*"], "*"),
-    )
-    .await;
-
-    Capabilities {
-        catalog,
-        namespaces,
-        tables,
-        is_admin: false,
-    }
-}
-
-/// Evaluates capabilities for a specific resource type.
-async fn evaluate_resource_capabilities(
-    principal: &super::Principal,
-    authorizer: &Arc<dyn Authorizer>,
-    resource: Resource,
-) -> ActionSet {
-    use super::AuthzContext;
-
-    let mut action_set = ActionSet::default();
-
-    // Check List action
-    let ctx = AuthzContext::new(principal.clone(), resource.clone(), Action::List);
-    if authorizer.authorize(&ctx).await.is_allowed() {
-        action_set.list = true;
-    }
-
-    // Check Read action
-    let ctx = AuthzContext::new(principal.clone(), resource.clone(), Action::Read);
-    if authorizer.authorize(&ctx).await.is_allowed() {
-        action_set.read = true;
-    }
-
-    // Check Create action
-    let ctx = AuthzContext::new(principal.clone(), resource.clone(), Action::Create);
-    if authorizer.authorize(&ctx).await.is_allowed() {
-        action_set.create = true;
-    }
-
-    // Check Update action
-    let ctx = AuthzContext::new(principal.clone(), resource.clone(), Action::Update);
-    if authorizer.authorize(&ctx).await.is_allowed() {
-        action_set.update = true;
-    }
-
-    // Check Delete action
-    let ctx = AuthzContext::new(principal.clone(), resource.clone(), Action::Delete);
-    if authorizer.authorize(&ctx).await.is_allowed() {
-        action_set.delete = true;
-    }
-
-    // Check Manage action
-    let ctx = AuthzContext::new(principal.clone(), resource.clone(), Action::Manage);
-    if authorizer.authorize(&ctx).await.is_allowed() {
-        action_set.manage = true;
-    }
-
-    action_set
-}
-
-// ============================================================================
-// Route Configuration
-// ============================================================================
-
-/// Creates the auth routes.
-///
-/// # Endpoints
-///
-/// - `GET /auth/context` - Returns the authenticated principal's context and capabilities
+/// Creates the identity introspection route.
 pub fn create_routes(app_state: AppState) -> Router {
     Router::new()
         .route("/auth/context", get(get_auth_context))
         .with_state(app_state)
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
+/// `POST /v1/oauth/tokens` — deliberately not a token endpoint.
+///
+/// The Iceberg REST spec marks `oauth/tokens` **deprecated for removal** and says
+/// plainly: *"It is not recommended to implement this endpoint, unless you are
+/// fully aware of the potential security implications."* It is scheduled to leave
+/// the spec entirely in Iceberg 2.0.
+///
+/// Rustberg does not issue tokens. Doing so would make it an authorization
+/// server — minting the credentials it also validates — when the whole design
+/// puts token lifetime and revocation with the identity provider that owns them.
+///
+/// The route exists because *not* having it is worse. A client configured with
+/// `credential=` performs an OAuth2 client-credentials exchange here before any
+/// catalog call, and an unrouted path answers `401 Authentication required`,
+/// which sends the reader hunting for a bad key. This answers the question that
+/// was actually asked.
+async fn oauth_tokens_unsupported() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": {
+                "message": "This catalog does not issue tokens. The Iceberg REST \
+                            `oauth/tokens` endpoint is deprecated for removal and is \
+                            deliberately not implemented. If you are using an API key, pass \
+                            it as the client's `token` property, not `credential`. If you \
+                            are using OIDC, point `oauth2-server-uri` at your identity \
+                            provider's token endpoint.",
+                "type": "UnsupportedOperationException",
+                "code": 501
+            }
+        })),
+    )
+}
+
+/// Routes that must answer without a credential.
+///
+/// A client calling the token endpoint has no token yet, so requiring one would
+/// replace the explanation with the `401` it is trying to understand.
+pub fn create_public_routes() -> Router {
+    Router::new().route(
+        "/v1/oauth/tokens",
+        axum::routing::post(oauth_tokens_unsupported),
+    )
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::principal::PrincipalBuilder;
 
-    #[test]
-    fn test_action_set_all() {
-        let actions = ActionSet::all();
-        assert!(actions.list);
-        assert!(actions.read);
-        assert!(actions.create);
-        assert!(actions.update);
-        assert!(actions.delete);
-        assert!(actions.manage);
+    fn principal() -> crate::auth::Principal {
+        PrincipalBuilder::new(
+            "svc-etl",
+            "ETL service",
+            PrincipalType::Service,
+            "acme",
+            AuthMethod::ApiKey,
+        )
+        .with_role("writer")
+        .with_role("reader")
+        .build()
     }
 
     #[test]
-    fn test_action_set_read_only() {
-        let actions = ActionSet::read_only();
-        assert!(actions.list);
-        assert!(actions.read);
-        assert!(!actions.create);
-        assert!(!actions.update);
-        assert!(!actions.delete);
-        assert!(!actions.manage);
+    fn roles_are_reported_in_a_stable_order() {
+        let p = principal();
+        let mut roles: Vec<String> = p.roles().iter().cloned().collect();
+        roles.sort_unstable();
+        assert_eq!(roles, vec!["reader".to_string(), "writer".to_string()]);
     }
 
     #[test]
-    fn test_action_set_default() {
-        let actions = ActionSet::default();
-        assert!(!actions.list);
-        assert!(!actions.read);
-        assert!(!actions.create);
-        assert!(!actions.update);
-        assert!(!actions.delete);
-        assert!(!actions.manage);
-    }
-
-    #[test]
-    fn test_principal_info_serialization() {
-        let info = PrincipalInfo {
-            id: "user123".to_string(),
-            name: "Test User".to_string(),
-            principal_type: "user".to_string(),
-            tenant_id: "tenant1".to_string(),
-            roles: vec!["reader".to_string(), "writer".to_string()],
-            auth_method: "api_key".to_string(),
-            expires_at: None,
-        };
-
-        let json = serde_json::to_string(&info).unwrap();
-        assert!(json.contains("user123"));
-        assert!(json.contains("Test User"));
-        assert!(json.contains("reader"));
-    }
-
-    #[test]
-    fn test_auth_context_response_serialization() {
-        let response = AuthContextResponse {
+    fn response_carries_identity_only() {
+        let json = serde_json::to_value(AuthContextResponse {
             principal: PrincipalInfo {
-                id: "user123".to_string(),
-                name: "Test User".to_string(),
-                principal_type: "user".to_string(),
-                tenant_id: "tenant1".to_string(),
-                roles: vec!["admin".to_string()],
-                auth_method: "jwt".to_string(),
-                expires_at: Some("2026-01-25T12:00:00Z".to_string()),
+                id: "svc-etl".into(),
+                name: "ETL service".into(),
+                principal_type: "service".into(),
+                tenant_id: "acme".into(),
+                roles: vec!["writer".into()],
+                auth_method: "api_key".into(),
+                expires_at: None,
             },
-            capabilities: Capabilities {
-                catalog: ActionSet::all(),
-                namespaces: ActionSet::all(),
-                tables: ActionSet::all(),
-                is_admin: true,
-            },
-            features: HashMap::new(),
-        };
+        })
+        .unwrap();
 
-        let json = serde_json::to_string_pretty(&response).unwrap();
-        assert!(json.contains("user123"));
-        assert!(json.contains("is_admin"));
-        assert!(json.contains("expires_at"));
+        assert_eq!(json["principal"]["id"], "svc-etl");
+        assert_eq!(json["principal"]["tenant_id"], "acme");
+
+        // The fabricated capability summary must not come back. It reported a
+        // hardcoded role check as if it were a policy decision.
+        assert!(
+            json.get("capabilities").is_none(),
+            "capabilities must not be reported: the value cannot be computed honestly"
+        );
+        assert!(!json.to_string().contains("is_admin"));
+    }
+
+    /// An absent expiry is omitted rather than sent as null, so a client can tell
+    /// "never expires" from "expiry unknown".
+    #[test]
+    fn absent_expiry_is_omitted() {
+        let json = serde_json::to_value(AuthContextResponse {
+            principal: PrincipalInfo {
+                id: "a".into(),
+                name: "a".into(),
+                principal_type: "user".into(),
+                tenant_id: "t".into(),
+                roles: vec![],
+                auth_method: "jwt".into(),
+                expires_at: None,
+            },
+        })
+        .unwrap();
+
+        assert!(json["principal"].get("expires_at").is_none());
     }
 }

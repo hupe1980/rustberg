@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+
+{# The documentation chrome: sidebar, search, breadcrumb, and the shell around
+   the page body. Both the section index and every page extend this, so there is
+   one navigation implementation rather than two that drift.
+
+   `current` is the path of whatever is being rendered — a page or the section
+   itself — and is what marks the sidebar entry. #}
+
+{% block body_class %}page-docs{% endblock body_class %}
+
+{% block content %}
+{%- set docs = get_section(path="docs/_index.md") -%}
+{%- if page -%}{%- set current = page.path -%}{%- else -%}{%- set current = section.path -%}{%- endif -%}
+<div class="docs">
+
+  <input type="checkbox" id="sidebar-toggle" class="sidebar-toggle-input" hidden>
+  <label for="sidebar-toggle" class="sidebar-toggle" tabindex="0" role="button" aria-label="Show documentation navigation">
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+      <path d="M4 7h16M4 12h16M4 17h16"/>
+    </svg>
+    <span>Contents</span>
+  </label>
+
+  <aside class="sidebar">
+    <div class="sidebar__inner">
+      <form class="search" role="search" onsubmit="return false;">
+        <label class="visually-hidden" for="search-input">Search the documentation</label>
+        <input type="search" id="search-input" placeholder="Search docs…  /" autocomplete="off" spellcheck="false">
+        <div id="search-results" class="search__results" hidden></div>
+      </form>
+
+      {#- The order is editorial, from `config.extra.nav`, rather than a flat
+          list of sixteen entries nobody reads to the end of. Each group's
+          entries are resolved by slug against the real pages, so a stale slug
+          is skipped rather than rendering a dead link. -#}
+      <nav class="sidebar__nav" aria-label="Documentation">
+        <a class="sidebar__overview{% if current == '/docs/' %} is-current{% endif %}" href="{{ get_url(path='@/docs/_index.md') }}">Overview</a>
+        {%- for group in config.extra.nav %}
+        <p class="sidebar__group">{{ group.title }}</p>
+        <ul class="sidebar__list">
+          {%- for slug in group.pages %}
+            {%- for p in docs.pages %}
+              {%- if p.slug == slug %}
+          <li><a href="{{ p.permalink }}"{% if current == p.path %} class="is-current" aria-current="page"{% endif %}>{{ p.title }}</a></li>
+              {%- endif %}
+            {%- endfor %}
+          {%- endfor %}
+        </ul>
+        {%- endfor %}
+      </nav>
+    </div>
+  </aside>
+
+  <main id="content" class="doc{% block doc_class %}{% endblock doc_class %}">
+    {% block doc_main %}{% endblock doc_main %}
+  </main>
+
+  {% block doc_aside %}{% endblock doc_aside %}
+
+</div>
+{% endblock content %}
+
+{% block scripts %}
+<script src="{{ get_url(path='elasticlunr.min.js', trailing_slash=false) }}" defer></script>
+<script src="{{ get_url(path='search_index.en.js', trailing_slash=false) }}" defer></script>
+<script src="{{ get_url(path='search.js', trailing_slash=false) }}" defer></script>
+{# Loads Mermaid lazily, and only when the page actually has a diagram. #}
+<script src="{{ get_url(path='mermaid.js', trailing_slash=false) }}" defer></script>
+{% endblock scripts %}

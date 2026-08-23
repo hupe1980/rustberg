@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+
+{# A 404 must not be indexed, or search engines accumulate one soft-404 per bad
+   link and treat the whole path as low quality. #}
+{% block robots %}<meta name="robots" content="noindex, follow">{% endblock robots %}
+
+{% block content %}
+<main id="content" class="notfound">
+  <div class="wrap notfound__inner">
+    <p class="notfound__code">404</p>
+    <h1>That page is not here</h1>
+    <p class="notfound__lede">
+      The link may be from an older version of this site — the documentation moved
+      from a flat set of pages to grouped sections. Everything below still exists.
+    </p>
+
+    <div class="hero__actions">
+      <a class="btn btn--primary" href="{{ get_url(path='@/docs/_index.md') }}">Browse the documentation</a>
+      <a class="btn" href="{{ get_url(path='@/_index.md') }}">Home</a>
+    </div>
+
+    {%- set docs = get_section(path="docs/_index.md") %}
+    <div class="cards notfound__cards">
+      {%- for p in docs.pages %}
+      <a class="card" href="{{ p.permalink }}">
+        <h3>{{ p.title }}</h3>
+        <p>{{ p.description }}</p>
+      </a>
+      {%- endfor %}
+    </div>
+  </div>
+</main>
+{% endblock content %}

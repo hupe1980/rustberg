@@ -1,3 +1,4 @@
+{{- include "rustberg.validateCatalog" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,6 +9,15 @@ spec:
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
+  strategy:
+    {{- if eq .Values.rustberg.catalog.backend "redb" }}
+    # Forced. redb holds an exclusive lock on the catalog file, so a rolling
+    # update's new pod cannot start until the old one has exited. Recreate makes
+    # that ordering explicit instead of stalling the rollout.
+    type: Recreate
+    {{- else }}
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+    {{- end }}
   selector:
     matchLabels:
       {{- include "rustberg.selectorLabels" . | nindent 6 }}
@@ -42,7 +52,11 @@ spec:
             - "{{ .Values.rustberg.server.host }}"
             - "--port"
             - "{{ .Values.rustberg.server.port }}"
-            - "--storage"
+            {{- if eq .Values.rustberg.catalog.backend "redb" }}
+            - "--catalog-url"
+            - "file://{{ .Values.rustberg.catalog.path }}"
+            {{- end }}
+            - "--warehouse"
             - "{{ include "rustberg.warehouseLocation" . }}"
             {{- if .Values.rustberg.config }}
             - "--config"
@@ -58,30 +72,17 @@ spec:
           env:
             - name: RUST_LOG
               value: "info"
+            {{- if eq .Values.rustberg.catalog.backend "postgres" }}
+            # Read from a Secret rather than passed as an argument: process
+            # arguments are visible to anything that can list processes, and the
+            # DSN carries the database password.
+            - name: RUSTBERG_CATALOG_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rustberg.postgresSecretName" . }}
+                  key: {{ include "rustberg.postgresSecretKey" . }}
+            {{- end }}
             {{- include "rustberg.storageEnv" . | nindent 12 }}
-            {{- if .Values.rustberg.encryption.enabled }}
-            {{- if eq .Values.rustberg.encryption.kmsProvider "env" }}
-            - name: RUSTBERG_ENCRYPTION_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "rustberg.fullname" . }}-encryption
-                  key: encryption-key
-            {{- end }}
-            {{- if eq .Values.rustberg.encryption.kmsProvider "vault" }}
-            - name: VAULT_ADDR
-              value: {{ .Values.rustberg.encryption.vault.address | quote }}
-            {{- if .Values.rustberg.encryption.vault.existingSecret }}
-            - name: VAULT_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.rustberg.encryption.vault.existingSecret }}
-                  key: {{ .Values.rustberg.encryption.vault.existingSecretTokenKey }}
-            {{- else }}
-            - name: VAULT_TOKEN
-              value: {{ .Values.rustberg.encryption.vault.token | quote }}
-            {{- end }}
-            {{- end }}
-            {{- end }}
             {{- with .Values.rustberg.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

@@ -6,66 +6,141 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::Json as AxumJson,
 };
 use iceberg::spec::{
-    NestedFieldRef, NullOrder, Schema as IcebergSchema, SortDirection, SortField, SortOrder,
-    TableMetadata, Transform, UnboundPartitionSpec,
+    FormatVersion, NestedFieldRef, NullOrder, Schema as IcebergSchema, SortDirection, SortField,
+    SortOrder, TableMetadata, Transform, UnboundPartitionSpec,
 };
 use iceberg::{NamespaceIdent, TableCreation, TableIdent, TableRequirement, TableUpdate};
 use serde::{Deserialize, Serialize};
 
+use super::delegation::AccessDelegation;
+use super::extract::{Json, NamespacePath, TablePath};
+use super::freshness;
+use super::guard::{self, Authorized, Target};
+use super::idempotency::{CachedResponse, IDEMPOTENCY_KEY_USED_HEADER, IdempotencyKey};
+use super::pagination::{PaginationQuery, collect_page};
+use super::snapshots::{self, SnapshotScope, SnapshotsQuery};
+use super::validation::{validate_namespace, validate_properties, validate_table_name};
 use crate::app::AppState;
-use crate::auth::{Action, AuthenticatedPrincipal, AuthzContext, Principal, Resource};
-use crate::catalog::extract::NamespacePath;
-use crate::catalog::idempotency::{CachedResponse, IdempotencyKey, IDEMPOTENCY_KEY_USED_HEADER};
-use crate::catalog::validation::{validate_namespace, validate_properties, validate_table_name};
+use crate::auth::{Action, AuthenticatedPrincipal, Obligations, Principal, RequestFacts};
 use crate::credentials::{StorageCredential, StorageCredentialRequest};
 use crate::error::{AppError, Result};
 
-/// Reserved property key for storing namespace owner's tenant ID.
-const TENANT_ID_PROPERTY: &str = "_tenant_id";
-
-/// Helper to get the owner tenant for a namespace, returning an error if namespace doesn't exist.
-async fn get_namespace_owner(
-    state: &AppState,
-    namespace: &NamespaceIdent,
-    default_tenant: &str,
-) -> Result<String> {
-    match state.catalog.get_namespace(namespace).await {
-        Ok(ns) => Ok(ns
-            .properties()
-            .get(TENANT_ID_PROPERTY)
-            .cloned()
-            .unwrap_or_else(|| default_tenant.to_string())),
-        Err(_) => Err(AppError::NoSuchNamespace(format!(
-            "Namespace {} does not exist",
-            namespace
-        ))),
-    }
+/// Outcome of deciding what storage access to hand a client.
+///
+/// Distinguishing "nothing was asked for" from "we refuse" matters: the first is
+/// the ordinary case for an engine carrying its own credentials, and the second
+/// is a policy decision the client needs to be able to see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Delegated {
+    /// Credentials the client may use.
+    Granted(Vec<StorageCredential>),
+    /// Nothing vended, and that is unremarkable: not requested, no provider
+    /// configured, or a location this provider does not serve.
+    None,
+    /// Vending was refused because policy attached obligations to this table.
+    Withheld(String),
+    /// The client asked for a credential, policy permitted one, and the exchange
+    /// itself failed — an STS call that timed out, an Entra token refused, a
+    /// misconfigured role.
+    ///
+    /// Distinct from [`Delegated::None`], and the distinction matters: this is
+    /// a *transient failure of a capability the server has*, not the absence of
+    /// one. Collapsing it into `None` made `loadTable` answer `200` with no
+    /// credentials and nothing saying why — metadata the caller had no way to
+    /// read — and made the credentials endpoint answer `501 not supported`
+    /// about a mechanism that is supported and merely broken. Both send an
+    /// operator to the wrong place, and neither is retryable by a client that
+    /// cannot tell it should retry.
+    Failed(String),
 }
 
-/// Helper to vend storage credentials for a table.
+/// The table a credential is being requested for, and at what access level.
 ///
-/// Returns `Some(credentials)` if credentials were successfully vended,
-/// or `None` if the provider doesn't support the location or credential vending is disabled.
+/// Grouped rather than passed as five positional arguments, where a `&str` table
+/// name and a `&str` location are easy to transpose at a call site and impossible
+/// to catch by type.
+#[derive(Debug, Clone, Copy)]
+struct CredentialTarget<'a> {
+    /// Namespace holding the table.
+    namespace: &'a [String],
+    /// Table name.
+    table_name: &'a str,
+    /// The table's storage location, which becomes the credential's prefix.
+    location: &'a str,
+    /// Whether the credential should permit writes. See [`wants_write_access`].
+    write_access: bool,
+}
+
+/// Vends storage credentials for a table, subject to policy.
+///
+/// # Obligations make a table undelegatable
+///
+/// If the policies that permitted this request carry a `@row_filter` or
+/// `@column_mask`, **no credential is vended**. A credential is prefix-shaped: the
+/// tightest it can express is the table's location. Handing that to an engine
+/// lets it read every row and every column in every file under that prefix, so a
+/// vended credential and a row filter are contradictory — whichever the policy
+/// says, the engine reads everything.
+///
+/// Enforcing the filter itself would need server-side scan planning paired with
+/// remote signing, so that the engine never holds a credential and every fetch is
+/// checked against the plan. Rustberg implements neither. Between vending a broad
+/// credential while claiming the filter is enforced, and declining to vend, only
+/// the second is honest — so that is what happens, and the response says so.
 async fn vend_table_credentials(
     state: &AppState,
     principal: &Principal,
-    namespace: &[String],
-    table_name: &str,
-    table_location: &str,
-    write_access: bool,
-) -> Option<Vec<StorageCredential>> {
-    // Check if the credential provider supports this storage location
+    target: CredentialTarget<'_>,
+    delegation: AccessDelegation,
+    obligations: &Obligations,
+) -> Delegated {
+    let CredentialTarget {
+        namespace,
+        table_name,
+        location: table_location,
+        write_access,
+    } = target;
+
+    // Delegation is something a client asks for. A client running with its own
+    // storage credentials does not want the catalog minting more, and vending
+    // unrequested widens the authority in every response we send.
+    if !delegation.vended_credentials {
+        tracing::debug!(
+            table = %table_name,
+            "Client did not request vended credentials; none returned"
+        );
+        return Delegated::None;
+    }
+
+    // Checked before consulting the provider: a table under row or column policy
+    // is never broadly credentialed, whatever the provider would have returned.
+    if !obligations.is_empty() {
+        let reason = format!(
+            "Policy attaches restrictions to this table ({}), and a storage \
+             credential cannot express them. Credentials are withheld rather than \
+             granting access wider than policy allows.",
+            obligations.describe()
+        );
+        tracing::info!(
+            tenant_id = principal.tenant_id(),
+            table = %table_name,
+            restrictions = %obligations.describe(),
+            "Withholding storage credentials: table is under row or column policy"
+        );
+        return Delegated::Withheld(reason);
+    }
+
     if !state.credential_provider.supports_location(table_location) {
         tracing::debug!(
             location = table_location,
             "Storage credential provider does not support location"
         );
-        return None;
+        return Delegated::None;
     }
 
     let request = if write_access {
@@ -82,17 +157,19 @@ async fn vend_table_credentials(
             table_name,
             table_location,
         )
-    };
+    }
+    .for_principal(principal.id());
 
     match state.credential_provider.vend_credentials(&request).await {
         Ok(credentials) if !credentials.is_empty() => {
             tracing::debug!(
                 tenant_id = principal.tenant_id(),
                 table = %table_name,
+                write_access,
                 credentials_count = credentials.len(),
                 "Vended storage credentials"
             );
-            Some(credentials)
+            Delegated::Granted(credentials)
         }
         Ok(_) => {
             tracing::debug!(
@@ -100,7 +177,7 @@ async fn vend_table_credentials(
                 table = %table_name,
                 "No credentials vended (empty result)"
             );
-            None
+            Delegated::None
         }
         Err(e) => {
             tracing::warn!(
@@ -109,9 +186,123 @@ async fn vend_table_credentials(
                 error = %e,
                 "Failed to vend storage credentials"
             );
-            None
+            // The provider's own message is not forwarded: it names roles,
+            // endpoints and account identifiers, and this response goes to
+            // whoever made the request. It is logged above, where reading it
+            // needs access to the host.
+            Delegated::Failed(format!(
+                "Storage credentials were requested for '{table_name}' and could not be \
+                 obtained. This is a failure of the credential exchange, not a policy \
+                 decision — the server log names the cause. Retrying is reasonable."
+            ))
         }
     }
+}
+
+impl Delegated {
+    /// The credentials to put in a `LoadTableResponse`.
+    ///
+    /// `Withheld` and `None` both mean "no credentials in this response", and
+    /// that is the correct shape: the spec has no field for *why* a table came
+    /// back uncredentialed, the `/credentials` endpoint answers that question
+    /// with a status code, and a table the caller may read is still worth
+    /// loading without one.
+    ///
+    /// A **failed exchange** is different and does not belong in a `200`. The
+    /// client asked for a credential, the policy said yes, and the response
+    /// would carry metadata it cannot read while looking exactly like the
+    /// ordinary uncredentialed case. So it becomes the `503` it is.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::ServiceUnavailable`] when the credential exchange failed.
+    fn into_response_credentials(self) -> Result<Option<Vec<StorageCredential>>> {
+        match self {
+            Delegated::Granted(credentials) => Ok(Some(credentials)),
+            Delegated::None | Delegated::Withheld(_) => Ok(None),
+            Delegated::Failed(reason) => Err(AppError::ServiceUnavailable(reason)),
+        }
+    }
+}
+
+/// Takes the reserved `format-version` property out of a create request.
+///
+/// The spec carries the table format version in `properties`, and every client
+/// puts it there — Spark's `TBLPROPERTIES ('format-version'='2')`, PyIceberg's
+/// `properties={"format-version": "3"}`. It is *not* a property: it selects the
+/// metadata version and is not persisted, which is why the metadata builder
+/// refuses to store it. Passing it straight through made every such create fail
+/// with "table properties should not contain reserved properties", so a table
+/// could only ever be created at the default version.
+///
+/// The other reserved names are read-only metadata that surfaces as properties
+/// — `uuid`, `current-snapshot-id`, `snapshot-count` and the rest. A client
+/// setting one is asking for something that cannot be honoured, so it is
+/// refused here with a message naming the key rather than deeper with one that
+/// reads like an internal failure.
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] for an unparseable version, a version this build
+/// does not support, or any other reserved property.
+fn take_format_version(properties: &mut HashMap<String, String>) -> Result<FormatVersion> {
+    const FORMAT_VERSION: &str = "format-version";
+
+    let requested = properties.remove(FORMAT_VERSION);
+
+    if let Some(reserved) = properties
+        .keys()
+        .find(|key| RESERVED_TABLE_PROPERTIES.contains(&key.as_str()))
+    {
+        return Err(AppError::BadRequest(format!(
+            "'{reserved}' is table metadata, not a table property, and cannot be set by a \
+             client."
+        )));
+    }
+
+    let Some(requested) = requested else {
+        // What the Iceberg community writes new tables at. v3 is opt-in while
+        // engine support is uneven, and choosing it by default would produce
+        // tables some readers cannot open.
+        return Ok(FormatVersion::V2);
+    };
+
+    match requested.trim() {
+        "1" => Ok(FormatVersion::V1),
+        "2" => Ok(FormatVersion::V2),
+        "3" => Ok(FormatVersion::V3),
+        other => Err(AppError::BadRequest(format!(
+            "Unsupported format-version '{other}'. This catalog serves table format \
+             versions 1, 2 and 3."
+        ))),
+    }
+}
+
+/// Reserved names other than `format-version`: read-only metadata that the spec
+/// surfaces as properties.
+const RESERVED_TABLE_PROPERTIES: &[&str] = &[
+    "uuid",
+    "snapshot-count",
+    "current-snapshot-id",
+    "current-snapshot-summary",
+    "current-snapshot-timestamp-ms",
+    "current-schema",
+    "default-partition-spec",
+    "default-sort-order",
+];
+
+/// Decides whether a vended credential should carry write permission.
+///
+/// Write access follows the caller's own authorization: a principal permitted to
+/// `Update` the table is writing to it, and needs to put objects under its
+/// prefix. One permitted to `Read` only receives a credential with no
+/// `s3:PutObject`.
+///
+/// A hardcoded read-only credential would make vended-credential writes
+/// impossible: a writer would receive a credential unable to put the data files
+/// its own commit references.
+async fn wants_write_access(state: &AppState, authorized: &Authorized) -> bool {
+    authorized.also_permits(state, Action::Update).await
 }
 
 // ============================================================================
@@ -159,8 +350,12 @@ pub struct CreateTablePayload {
     pub partition_spec: Option<UnboundPartitionSpec>,
     /// Optional write ordering.
     pub write_order: Option<WriteOrder>,
-    /// Whether to stage the table (not yet committed).
-    /// When `true`, returns 400 — staged creates are not supported.
+    /// Whether to stage the table rather than create it.
+    ///
+    /// A staged table is written to storage but is absent from every listing and
+    /// does not resolve to a load. It becomes real through a later `commit_table`
+    /// carrying a `NotExist` requirement — which is how Spark performs
+    /// `CREATE TABLE AS SELECT`.
     pub stage_create: Option<bool>,
     /// Table properties.
     pub properties: Option<HashMap<String, String>>,
@@ -209,6 +404,13 @@ pub struct WriteOrderField {
 #[serde(rename_all = "kebab-case")]
 pub struct LoadTableResponse {
     /// Metadata file location.
+    ///
+    /// Absent when the metadata is not committed — which is exactly the staged
+    /// case. The spec is explicit that a create transaction returns metadata
+    /// that is staged but not committed, and naming a location there would
+    /// assert the catalog is serving that file as a table's current metadata
+    /// when it is not.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_location: Option<String>,
     /// Table metadata.
     pub metadata: TableMetadata,
@@ -218,6 +420,56 @@ pub struct LoadTableResponse {
     /// Clients should check this field before falling back to credentials in config.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_credentials: Option<Vec<StorageCredential>>,
+    /// Signer settings, when the client asked for remote signing and this
+    /// deployment offers it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_signing_config: Option<super::sign::RemoteSigningConfig>,
+}
+
+impl LoadTableResponse {
+    /// The same response with any vended credentials removed.
+    ///
+    /// Used for the idempotency cache: credentials are short-lived and scoped to
+    /// the request that minted them, so storing one for the cache's 24-hour
+    /// lifetime keeps a live secret around long after it was needed and replays
+    /// an expired one afterwards.
+    fn without_credentials(&self) -> Self {
+        Self {
+            metadata_location: self.metadata_location.clone(),
+            metadata: self.metadata.clone(),
+            config: self.config.clone(),
+            storage_credentials: None,
+            remote_signing_config: self.remote_signing_config.clone(),
+        }
+    }
+}
+
+/// The signer settings and `config` keys a `LoadTableResult` should carry.
+///
+/// Empty unless the client asked for `remote-signing` and this deployment
+/// offers it.
+fn signing_response(
+    state: &AppState,
+    delegation: AccessDelegation,
+    namespace: &NamespaceIdent,
+    table_name: &str,
+    obligations: &Obligations,
+) -> (
+    HashMap<String, String>,
+    Option<super::sign::RemoteSigningConfig>,
+) {
+    if !delegation.remote_signing || !state.signing.enabled || !obligations.is_empty() {
+        return (HashMap::new(), None);
+    }
+
+    let signing = super::sign::signing_config_for(namespace, table_name);
+    let config = HashMap::from([
+        ("s3.remote-signing-enabled".to_string(), "true".to_string()),
+        ("s3.signer".to_string(), "S3V4RestSigner".to_string()),
+        ("s3.signer.endpoint".to_string(), signing.endpoint.clone()),
+    ]);
+
+    (config, Some(signing))
 }
 
 /// Request for registering an existing table.
@@ -228,6 +480,52 @@ pub struct RegisterTablePayload {
     pub name: String,
     /// Location of the metadata file.
     pub metadata_location: String,
+}
+
+/// `POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/unregister`
+///
+/// Removes the catalog's pointer to a table, leaving its data and metadata files
+/// where they are. The table can be adopted again later — by this catalog or a
+/// different one — with `register`.
+///
+/// # Why this is not just `DELETE`
+///
+/// `DELETE …/tables/{table}` without `purgeRequested` does the same thing to the
+/// same state, so this endpoint could be read as a duplicate. It is not, and the
+/// difference is intent rather than mechanism: `DELETE` says *this table is
+/// finished*, and adding `?purgeRequested=true` to it destroys data. `unregister`
+/// says *this table is moving*, and has no way to spell "delete the files".
+///
+/// A migration script that means "hand this table to another catalog" should not
+/// be one query parameter away from erasing it.
+pub async fn unregister_table(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    RequestFacts(request): RequestFacts,
+    TablePath(table_ident): TablePath,
+) -> Result<StatusCode> {
+    let namespace = table_ident.namespace().clone();
+    let table_name = table_ident.name().to_string();
+
+    guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &namespace,
+        Target::Table(&table_name),
+        Action::Delete,
+    )
+    .await?;
+
+    state.metrics.catalog_delete_table.inc();
+    state.catalog.drop_table(&table_ident).await?;
+
+    tracing::info!(
+        table = %table_ident,
+        "Unregistered table (metadata and data left in place)"
+    );
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Request for reporting scan/commit metrics.
@@ -319,7 +617,7 @@ pub struct CommitTableResponse {
 /// Query parameters for listing tables.
 #[derive(Debug, Default, Deserialize)]
 pub struct ListTablesQuery {
-    /// Pagination: token for next page.
+    /// Pagination: token for the next page.
     #[serde(rename = "pageToken")]
     pub page_token: Option<String>,
     /// Pagination: maximum items per page.
@@ -385,54 +683,88 @@ where
 // Handlers
 // ============================================================================
 
-/// Lists all tables within a given namespace.
+/// Lists the tables in a namespace that the caller may see.
+///
+/// # Filtering, not denying
+///
+/// `List` on the namespace permits *asking*; each table is then checked
+/// individually and omitted if the caller cannot read it. A caller therefore
+/// never learns that a table it has no grant on exists, and the listing agrees
+/// with what a subsequent load would answer.
+///
+/// Filtering runs **before** the page is cut. Slicing first and filtering after
+/// would return short pages, and an entirely unpermitted page would come back
+/// empty while permitted tables remained further on — which many clients treat as
+/// the end of the list.
+///
+/// The cost is one Cedar evaluation per table *scanned* rather than per table
+/// returned, with no additional I/O: the namespace's owner is already known, so
+/// each decision is an in-memory evaluation.
 ///
 /// GET /v1/namespaces/{namespace}/tables
 pub async fn list_tables(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    RequestFacts(request): RequestFacts,
     namespace: NamespacePath,
     axum::extract::Query(query): axum::extract::Query<ListTablesQuery>,
 ) -> Result<AxumJson<ListTablesResponse>> {
-    use crate::catalog::pagination::PaginationQuery;
+    let authorized = guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &namespace,
+        Target::Namespace,
+        Action::List,
+    )
+    .await?;
 
-    // Get the namespace's owner tenant
-    let namespace_ident = NamespaceIdent::from_vec(namespace.clone().inner())?;
-    let owner_tenant = get_namespace_owner(&state, &namespace_ident, principal.tenant_id()).await?;
-
-    // Authorize the request against the actual owner
-    let resource = Resource::namespace(&owner_tenant, namespace.clone().inner());
-    let ctx = AuthzContext::new(principal, resource, Action::List);
-    state.authorizer.check(&ctx).await?;
-
-    // Record metric
     state.metrics.catalog_list_tables.inc();
 
-    let mut identifiers: Vec<TableIdentifier> = state
-        .catalog
-        .list_tables(&namespace)
-        .await?
-        .into_iter()
-        .map(|table_ident| TableIdentifier {
-            namespace: table_ident.namespace().to_vec(),
-            name: table_ident.name().to_string(),
-        })
-        .collect();
-
-    // Sort for consistent pagination
-    identifiers.sort_by(|a, b| a.name.cmp(&b.name));
-
-    // Apply pagination
-    let pagination = PaginationQuery {
-        page_token: query.page_token,
-        page_size: query.page_size,
-    };
-
-    let paged = pagination.paginate(identifiers, |id| id.name.clone());
+    let page = collect_page(
+        PaginationQuery::new(query.page_token, query.page_size).to_request()?,
+        |page_request| {
+            let state = state.clone();
+            let namespace = namespace.0.clone();
+            async move {
+                state
+                    .catalog
+                    .list_tables(&namespace, &page_request)
+                    .await
+                    .map_err(AppError::from)
+            }
+        },
+        |ident: TableIdent| {
+            let state = state.clone();
+            let principal = principal.clone();
+            let facts = request.clone();
+            let owner = authorized.owner.clone();
+            async move {
+                let visible = guard::can_see(
+                    &state,
+                    &principal,
+                    &facts,
+                    &owner,
+                    ident.namespace(),
+                    Target::Table(ident.name()),
+                )
+                .await;
+                (visible, ident)
+            }
+        },
+    )
+    .await?;
 
     Ok(AxumJson(ListTablesResponse {
-        next_page_token: paged.next_page_token,
-        identifiers: paged.items,
+        next_page_token: page.next_page_token,
+        identifiers: page
+            .items
+            .into_iter()
+            .map(|ident| TableIdentifier {
+                namespace: ident.namespace().to_vec(),
+                name: ident.name().to_string(),
+            })
+            .collect(),
     }))
 }
 
@@ -442,9 +774,10 @@ pub async fn list_tables(
 pub async fn create_table(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    RequestFacts(request): RequestFacts,
     namespace: NamespacePath,
     headers: HeaderMap,
-    AxumJson(payload): AxumJson<CreateTablePayload>,
+    Json(payload): Json<CreateTablePayload>,
 ) -> Result<axum::response::Response> {
     use axum::http::header::CONTENT_TYPE;
     use axum::response::IntoResponse;
@@ -455,13 +788,14 @@ pub async fn create_table(
         validate_properties(props)?;
     }
 
-    // Reject staged table creation (not implemented per Iceberg spec optional feature)
-    if payload.stage_create == Some(true) {
-        return Err(AppError::BadRequest(
-            "Staged table creation is not supported. Omit 'stage-create' or set it to false."
-                .into(),
-        ));
+    // A client-supplied location becomes the prefix of any credential vended for
+    // this table, so it is confined to the warehouse before it is recorded. See
+    // `crate::location` for the confused-deputy hole this closes.
+    if let Some(ref location) = payload.location {
+        crate::location::ensure_within_warehouse(&state.warehouse_for(&namespace).await, location)?;
     }
+
+    let staged = payload.stage_create == Some(true);
 
     // Build the endpoint path for idempotency scoping
     let endpoint_path = format!(
@@ -470,27 +804,31 @@ pub async fn create_table(
     );
 
     // Check for idempotency key
-    let idempotency_key = IdempotencyKey::from_headers(&headers, "POST", &endpoint_path);
+    let idempotency_key =
+        IdempotencyKey::from_headers(&headers, "POST", &endpoint_path, &principal);
 
-    // If idempotency key present, check cache first
-    if let Some(ref key) = idempotency_key {
-        if let Some(cached) = state.idempotency_cache.get(key) {
-            return Ok(cached.into_axum_response());
-        }
+    let table_name = payload.name.clone();
+    let authorized = guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &namespace,
+        Target::Table(&table_name),
+        Action::Create,
+    )
+    .await?;
+    // Consulted only after authorization: a cache hit answers without touching
+    // the catalog, so checking it first would serve a request that was never
+    // authorized — and would keep serving it after the grant was revoked.
+    if let Some(ref key) = idempotency_key
+        && let Some(cached) = state.idempotency_cache.get(key).await
+    {
+        return Ok(cached.into_axum_response());
     }
 
-    // Get the namespace's owner tenant
-    let namespace_ident = NamespaceIdent::from_vec(namespace.clone().inner())?;
-    let owner_tenant = get_namespace_owner(&state, &namespace_ident, principal.tenant_id()).await?;
-
-    // Authorize the request against the actual owner
-    let table_name = payload.name.clone();
-    let resource = Resource::table(&owner_tenant, namespace.clone().inner(), &table_name);
-    let ctx = AuthzContext::new(principal.clone(), resource, Action::Create);
-    state.authorizer.check(&ctx).await?;
-
-    // Record metric
     state.metrics.catalog_create_table.inc();
+
+    let delegation = AccessDelegation::from_headers(&headers);
 
     if payload.schema.schema_type != "struct" {
         return Err(AppError::InvalidSchema(
@@ -509,45 +847,80 @@ pub async fn create_table(
 
     let sort_order = build_sort_order(&payload.write_order)?;
 
-    let location = payload
-        .location
-        .unwrap_or_else(|| format!("{}/{}", state.warehouse_location, table_name));
+    let mut properties = payload.properties.unwrap_or_default();
+    let format_version = take_format_version(&mut properties)?;
 
-    let table_creation = {
-        let builder = TableCreation::builder()
-            .name(table_name.clone())
-            .location(location)
-            .schema(schema)
-            .partition_spec(payload.partition_spec.unwrap_or_default())
-            .properties(payload.properties.unwrap_or_default());
+    // Only an explicit client-supplied location is passed through. When it is
+    // absent the catalog derives one from the warehouse *and the namespace* —
+    // computing `{warehouse}/{table}` here dropped the namespace, so two tables
+    // of the same name in different namespaces resolved to one location.
+    let table_creation = TableCreation::builder()
+        .name(table_name.clone())
+        .location_opt(payload.location)
+        .schema(schema)
+        .partition_spec(payload.partition_spec.unwrap_or_default())
+        .sort_order_opt(sort_order)
+        .properties(properties)
+        .format_version(format_version)
+        .build();
 
-        match sort_order {
-            Some(order) => builder.sort_order(order).build(),
-            None => builder.build(),
-        }
+    // `stage-create` builds the table's first metadata and hands it back
+    // *without* creating the table: the engine writes its data files first and
+    // commits the whole thing atomically, which is how Spark performs CREATE
+    // TABLE AS SELECT. A staged table is invisible until that commit lands and
+    // reserves nothing in the meantime.
+    let table = if staged {
+        state
+            .catalog
+            .stage_create_table(&namespace, table_creation)
+            .await?
+    } else {
+        state
+            .catalog
+            .create_table(&namespace, table_creation)
+            .await?
     };
 
-    let table = state
-        .catalog
-        .create_table(&namespace, table_creation)
-        .await?;
-
-    // Vend storage credentials with write access for newly created table
+    // A caller that just created a table is writing to it, so the credential
+    // carries write access without needing a second decision.
     let storage_credentials = vend_table_credentials(
         &state,
         &principal,
-        &namespace.clone().inner(),
-        &table_name,
-        table.metadata().location(),
-        true, // write access for create_table
+        CredentialTarget {
+            namespace: namespace.as_ref(),
+            table_name: &table_name,
+            location: table.metadata().location(),
+            write_access: true,
+        },
+        delegation,
+        &authorized.obligations,
     )
-    .await;
+    .await
+    .into_response_credentials()?;
+
+    let (signing_config, remote_signing_config) = signing_response(
+        &state,
+        delegation,
+        &namespace,
+        &table_name,
+        &authorized.obligations,
+    );
 
     let response_body = LoadTableResponse {
-        metadata_location: table.metadata_location().map(|s| s.to_string()),
+        // A staged table has no committed metadata location, and the spec says
+        // to omit the field in exactly that case. The location is still recorded
+        // server-side — it is the base the eventual `assert-create` commit
+        // builds on — but it is not something the client is being handed as a
+        // table's current metadata.
+        metadata_location: if staged {
+            None
+        } else {
+            table.metadata_location().map(|s| s.to_string())
+        },
         metadata: table.metadata().clone(),
-        config: HashMap::new(),
+        config: signing_config,
         storage_credentials,
+        remote_signing_config,
     };
 
     // Build response
@@ -557,62 +930,175 @@ pub async fn create_table(
         axum::http::HeaderValue::from_static("application/json"),
     );
 
-    // Cache if idempotency key was provided
-    if let Some(key) = idempotency_key {
-        if let Some(cached) = CachedResponse::from_json(StatusCode::OK, &response_body) {
-            state.idempotency_cache.set(key, cached);
-            response.headers_mut().insert(
-                IDEMPOTENCY_KEY_USED_HEADER,
-                axum::http::HeaderValue::from_static("true"),
-            );
-        }
+    // The caller now holds this exact version, so hand it the tag that names it.
+    // Its next `loadTable` can then be conditional and cost nothing.
+    //
+    // Not for a staged table: there is no table to load conditionally, and a tag
+    // naming a version the catalog does not acknowledge would be a promise about
+    // state that does not exist.
+    if !staged && let Some(tag) = freshness::etag_for(table.metadata_location(), SnapshotScope::All)
+    {
+        insert_etag(&mut response, &tag);
+    }
+
+    // Cache a credential-free copy. A vended credential is short-lived and
+    // request-scoped, so replaying one from a 24-hour cache would hand back a
+    // credential that has almost certainly expired — and would keep a live secret
+    // in memory long after the request that minted it. A client replaying a
+    // create asks for credentials again if it wants them.
+    //
+    // A staged create is never cached. Staging is not idempotent by nature — each
+    // call mints fresh metadata and supersedes the last — and replaying an old
+    // staged response would hand a client a metadata location the catalog has
+    // already replaced, so its commit would assert against the wrong base.
+    if let Some(key) = idempotency_key.filter(|_| !staged)
+        && let Some(cached) =
+            CachedResponse::from_json(StatusCode::OK, &response_body.without_credentials())
+    {
+        state.idempotency_cache.set(key, cached).await;
+        response.headers_mut().insert(
+            IDEMPOTENCY_KEY_USED_HEADER,
+            axum::http::HeaderValue::from_static("true"),
+        );
     }
 
     Ok(response)
 }
 
-/// Loads a table's metadata.
+/// Loads a table's metadata, and vends credentials if the client asked for them.
+///
+/// The credential's access level follows the caller's own permissions: a
+/// principal that may also `Update` this table receives a credential that can
+/// write under its prefix, and a read-only principal receives one that cannot.
+/// See [`wants_write_access`].
 ///
 /// GET /v1/namespaces/{namespace}/tables/{table}
 pub async fn load_table(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
-    Path((namespace_str, table_name)): Path<(String, String)>,
-) -> Result<AxumJson<LoadTableResponse>> {
-    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
-    let namespace = NamespaceIdent::from_vec(namespace_parts.clone())?;
+    RequestFacts(request): RequestFacts,
+    TablePath(table_ident): TablePath,
+    Query(snapshots_query): Query<SnapshotsQuery>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response> {
+    use axum::response::IntoResponse;
 
-    // Get the namespace's owner tenant
-    let owner_tenant = get_namespace_owner(&state, &namespace, principal.tenant_id()).await?;
+    // Rejected before any work is done: an unusable parameter is the client's
+    // error, and answering it with a full table load would hide that.
+    let scope = snapshots_query.scope()?;
 
-    // Authorize the request against the actual owner
-    let resource = Resource::table(&owner_tenant, namespace_parts.clone(), &table_name);
-    let ctx = AuthzContext::new(principal.clone(), resource, Action::Read);
-    state.authorizer.check(&ctx).await?;
+    let delegation = AccessDelegation::from_headers(&headers);
+    let namespace = table_ident.namespace().clone();
+    let table_name = table_ident.name().to_string();
+
+    let authorized = guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &namespace,
+        Target::Table(&table_name),
+        Action::Read,
+    )
+    .await?;
 
     // Record metric
     state.metrics.catalog_load_table.inc();
 
-    let table_ident = TableIdent::new(namespace, table_name.clone());
-    let table = state.catalog.load_table(&table_ident).await?;
+    // A conditional request is answered from the metadata *pointer* — a registry
+    // lookup — so a `304` never fetches or parses the metadata document, which
+    // is the whole cost of a table load. Deriving the tag from a full load
+    // instead made a `304` cost exactly what a `200` did.
+    //
+    // Only when the client actually asked, though. Computing a tag costs a
+    // catalog lookup, and on a federated mount that lookup is a *remote* call —
+    // doing it unconditionally would double the cost of every ordinary load to
+    // serve a header nobody sent. So an unconditional request goes straight to
+    // the load and derives its tag from what came back.
+    //
+    // This sits *after* authorization deliberately: `304` reveals that the table
+    // exists and is unchanged, which is exactly as much as `200` would, so it
+    // must be gated by the same decision. Answering it earlier would turn the
+    // cache into a way to probe for tables the caller may not see.
+    if freshness::is_conditional(&headers) {
+        let pointer = state.catalog.metadata_pointer(&table_ident).await?;
 
-    // Vend storage credentials if the provider supports the table's location
+        if let Some(tag) = freshness::etag_for(pointer.as_deref(), scope)
+            && freshness::matches(&headers, &tag)
+        {
+            state.metrics.catalog_load_table_not_modified.inc();
+            let mut response = StatusCode::NOT_MODIFIED.into_response();
+            insert_etag(&mut response, &tag);
+            return Ok(response);
+        }
+    }
+
+    let table = state.catalog.load_table(&table_ident).await?;
+    let etag = freshness::etag_for(table.metadata_location(), scope);
+
+    // A row filter over a non-partition column cannot be enforced by
+    // withholding files, and looks identical in the policy file to one that
+    // can. Reported here, where the filter and the partition spec are both in
+    // hand, and at most once per table per policy set.
+    crate::auth::filter_alignment::warn_if_cooperative(
+        &authorized.obligations.row_filters,
+        table.metadata(),
+        &table_ident.to_string(),
+        state.authorizer.policy_set_version().as_deref(),
+    );
+
+    let write_access = wants_write_access(&state, &authorized).await;
     let storage_credentials = vend_table_credentials(
         &state,
         &principal,
-        &namespace_parts,
-        &table_name,
-        table.metadata().location(),
-        false, // read-only access for load_table
+        CredentialTarget {
+            namespace: namespace.as_ref(),
+            table_name: &table_name,
+            location: table.metadata().location(),
+            write_access,
+        },
+        delegation,
+        &authorized.obligations,
     )
-    .await;
+    .await
+    .into_response_credentials()?;
 
-    Ok(AxumJson(LoadTableResponse {
+    let metadata = snapshots::apply_scope(table.metadata().clone(), scope)?;
+
+    let (signing_config, remote_signing_config) = signing_response(
+        &state,
+        delegation,
+        &namespace,
+        &table_name,
+        &authorized.obligations,
+    );
+
+    let body = LoadTableResponse {
         metadata_location: table.metadata_location().map(|s| s.to_string()),
-        metadata: table.metadata().clone(),
-        config: HashMap::new(),
+        metadata,
+        config: signing_config,
         storage_credentials,
-    }))
+        remote_signing_config,
+    };
+
+    let mut response = (StatusCode::OK, AxumJson(body)).into_response();
+    if let Some(ref tag) = etag {
+        insert_etag(&mut response, tag);
+    }
+    Ok(response)
+}
+
+/// Attaches an entity tag to a response.
+///
+/// A tag that will not parse as a header is dropped rather than failing the
+/// request: the response is correct without it, and the only cost is that the
+/// client's next load is unconditional. The tag is hex inside quotes, so this
+/// cannot actually happen — which is why it must not be an error path.
+fn insert_etag(response: &mut axum::response::Response, tag: &str) {
+    if let Ok(value) = axum::http::HeaderValue::from_str(tag) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::ETAG, value);
+    }
 }
 
 /// Checks if a table exists.
@@ -621,23 +1107,25 @@ pub async fn load_table(
 pub async fn table_exists(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
-    Path((namespace_str, table_name)): Path<(String, String)>,
+    RequestFacts(request): RequestFacts,
+    TablePath(table_ident): TablePath,
 ) -> Result<StatusCode> {
-    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
-    let namespace = NamespaceIdent::from_vec(namespace_parts.clone())?;
+    let namespace = table_ident.namespace().clone();
+    let table_name = table_ident.name().to_string();
 
-    // Get the namespace's owner tenant
-    let owner_tenant = get_namespace_owner(&state, &namespace, principal.tenant_id()).await?;
-
-    // Authorize the request against the actual owner
-    let resource = Resource::table(&owner_tenant, namespace_parts, &table_name);
-    let ctx = AuthzContext::new(principal, resource, Action::Read);
-    state.authorizer.check(&ctx).await?;
-
-    let table_ident = TableIdent::new(namespace, table_name);
+    guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &namespace,
+        Target::Table(&table_name),
+        Action::Read,
+    )
+    .await?;
 
     if state.catalog.table_exists(&table_ident).await? {
-        Ok(StatusCode::OK)
+        // The Iceberg REST spec defines the HEAD responses as 204 No Content.
+        Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NoSuchTable(table_ident.to_string()))
     }
@@ -651,73 +1139,75 @@ pub struct LoadCredentialsResponse {
     pub storage_credentials: Vec<StorageCredential>,
 }
 
-/// Loads vended credentials for a table.
+/// Loads vended credentials for a table, without its metadata.
 ///
-/// This endpoint provides storage credentials scoped to a specific table's
-/// data files. Use this instead of `load_table` when you only need credentials
-/// and don't need the full table metadata.
+/// Use this instead of `loadTable` when a client already holds the metadata and
+/// only needs to refresh an expiring credential.
 ///
-/// The credentials returned are:
-/// - Short-lived (typically 1 hour)
-/// - Scoped to the minimum permissions required for the table
-/// - Specific to the storage location (S3, GCS, Azure)
+/// Access level follows the caller's permissions, exactly as in `loadTable`: a
+/// principal permitted to `Update` receives a writable credential.
 ///
 /// GET /v1/namespaces/{namespace}/tables/{table}/credentials
 pub async fn load_table_credentials(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
-    Path((namespace_str, table_name)): Path<(String, String)>,
+    RequestFacts(request): RequestFacts,
+    TablePath(table_ident): TablePath,
 ) -> Result<AxumJson<LoadCredentialsResponse>> {
-    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
-    let namespace = NamespaceIdent::from_vec(namespace_parts.clone())?;
+    // This endpoint exists solely to obtain credentials, so calling it *is* the
+    // request; no delegation header is required.
+    let delegation = AccessDelegation {
+        vended_credentials: true,
+        remote_signing: false,
+    };
+    let namespace = table_ident.namespace().clone();
+    let table_name = table_ident.name().to_string();
 
-    // Get the namespace's owner tenant
-    let owner_tenant = get_namespace_owner(&state, &namespace, principal.tenant_id()).await?;
+    let authorized = guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &namespace,
+        Target::Table(&table_name),
+        Action::Read,
+    )
+    .await?;
 
-    // Authorize the request against the actual owner
-    let resource = Resource::table(&owner_tenant, namespace_parts.clone(), &table_name);
-    let ctx = AuthzContext::new(principal.clone(), resource, Action::Read);
-    state.authorizer.check(&ctx).await?;
-
-    let table_ident = TableIdent::new(namespace, table_name.clone());
-
-    // Load table to get its location
     let table = state.catalog.load_table(&table_ident).await?;
     let table_location = table.metadata().location();
 
-    // Check if the credential provider supports this storage location
-    if !state.credential_provider.supports_location(table_location) {
-        return Err(AppError::NotSupported(format!(
-            "Credential vending not supported for storage location: {}",
+    let write_access = wants_write_access(&state, &authorized).await;
+    let delegated = vend_table_credentials(
+        &state,
+        &principal,
+        CredentialTarget {
+            namespace: namespace.as_ref(),
+            table_name: &table_name,
+            location: table_location,
+            write_access,
+        },
+        delegation,
+        &authorized.obligations,
+    )
+    .await;
+
+    match delegated {
+        Delegated::Granted(storage_credentials) => Ok(AxumJson(LoadCredentialsResponse {
+            storage_credentials,
+        })),
+        // A policy decision, so it is reported as one. Answering "not supported"
+        // here would send the client looking for a configuration problem.
+        Delegated::Withheld(reason) => Err(AppError::Forbidden(reason)),
+        Delegated::Failed(reason) => Err(AppError::ServiceUnavailable(reason)),
+        Delegated::None => Err(AppError::NotSupported(format!(
+            "Credential vending is not available for storage location: {}",
             table_location
                 .split('/')
                 .take(3)
                 .collect::<Vec<_>>()
                 .join("/")
-        )));
+        ))),
     }
-
-    // Vend storage credentials with read access (use load_table for write credentials)
-    let storage_credentials = vend_table_credentials(
-        &state,
-        &principal,
-        &namespace_parts,
-        &table_name,
-        table_location,
-        false, // read-only access
-    )
-    .await
-    .unwrap_or_default();
-
-    if storage_credentials.is_empty() {
-        return Err(AppError::NotSupported(
-            "No storage credentials available for this table".to_string(),
-        ));
-    }
-
-    Ok(AxumJson(LoadCredentialsResponse {
-        storage_credentials,
-    }))
 }
 
 /// Drops a table from the catalog.
@@ -741,88 +1231,36 @@ pub async fn load_table_credentials(
 pub async fn drop_table(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
-    Path((namespace_str, table_name)): Path<(String, String)>,
+    RequestFacts(request): RequestFacts,
+    TablePath(table_ident): TablePath,
     axum::extract::Query(query): axum::extract::Query<DropTableQuery>,
 ) -> Result<StatusCode> {
-    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
-    let namespace = NamespaceIdent::from_vec(namespace_parts.clone())?;
+    let namespace = table_ident.namespace().clone();
+    let table_name = table_ident.name().to_string();
 
-    // Get the namespace's owner tenant
-    let owner_tenant = get_namespace_owner(&state, &namespace, principal.tenant_id()).await?;
-
-    // Authorize the request against the actual owner
-    let resource = Resource::table(&owner_tenant, namespace_parts, &table_name);
-    let ctx = AuthzContext::new(principal, resource, Action::Delete);
-    state.authorizer.check(&ctx).await?;
+    guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &namespace,
+        Target::Table(&table_name),
+        Action::Delete,
+    )
+    .await?;
 
     // Record metric
     state.metrics.catalog_delete_table.inc();
 
-    let table_ident = TableIdent::new(namespace.clone(), table_name.clone());
-
-    // If purge is requested, we need to load the table first to get:
-    // 1. The table's data location (from metadata)
-    // 2. The FileIO instance to delete files
-    let purge_info = if query.purge_requested {
-        match state.catalog.load_table(&table_ident).await {
-            Ok(table) => {
-                let location = table.metadata().location().to_string();
-                let file_io = table.file_io().clone();
-                tracing::info!(
-                    table = %table_ident,
-                    location = %location,
-                    "Table loaded for purge operation"
-                );
-                Some((location, file_io))
-            }
-            Err(e) => {
-                // Table might not be loadable but still exists in catalog
-                // Log warning and proceed with catalog-only drop
-                tracing::warn!(
-                    table = %table_ident,
-                    error = %e,
-                    "Failed to load table for purge; proceeding with catalog-only drop"
-                );
-                None
-            }
-        }
+    if query.purge_requested {
+        // Purge drops the table and deletes the files it owns, in one catalog
+        // operation. The catalog walks the table's manifests and removes exactly
+        // the referenced files; it does not recursively delete the table location,
+        // which could destroy unrelated tables sharing the same prefix.
+        state.catalog.purge_table(&table_ident).await?;
+        tracing::info!(table = %table_ident, "Dropped table and purged its data");
     } else {
-        None
-    };
-
-    // Drop the table from the catalog
-    state.catalog.drop_table(&table_ident).await?;
-
-    // If purge was requested and we have the table's location, delete the data
-    if let Some((location, file_io)) = purge_info {
-        tracing::info!(
-            table = %table_ident,
-            location = %location,
-            "Purging table data"
-        );
-
-        // Delete all files in the table's location recursively
-        // This includes: data files, manifest files, manifest lists, metadata files
-        if let Err(e) = file_io.remove_dir_all(&location).await {
-            // Log error but don't fail the request - the table is already dropped from catalog
-            // The data files are now orphaned and can be cleaned up manually
-            tracing::error!(
-                table = %table_ident,
-                location = %location,
-                error = %e,
-                "Failed to purge table data; table removed from catalog but data files may remain"
-            );
-            // Note: We intentionally don't return an error here because:
-            // 1. The table has already been dropped from the catalog
-            // 2. The purge operation is "best effort"
-            // 3. Orphaned files can be cleaned up separately
-        } else {
-            tracing::info!(
-                table = %table_ident,
-                location = %location,
-                "Table data purged successfully"
-            );
-        }
+        state.catalog.drop_table(&table_ident).await?;
+        tracing::info!(table = %table_ident, "Dropped table (data left in place)");
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -831,10 +1269,19 @@ pub async fn drop_table(
 /// Renames a table.
 ///
 /// POST /v1/tables/rename
+/// Renames a table.
+///
+/// Needs `Update` on the source and `Create` on the destination: a rename removes
+/// a table from one name and creates it at another, and a caller permitted only
+/// to write the destination must not be able to move someone else's table into
+/// it.
+///
+/// POST /v1/tables/rename
 pub async fn rename_table(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
-    AxumJson(payload): AxumJson<RenameTablePayload>,
+    RequestFacts(request): RequestFacts,
+    Json(payload): Json<RenameTablePayload>,
 ) -> Result<StatusCode> {
     // Validate destination table name and namespaces
     validate_table_name(&payload.destination.name)?;
@@ -844,38 +1291,35 @@ pub async fn rename_table(
     let src_namespace = NamespaceIdent::from_vec(payload.source.namespace.clone())?;
     let dst_namespace = NamespaceIdent::from_vec(payload.destination.namespace.clone())?;
 
-    // Get owner for source namespace
-    let src_owner = get_namespace_owner(&state, &src_namespace, principal.tenant_id()).await?;
+    let src = guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &src_namespace,
+        Target::Table(&payload.source.name),
+        Action::Update,
+    )
+    .await?;
 
-    // Get owner for destination namespace
-    let dst_owner = get_namespace_owner(&state, &dst_namespace, principal.tenant_id()).await?;
+    let dst = guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &dst_namespace,
+        Target::Table(&payload.destination.name),
+        Action::Create,
+    )
+    .await?;
 
-    // SEC-028: Prevent cross-tenant table moves
-    // Table renames must stay within the same tenant to prevent data leakage.
-    // Both namespaces must belong to the same tenant.
-    if src_owner != dst_owner {
+    // A rename is not a mechanism for moving data between tenants. Both checks
+    // above could pass for a principal with grants in two tenants, and the
+    // resulting table would sit in one tenant's namespace while its files live
+    // under another's warehouse prefix.
+    if src.owner != dst.owner {
         return Err(AppError::Forbidden(
             "Cannot move tables between namespaces owned by different tenants".to_string(),
         ));
     }
-
-    // Authorize the request - need Update on source table
-    let src_resource = Resource::table(
-        &src_owner,
-        payload.source.namespace.clone(),
-        &payload.source.name,
-    );
-    let src_ctx = AuthzContext::new(principal.clone(), src_resource, Action::Update);
-    state.authorizer.check(&src_ctx).await?;
-
-    // Check permission on destination table (Create)
-    let dst_resource = Resource::table(
-        &dst_owner,
-        payload.destination.namespace.clone(),
-        &payload.destination.name,
-    );
-    let dst_ctx = AuthzContext::new(principal, dst_resource, Action::Create);
-    state.authorizer.check(&dst_ctx).await?;
 
     // Record metric
     state.metrics.catalog_rename_table.inc();
@@ -905,45 +1349,66 @@ pub async fn rename_table(
 pub async fn commit_table(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
-    Path((namespace_str, table_name)): Path<(String, String)>,
+    RequestFacts(request): RequestFacts,
+    TablePath(table_ident): TablePath,
     headers: HeaderMap,
-    AxumJson(payload): AxumJson<CommitTableRequest>,
+    Json(payload): Json<CommitTableRequest>,
 ) -> Result<axum::response::Response> {
     use axum::http::header::CONTENT_TYPE;
     use axum::response::IntoResponse;
 
-    // Build the endpoint path for idempotency scoping
-    let endpoint_path = format!("/v1/namespaces/{}/tables/{}", namespace_str, table_name);
+    let namespace_parts = table_ident.namespace().to_vec();
+    let table_name = table_ident.name().to_string();
 
-    // Check for idempotency key
-    let idempotency_key = IdempotencyKey::from_headers(&headers, "POST", &endpoint_path);
+    // Scope the idempotency key to the resource, not to the request URL: the
+    // same commit is reachable through `/v1/...` and `/v1/{prefix}/...`, and a
+    // retry that happens to use the other form must hit the same cache entry.
+    let endpoint_path = format!(
+        "commit-table:{}:{}",
+        namespace_parts.join("\u{1F}"),
+        table_name
+    );
 
-    // If idempotency key present, check cache first
-    if let Some(ref key) = idempotency_key {
-        if let Some(cached) = state.idempotency_cache.get(key) {
-            return Ok(cached.into_axum_response());
-        }
+    let idempotency_key =
+        IdempotencyKey::from_headers(&headers, "POST", &endpoint_path, &principal);
+
+    // The spec lets the body repeat the identifier the URL already carries. Two
+    // sources for one fact diverge: letting the body win commits against a table
+    // the URL never named, while the idempotency key stays scoped to the URL's.
+    // So they must agree, and the path is authoritative.
+    if let Some(ref ident) = payload.identifier
+        && (ident.namespace != namespace_parts || ident.name != table_name)
+    {
+        return Err(AppError::BadRequest(format!(
+            "The identifier in the request body ({}.{}) does not name the table in \
+                 the URL ({}.{}). They must match.",
+            ident.namespace.join("."),
+            ident.name,
+            namespace_parts.join("."),
+            table_name
+        )));
     }
 
-    // Parse namespace from URL path
-    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
+    let namespace = NamespaceIdent::from_vec(namespace_parts)?;
+    let final_table_name = table_name;
 
-    // Use identifier from payload if provided, otherwise use URL path
-    let (final_namespace_parts, final_table_name) = if let Some(ref ident) = payload.identifier {
-        (ident.namespace.clone(), ident.name.clone())
-    } else {
-        (namespace_parts, table_name)
-    };
-
-    let namespace = NamespaceIdent::from_vec(final_namespace_parts.clone())?;
-
-    // Get the namespace's owner tenant
-    let owner_tenant = get_namespace_owner(&state, &namespace, principal.tenant_id()).await?;
-
-    // Authorize the request against the actual owner
-    let resource = Resource::table(&owner_tenant, final_namespace_parts, &final_table_name);
-    let ctx = AuthzContext::new(principal, resource, Action::Update);
-    state.authorizer.check(&ctx).await?;
+    guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &namespace,
+        Target::Table(&final_table_name),
+        Action::Update,
+    )
+    .await?;
+    // Consulted only after authorization: a cache hit answers without touching
+    // the catalog, so checking it first would serve a request that was never
+    // authorized — and would keep serving it after the grant was revoked.
+    if let Some(ref key) = idempotency_key
+        && let Some(cached) = state.idempotency_cache.get(key).await
+    {
+        return Ok(cached.into_axum_response());
+    }
 
     let table_ident = TableIdent::new(namespace, final_table_name);
 
@@ -961,15 +1426,10 @@ pub async fn commit_table(
     let updated_table = state
         .catalog
         .commit_table(&table_ident, payload.requirements, payload.updates)
-        .await
-        .map_err(|e| {
-            // Convert iceberg errors to appropriate app errors
-            if e.kind() == iceberg::ErrorKind::CatalogCommitConflicts {
-                AppError::CommitConflict(e.to_string())
-            } else {
-                AppError::Internal(e.to_string())
-            }
-        })?;
+        // `From<iceberg::Error>` maps on ErrorKind, so a commit conflict becomes
+        // 409 and a missing table becomes 404. Mapping by hand here collapsed
+        // everything that was not a conflict into a 500.
+        .await?;
 
     let metadata_location = updated_table
         .metadata_location()
@@ -983,20 +1443,25 @@ pub async fn commit_table(
 
     // Build response
     let mut response = (StatusCode::OK, AxumJson(&response_body)).into_response();
+    // The committer already holds the new version; tagging it here saves the
+    // full re-read that otherwise follows every write.
+    if let Some(tag) = freshness::etag_for(updated_table.metadata_location(), SnapshotScope::All) {
+        insert_etag(&mut response, &tag);
+    }
     response.headers_mut().insert(
         CONTENT_TYPE,
         axum::http::HeaderValue::from_static("application/json"),
     );
 
     // Cache if idempotency key was provided
-    if let Some(key) = idempotency_key {
-        if let Some(cached) = CachedResponse::from_json(StatusCode::OK, &response_body) {
-            state.idempotency_cache.set(key, cached);
-            response.headers_mut().insert(
-                IDEMPOTENCY_KEY_USED_HEADER,
-                axum::http::HeaderValue::from_static("true"),
-            );
-        }
+    if let Some(key) = idempotency_key
+        && let Some(cached) = CachedResponse::from_json(StatusCode::OK, &response_body)
+    {
+        state.idempotency_cache.set(key, cached).await;
+        response.headers_mut().insert(
+            IDEMPOTENCY_KEY_USED_HEADER,
+            axum::http::HeaderValue::from_static("true"),
+        );
     }
 
     Ok(response)
@@ -1011,16 +1476,24 @@ pub async fn commit_table(
 pub async fn register_table(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    RequestFacts(request): RequestFacts,
     namespace: NamespacePath,
     headers: HeaderMap,
-    AxumJson(payload): AxumJson<RegisterTablePayload>,
+    Json(payload): Json<RegisterTablePayload>,
 ) -> Result<axum::response::Response> {
     use axum::http::header::CONTENT_TYPE;
     use axum::response::IntoResponse;
-    use iceberg::io::FileIOBuilder;
 
     // Validate input
     validate_table_name(&payload.name)?;
+
+    // Registration is the sharpest form of the problem: the caller names a
+    // metadata file directly, and the table location read out of it becomes the
+    // prefix of a *write* credential below. Confined to the warehouse first.
+    crate::location::ensure_within_warehouse(
+        &state.warehouse_for(&namespace).await,
+        &payload.metadata_location,
+    )?;
 
     // Build the endpoint path for idempotency scoping
     let endpoint_path = format!(
@@ -1029,81 +1502,84 @@ pub async fn register_table(
     );
 
     // Check for idempotency key
-    let idempotency_key = IdempotencyKey::from_headers(&headers, "POST", &endpoint_path);
+    let idempotency_key =
+        IdempotencyKey::from_headers(&headers, "POST", &endpoint_path, &principal);
 
-    // If idempotency key present, check cache first
-    if let Some(ref key) = idempotency_key {
-        if let Some(cached) = state.idempotency_cache.get(key) {
-            return Ok(cached.into_axum_response());
-        }
-    }
-
-    // Get the namespace's owner tenant
-    let namespace_ident = NamespaceIdent::from_vec(namespace.clone().inner())?;
-    let owner_tenant = get_namespace_owner(&state, &namespace_ident, principal.tenant_id()).await?;
-
-    // Authorize the request against the actual owner
     let table_name = payload.name.clone();
-    let resource = Resource::table(&owner_tenant, namespace.clone().inner(), &table_name);
-    let ctx = AuthzContext::new(principal.clone(), resource, Action::Create);
-    state.authorizer.check(&ctx).await?;
+    let authorized = guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &namespace,
+        Target::Table(&table_name),
+        Action::Create,
+    )
+    .await?;
+
+    // Consulted only after authorization: a cache hit answers without touching
+    // the catalog, so checking it first would serve a request that was never
+    // authorized — and would keep serving it after the grant was revoked.
+    if let Some(ref key) = idempotency_key
+        && let Some(cached) = state.idempotency_cache.get(key).await
+    {
+        return Ok(cached.into_axum_response());
+    }
 
     // Record metric
     state.metrics.catalog_register_table.inc();
 
-    // Read metadata from the provided location
-    let file_io = FileIOBuilder::new_fs_io().build()?;
-    let metadata_content = file_io
-        .new_input(&payload.metadata_location)?
-        .read()
-        .await?;
-    let metadata_str = std::str::from_utf8(&metadata_content)
-        .map_err(|e| AppError::InvalidSchema(format!("Invalid metadata file encoding: {}", e)))?;
-    let table_metadata: TableMetadata = serde_json::from_str(metadata_str)
-        .map_err(|e| AppError::InvalidSchema(format!("Invalid table metadata: {}", e)))?;
+    let delegation = AccessDelegation::from_headers(&headers);
 
-    // Verify the table doesn't already exist
-    let table_ident = TableIdent::new(namespace_ident.clone(), table_name.clone());
-    if state.catalog.table_exists(&table_ident).await? {
-        return Err(AppError::TableAlreadyExists(format!(
-            "Table {} already exists in namespace {}",
-            table_name,
-            namespace.clone().inner().join(".")
-        )));
-    }
-
-    // Create the table in the catalog with the existing metadata
-    // The location comes from the metadata itself
-    let location = table_metadata.location().to_string();
-    let schema = table_metadata.current_schema().as_ref().clone();
-
-    let table_creation = TableCreation::builder()
-        .name(table_name.clone())
-        .location(location)
-        .schema(schema)
-        .build();
+    // Handed to the catalog as-is: it reads the location through its own FileIO,
+    // confines the location that metadata *declares* to the mount's warehouse,
+    // and only then records the pointer.
+    //
+    // The declared-location check is the backend's rather than this handler's,
+    // and deliberately so — see [`crate::location::confine_declared_location`].
+    // Doing it here meant publishing the pointer first and dropping the table
+    // when the check failed, which left a window in which an out-of-warehouse
+    // table was loadable; doing it here *before* the call would check a
+    // different read of a file the caller controls.
+    //
+    // Registration must *adopt* the existing metadata, never rewrite it. Parsing
+    // it here and calling `create_table` would write a fresh metadata file,
+    // discarding the snapshot history the caller is registering.
+    let table_ident = TableIdent::new(namespace.0.clone(), table_name.clone());
 
     let table = state
         .catalog
-        .create_table(&namespace_ident, table_creation)
+        .register_table(&table_ident, payload.metadata_location.clone())
         .await?;
 
-    // Vend storage credentials with write access
     let storage_credentials = vend_table_credentials(
         &state,
         &principal,
-        &namespace.clone().inner(),
-        &table_name,
-        table.metadata().location(),
-        true,
+        CredentialTarget {
+            namespace: namespace.as_ref(),
+            table_name: &table_name,
+            location: table.metadata().location(),
+            write_access: true,
+        },
+        delegation,
+        &authorized.obligations,
     )
-    .await;
+    .await
+    .into_response_credentials()?;
+
+    let (signing_config, remote_signing_config) = signing_response(
+        &state,
+        delegation,
+        &namespace,
+        &table_name,
+        &authorized.obligations,
+    );
 
     let response_body = LoadTableResponse {
-        metadata_location: Some(payload.metadata_location),
-        metadata: table_metadata,
-        config: HashMap::new(),
+        metadata_location: table.metadata_location().map(str::to_string),
+        metadata: table.metadata().clone(),
+        config: signing_config,
         storage_credentials,
+        remote_signing_config,
     };
 
     // Build response
@@ -1113,15 +1589,16 @@ pub async fn register_table(
         axum::http::HeaderValue::from_static("application/json"),
     );
 
-    // Cache if idempotency key was provided
-    if let Some(key) = idempotency_key {
-        if let Some(cached) = CachedResponse::from_json(StatusCode::OK, &response_body) {
-            state.idempotency_cache.set(key, cached);
-            response.headers_mut().insert(
-                IDEMPOTENCY_KEY_USED_HEADER,
-                axum::http::HeaderValue::from_static("true"),
-            );
-        }
+    // Credential-free, for the reason given in `create_table`.
+    if let Some(key) = idempotency_key
+        && let Some(cached) =
+            CachedResponse::from_json(StatusCode::OK, &response_body.without_credentials())
+    {
+        state.idempotency_cache.set(key, cached).await;
+        response.headers_mut().insert(
+            IDEMPOTENCY_KEY_USED_HEADER,
+            axum::http::HeaderValue::from_static("true"),
+        );
     }
 
     Ok(response)
@@ -1137,19 +1614,23 @@ pub async fn register_table(
 pub async fn report_metrics(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
-    Path((namespace_str, table_name)): Path<(String, String)>,
-    AxumJson(payload): AxumJson<ReportMetricsRequest>,
+    RequestFacts(request): RequestFacts,
+    TablePath(table_ident): TablePath,
+    Json(payload): Json<ReportMetricsRequest>,
 ) -> Result<StatusCode> {
-    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
-    let namespace = NamespaceIdent::from_vec(namespace_parts.clone())?;
+    let namespace = table_ident.namespace().clone();
+    let table_name = table_ident.name().to_string();
 
-    // Get the namespace's owner tenant
-    let owner_tenant = get_namespace_owner(&state, &namespace, principal.tenant_id()).await?;
-
-    // Authorize the request - only need Read access to report metrics
-    let resource = Resource::table(&owner_tenant, namespace_parts, &table_name);
-    let ctx = AuthzContext::new(principal.clone(), resource, Action::Read);
-    state.authorizer.check(&ctx).await?;
+    // Reporting telemetry about a table needs only the right to read it.
+    guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &namespace,
+        Target::Table(&table_name),
+        Action::Read,
+    )
+    .await?;
 
     // Log the metrics for observability
     tracing::info!(
@@ -1170,7 +1651,7 @@ pub async fn report_metrics(
 ///
 /// Uses an atomic commit model with:
 /// - Optimistic concurrency control with version tracking
-/// - WriteBatch for atomic multi-key registry updates
+/// - one backend transaction, so every pointer swaps together or none does
 /// - Exponential backoff retry on conflicts
 ///
 /// All table changes are applied atomically: either all succeed or none do.
@@ -1180,21 +1661,15 @@ pub async fn report_metrics(
 pub async fn commit_transaction(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    RequestFacts(request): RequestFacts,
     headers: HeaderMap,
-    AxumJson(payload): AxumJson<CommitTransactionRequest>,
+    Json(payload): Json<CommitTransactionRequest>,
 ) -> Result<StatusCode> {
     // Build the endpoint path for idempotency scoping
     let endpoint_path = "/v1/transactions/commit";
 
     // Check for idempotency key
-    let idempotency_key = IdempotencyKey::from_headers(&headers, "POST", endpoint_path);
-
-    // If idempotency key present, check cache first
-    if let Some(ref key) = idempotency_key {
-        if let Some(_cached) = state.idempotency_cache.get(key) {
-            return Ok(StatusCode::NO_CONTENT);
-        }
-    }
+    let idempotency_key = IdempotencyKey::from_headers(&headers, "POST", endpoint_path, &principal);
 
     if payload.table_changes.is_empty() {
         return Err(AppError::ValidationError(
@@ -1213,15 +1688,47 @@ pub async fn commit_transaction(
             )
         })?;
 
-        let namespace = NamespaceIdent::from_vec(ident.namespace.clone())?;
-        let owner_tenant = get_namespace_owner(&state, &namespace, principal.tenant_id()).await?;
+        // Validated for the same reason as in `commit_table`: a transaction
+        // entry names its table in the body, so nothing has applied the name
+        // rules to it yet, and those rules are what keep a Cedar entity id
+        // injective.
+        validate_namespace(&ident.namespace)?;
+        validate_table_name(&ident.name)?;
 
-        // Authorize update on each table
-        let resource = Resource::table(&owner_tenant, ident.namespace.clone(), &ident.name);
-        let ctx = AuthzContext::new(principal.clone(), resource, Action::Update);
-        state.authorizer.check(&ctx).await?;
+        let namespace = NamespaceIdent::from_vec(ident.namespace.clone())?;
+
+        // Every table in the transaction is authorized before any of them is
+        // committed, so a transaction touching one forbidden table applies to
+        // none of them.
+        guard::authorize(
+            &state,
+            &principal,
+            &request,
+            &namespace,
+            Target::Table(&ident.name),
+            Action::Update,
+        )
+        .await?;
 
         let table_ident = TableIdent::new(namespace, ident.name.clone());
+
+        // Two entries for one table cannot both be applied: the second is
+        // written against a version the first has already superseded, so the
+        // backend sees its own write as a conflict and retries until it gives
+        // up — burning the full retry budget to answer 409 for a request that
+        // was malformed from the start. The transaction also has no defined
+        // meaning: nothing says which entry wins, or whether the second builds
+        // on the first.
+        if table_commits
+            .iter()
+            .any(|(existing, _, _): &(TableIdent, _, _)| existing == &table_ident)
+        {
+            return Err(AppError::ValidationError(format!(
+                "Table '{table_ident}' appears more than once in this transaction. \
+                 List each table at most once, combining its updates into a single entry."
+            )));
+        }
+
         table_commits.push((
             table_ident,
             commit_req.requirements.clone(),
@@ -1229,36 +1736,46 @@ pub async fn commit_transaction(
         ));
     }
 
-    // Execute ATOMIC multi-table commit
-    // Using OCC with WriteBatch for true atomicity across all tables
+    // Consulted only after every table in the transaction has been authorized,
+    // so a replay cannot answer a request that policy would now refuse.
+    if let Some(ref key) = idempotency_key
+        && state.idempotency_cache.get(key).await.is_some()
+    {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    // Either every table advances or none does; the backend guarantees that and
+    // this handler only has to report it.
     match state.catalog.commit_tables_atomic(table_commits).await {
         Ok(_tables) => {
             // Cache success if idempotency key was provided
-            if let Some(key) = idempotency_key {
-                if let Some(cached) = CachedResponse::from_json(StatusCode::NO_CONTENT, &()) {
-                    state.idempotency_cache.set(key, cached);
-                }
+            if let Some(key) = idempotency_key
+                && let Some(cached) = CachedResponse::from_json(StatusCode::NO_CONTENT, &())
+            {
+                state.idempotency_cache.set(key, cached).await;
             }
 
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => {
-            tracing::error!(
-                error = %e,
-                "Atomic transaction commit failed"
-            );
+            tracing::warn!(error = %e, "Atomic transaction commit failed");
 
-            if e.kind() == iceberg::ErrorKind::CatalogCommitConflicts {
-                Err(AppError::CommitConflict(format!(
-                    "Commit conflict: {}. Transaction was not applied (all-or-nothing).",
-                    e,
-                )))
-            } else {
-                Err(AppError::Internal(format!(
-                    "Transaction failed: {}. Transaction was not applied (all-or-nothing).",
-                    e,
-                )))
-            }
+            // Mapped by `ErrorKind`, never by hand. Hand-mapping collapses every
+            // non-conflict into a `500`, so a cross-mount transaction — refused
+            // deliberately, with a message explaining why — would reach the
+            // client as "an internal error occurred", telling it to retry
+            // something that will never succeed.
+            //
+            // The all-or-nothing note is added only to a conflict, where the
+            // client's next move depends on it. A `501` for an operation that
+            // spans two catalogs already says nothing was applied.
+            let mapped = AppError::from(e);
+            Err(match mapped {
+                AppError::CommitConflict(message) => AppError::CommitConflict(format!(
+                    "{message}. The transaction was not applied — it is all or nothing."
+                )),
+                other => other,
+            })
         }
     }
 }
@@ -1313,6 +1830,62 @@ fn build_sort_order(write_order: &Option<WriteOrder>) -> Result<Option<SortOrder
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn props(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Every client puts the table format version in `properties`, and the
+    /// metadata builder refuses to store it there — so passing it through made
+    /// `TBLPROPERTIES ('format-version'='2')` fail outright.
+    #[test]
+    fn format_version_is_read_from_properties_and_not_persisted() {
+        let mut properties = props(&[("format-version", "3"), ("owner", "alice")]);
+        assert_eq!(
+            take_format_version(&mut properties).unwrap(),
+            FormatVersion::V3
+        );
+        assert_eq!(properties, props(&[("owner", "alice")]));
+
+        assert_eq!(
+            take_format_version(&mut props(&[("format-version", "1")])).unwrap(),
+            FormatVersion::V1
+        );
+        assert_eq!(
+            take_format_version(&mut props(&[("format-version", " 2 ")])).unwrap(),
+            FormatVersion::V2
+        );
+    }
+
+    /// v2 while v3 reader support is uneven: defaulting to v3 would write tables
+    /// some engines cannot open.
+    #[test]
+    fn the_default_format_version_is_two() {
+        assert_eq!(
+            take_format_version(&mut HashMap::new()).unwrap(),
+            FormatVersion::V2
+        );
+    }
+
+    #[test]
+    fn an_unknown_format_version_is_refused() {
+        for value in ["0", "4", "v2", ""] {
+            let err = take_format_version(&mut props(&[("format-version", value)])).unwrap_err();
+            assert_eq!(err.status_code(), StatusCode::BAD_REQUEST, "{value}");
+        }
+    }
+
+    /// The other reserved names are read-only metadata. Refusing here names the
+    /// key; letting it through fails deeper with a message that reads like a bug.
+    #[test]
+    fn other_reserved_properties_are_refused_by_name() {
+        let err = take_format_version(&mut props(&[("uuid", "nope")])).unwrap_err();
+        assert!(err.to_string().contains("uuid"), "{err}");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    }
 
     // ========================================================================
     // TableIdentifier Tests

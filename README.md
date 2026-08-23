@@ -1,493 +1,245 @@
+<div align="center">
+
 # Rustberg
 
-<p align="center">
-  <strong>A production-grade, cross-platform, single-binary Apache Iceberg REST Catalog server written in Rust.</strong>
-</p>
+**The policy layer for Apache Iceberg.**
 
-<p align="center">
-  <a href="https://hupe1980.github.io/rustberg">Documentation</a> •
-  <a href="#quick-start">Quick Start</a> •
-  <a href="#features">Features</a> •
-  <a href="https://hupe1980.github.io/rustberg/docs/security">Security</a> •
-  <a href="https://hupe1980.github.io/rustberg/docs/api">API</a>
-</p>
+One authenticated, policy-controlled Iceberg REST endpoint in front of every
+catalog your organisation owns — a single Rust binary, and an embeddable crate.
 
-<p align="center">
-  <img src="https://img.shields.io/badge/tests-511%20passing-brightgreen" alt="Tests">
-  <img src="https://img.shields.io/badge/clippy-0%20warnings-brightgreen" alt="Clippy">
-  <img src="https://img.shields.io/badge/memory-~9MB-blue" alt="Memory">
-  <img src="https://img.shields.io/badge/binary-7.4MB-blue" alt="Binary Size">
-  <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
-</p>
+[Documentation](https://hupe1980.github.io/rustberg) ·
+[Getting started](https://hupe1980.github.io/rustberg/docs/getting-started/) ·
+[API reference](https://hupe1980.github.io/rustberg/docs/api/) ·
+[Security](https://hupe1980.github.io/rustberg/docs/security/)
+
+<img src="https://img.shields.io/badge/tests-904%20%2B%2069%20client-brightgreen" alt="904 Rust tests, 69 client conformance tests">
+<img src="https://img.shields.io/badge/unsafe-forbidden-brightgreen" alt="unsafe forbidden">
+<img src="https://img.shields.io/badge/binary-~24%20MB-blue" alt="~24 MB binary">
+<img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="Apache 2.0">
+
+</div>
 
 ---
 
-## Why Rustberg?
+## 🧊 What it is
 
-**Rustberg** is a production-grade Apache Iceberg REST Catalog designed for simplicity and performance:
+Engines connect to one endpoint with one identity. Rustberg authenticates the
+caller, authorizes every operation against [Cedar](https://www.cedarpolicy.com/)
+policy, routes the request to the catalog that actually holds the table, hands
+out storage access scoped to what policy allows, and records the decision.
 
-### Core Capabilities
-
-- 🚀 **Instant Startup** — Sub-10ms cold start, ready immediately
-- 📦 **Single Binary** — No JVM, no PostgreSQL, no external services required
-- 🔐 **Security First** — TLS 1.3, API keys, JWT/OIDC, Cedar policies, AES-256-GCM encryption
-- ☸️ **Kubernetes Native** — SlateDB on S3/GCS/Azure for horizontal scaling
-- 🌍 **Cross-Platform** — Linux, macOS, Windows with first-class support
-- 📋 **Full Iceberg REST API** — Tables, views, namespaces, transactions, credential vending
-
----
-
-## Quick Start
-
-### Option 1: Pre-built Binaries
-
-```bash
-# Linux (x86_64)
-curl -L https://github.com/hupe1980/rustberg/releases/latest/download/rustberg-linux-x86_64 -o rustberg
-
-# Linux (ARM64)
-curl -L https://github.com/hupe1980/rustberg/releases/latest/download/rustberg-linux-aarch64 -o rustberg
-
-# macOS (Apple Silicon)
-curl -L https://github.com/hupe1980/rustberg/releases/latest/download/rustberg-darwin-aarch64 -o rustberg
-
-# Make executable and run
-chmod +x rustberg
-./rustberg
+```
+   Spark · Trino · DuckDB · PyIceberg · Flink
+                    │
+                    │  one Iceberg REST endpoint, one identity
+                    ▼
+        ┌───────────────────────────┐
+        │         Rustberg          │
+        │  identity → policy →      │
+        │  routing → storage →      │
+        │  audit                    │
+        └───────────────────────────┘
+           │         │          │
+     ┌─────┘         │          └──────────┐
+     ▼               ▼                     ▼
+  native          remote REST          AWS Glue
+  redb ·        (Polaris · Lakekeeper   Hive · S3 Tables
+  Postgres       · Unity · Nessie)       (not built)
 ```
 
-### Option 2: Docker
+Storing table pointers is solved. Governing who may read, who may write, and who
+gets handed storage access — across catalogs an organisation did not choose to
+have in the same place — is not. That is the product.
+
+## 🚀 Quick start
 
 ```bash
-# Start Rustberg
-docker run -d -p 8181:8181 --name rustberg \
-  -e RUSTBERG_INSECURE_HTTP=true \
-  ghcr.io/hupe1980/rustberg:latest
+curl -L https://github.com/hupe1980/rustberg/releases/latest/download/rustberg-linux-x86_64.tar.gz \
+  | tar -xz
 
-# Verify it's running
-curl http://localhost:8181/health
-
-# Create a namespace
-curl -X POST http://localhost:8181/v1/namespaces \
-  -H "Content-Type: application/json" \
-  -d '{"namespace": ["my_namespace"]}'
+./rustberg-linux-x86_64 --dev --insecure-http
 ```
 
-### Option 3: Helm Chart (Kubernetes)
+Authentication is on by default. With nothing configured, Rustberg mints one
+admin key and prints it, rather than starting in a state that accepts nobody or
+one that accepts everybody:
+
+```text
+WARN No API keys or OIDC configured — minted a temporary admin key.
+WARN     X-API-Key: rb_sOYl2CxcSLwECS2K8Ri8Y14JgqsBpYydrX7hZqVRxrc
+WARN     curl -H 'X-API-Key: rb_sOYl…' http://localhost:8000/v1/config
+```
+
+The key lives in memory only, so a restart mints a new one — configure
+`[[server.auth.api_keys]]` or OIDC for anything lasting. Then point a client at
+it:
+
+```python
+from pyiceberg.catalog.rest import RestCatalog
+
+catalog = RestCatalog("rustberg", uri="http://localhost:8000", token="rb_...")
+catalog.create_namespace("analytics")
+```
+
+Without `--dev`, Rustberg runs in production mode: it requires an explicit
+`--catalog-url` and refuses wildcard CORS, so an ephemeral catalog never quietly
+ends up holding real metadata.
+
+<details>
+<summary><strong>🐳 Docker, Helm, and building from source</strong></summary>
 
 ```bash
-# Clone repository
-git clone https://github.com/hupe1980/rustberg
-cd rustberg
+# Docker — take the key from the startup log
+docker run -d -p 8000:8000 --name rustberg \
+  -e RUSTBERG_INSECURE_HTTP=true ghcr.io/hupe1980/rustberg:latest
+docker logs rustberg 2>&1 | grep X-API-Key
 
-# Install with Helm
+# Helm
 helm install rustberg charts/rustberg \
   --set rustberg.storage.type=s3 \
   --set rustberg.storage.s3.bucket=my-catalog-bucket
 
-# Or with custom values
-helm install rustberg charts/rustberg -f my-values.yaml
-```
-
-### Option 4: Build from Source
-
-Requires **Rust 1.89+** ([install](https://rustup.rs/))
-
-```bash
-# Clone and build
-git clone https://github.com/hupe1980/rustberg
-cd rustberg
+# From source — Rust 1.94+
 cargo build --release --all-features
-
-# Generate TLS certificate (development)
-./target/release/rustberg generate-cert
-
-# Start server
-./target/release/rustberg --tls-cert server.crt --tls-key server.key
 ```
 
----
+</details>
 
-## Features
+## 🛡️ Why it exists
 
-### Core Iceberg API
+**Policy is the product.** Every other subsystem exists to make the policy
+decision correct, fast and auditable.
 
-- ✅ **Namespace CRUD** - Create, list, update, delete namespaces
-- ✅ **Table CRUD** - Full table lifecycle management with optional data purge
-- ✅ **Table Commits** - Optimistic concurrency with version-based CAS (409 on conflict)
-- ✅ **Atomic Rename** - Crash-safe table rename via WriteBatch
-- ✅ **Register Table** - Import existing tables from metadata location
-- ✅ **Multi-table Transactions** - Atomic commit with WriteBatch
-- ✅ **Metrics Reporting** - Client telemetry collection
-- ✅ **Credential Vending** - AWS STS + GCS + Azure temporary credentials
-- ✅ **Pagination** - Cursor-based with configurable page size
-- ✅ **Views** - Full CRUD with persistent storage (SlateDB)
-- ✅ **Idempotency** - Request deduplication with persistent storage (SlateDB)
-
-### Security
-
-- ✅ **API Key Authentication** - Argon2id hashed with in-memory caching (moka)
-- ✅ **JWT/OIDC Authentication** - JWKS validation with auto-purge on rotation, configurable claims
-- ✅ **Cedar Policy Authorization** - Fine-grained ABAC beyond simple RBAC
-- ✅ **Multi-Tenancy** - Hard isolation between tenants
-- ✅ **Rate Limiting** - Token bucket per IP/tenant with non-consuming header peek
-- ✅ **Encryption at Rest** - AES-256-GCM with envelope encryption + AWS KMS/Vault/Azure KV
-- ✅ **TLS/HTTPS** - TLS 1.2/1.3 via rustls
-- ✅ **Secret Redaction** - Sensitive data redacted in debug output and logs
-- ✅ **Security Headers** - CSP, X-Frame-Options, X-Content-Type-Options
-- ✅ **CORS Support** - Configurable cross-origin resource sharing
-- ✅ **Audit Logging** - Structured JSON for SIEM
-- ✅ **Idempotency Guard** - RAII-based in-flight deduplication with auto-cleanup
-
-### Operations
-
-- ✅ **Health Checks** - `/health` and `/ready` endpoints with storage backend verification
-- ✅ **Metrics** - Prometheus-compatible `/metrics` with KMS operations, cache stats, and 30+ counters
-- ✅ **Request Tracing** - X-Request-Id propagation for distributed tracing
-- ✅ **Response Compression** - Gzip/deflate/brotli automatic compression
-- ✅ **Graceful Shutdown** - SIGTERM handling with connection drain
-- ✅ **Backup/Restore** - CLI commands for disaster recovery
-- ✅ **TOML Configuration** - File-based config with env override
-
----
-
-## Security
-
-### Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         SECURITY LAYERS                              │
-├─────────────────────────────────────────────────────────────────────┤
-│  TLS 1.2/1.3 (rustls)                           Transport Security  │
-│  ├── Rate Limiting (token bucket)               DoS Protection      │
-│  ├── Request Size Limits (10MB)                 Resource Protection │
-│  ├── Request Timeouts (30s)                     Hang Protection     │
-│  ├── Security Headers (CSP, X-Frame-Options)    Browser Security    │
-│  ├── X-Request-Id Tracing                       Distributed Tracing │
-│  ├── CORS Middleware                            Cross-Origin Policy │
-│  ├── API Key / JWT Authentication               Identity            │
-│  ├── Cedar Policy Authorization                 Access Control      │
-│  ├── Input Validation                           Injection Defense   │
-│  ├── Audit Logging                              Forensics           │
-│  └── AES-256-GCM Encryption                     Data at Rest        │
-│      └── KMS (env/AWS/Vault) + Circuit Breaker  Key Management      │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### Authentication
-
-```bash
-# Generate an API key
-rustberg generate-key --name admin --roles admin,writer
-
-# Use the key
-curl -H "X-API-Key: rb_abc123..." https://localhost:8000/v1/namespaces
-```
-
-### Authorization (Cedar Policies)
+- **Cedar, not a permission table.** Resources form a hierarchy, so one policy
+  covers a whole namespace subtree — including tables that do not exist yet.
+  Policies are validated at load, so a typo is a startup failure rather than a
+  `permit` that silently never matches. Deny by default, including on evaluation
+  error.
+- **Listings filter, they do not deny.** A caller sees exactly the subset it may
+  read and never learns the rest exists. A resource you cannot see is `404`, not
+  `403`, so the status code is never an oracle.
+- **Storage access only narrows, in two strengths.** Vend a short-lived
+  credential scoped to one table prefix — STS session policies, GCS credential
+  access boundaries, Azure user-delegation SAS, each a real downscoping exchange.
+  Or hand the engine *nothing* and sign every object request, so a revoked grant
+  takes effect on the next read rather than at the next expiry.
+- **Scan planning that knows the policy.** `planTableScan` conjoins a permit's
+  `@row_filter` with the client's own, so a restricted caller is told about fewer
+  files. A filter this catalog cannot bind is *widened*, never dropped — pruning
+  against a predicate nobody wrote returns too few files.
+- **The audit trail is a deliverable.** Every decision names the policy that made
+  it and the version of the policy set it came from. When the sink fails,
+  mutating requests fail with it.
+- **Federation under one identity.** Mount several catalogs — your own, or
+  somebody else's Iceberg REST catalog — routed by top-level namespace. The mount
+  is invisible on the wire, so a cross-catalog join is ordinary SQL.
+- **A binary, or a crate.** `app.as_principal(p)` gives the same operations
+  in-process, through the same authorization guard, with no router. The
+  equivalence is tested as equivalence.
 
 ```cedar
-// Allow readers to list namespaces
+// Analysts read anything under one namespace subtree, and nothing else.
 permit(
-  principal,
-  action == Action::"ListNamespaces",
-  resource
-) when {
-  principal.roles.contains("reader")
-};
+  principal in Rustberg::Group::"analysts",
+  action    in [Rustberg::Action::"Read", Rustberg::Action::"List"],
+  resource  in Rustberg::Namespace::"acme\u{1F}analytics"
+);
 
-// Deny cross-tenant access
+// A pipeline writes to one namespace, outside business hours only.
+permit(
+  principal == Rustberg::User::"svc-etl",
+  action    in [Rustberg::Action::"Create", Rustberg::Action::"Update"],
+  resource  in Rustberg::Namespace::"acme\u{1F}analytics\u{1F}web"
+) when { context.utc_hour < 6 || context.utc_hour > 20 };
+
+// Nothing in production is reachable from outside the VPC.
+// `context has source_ip` matters: without it, a request whose address is
+// unknown would satisfy the exemption and the restriction would not apply.
 forbid(
-  principal,
-  action,
-  resource
-) when {
-  principal.tenant_id != resource.tenant_id
+  principal, action,
+  resource in Rustberg::Tenant::"prod"
+) unless {
+  context has source_ip && context.source_ip.isInRange(ip("10.0.0.0/8"))
 };
 ```
 
----
+→ [Authorization](https://hupe1980.github.io/rustberg/docs/authorization/)
 
-## API
+## 📦 Deployment shapes
 
-### Endpoints
+| | Catalog | Replicas | Use it when |
+|---|---|---|---|
+| **Single binary** | embedded redb file | exactly one — redb takes an exclusive lock | development, CI, edge, single-node production |
+| **Replicated** | Postgres | any number, stateless | Kubernetes, or anything that needs to scale out |
+| **Embedded** | in-process | n/a | a Rust service that wants policy and storage access with no network hop |
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Liveness check |
-| `GET` | `/ready` | Readiness check with dependencies |
-| `GET` | `/metrics` | Prometheus metrics |
-| `GET` | `/v1/config` | Catalog configuration |
-| `GET` | `/v1/namespaces` | List namespaces |
-| `POST` | `/v1/namespaces` | Create namespace |
-| `GET` | `/v1/namespaces/{ns}` | Get namespace |
-| `POST` | `/v1/namespaces/{ns}` | Update namespace |
-| `DELETE` | `/v1/namespaces/{ns}` | Delete namespace |
-| `GET` | `/v1/namespaces/{ns}/tables` | List tables |
-| `POST` | `/v1/namespaces/{ns}/tables` | Create table |
-| `POST` | `/v1/namespaces/{ns}/register` | Register existing table |
-| `GET` | `/v1/namespaces/{ns}/tables/{table}` | Load table |
-| `DELETE` | `/v1/namespaces/{ns}/tables/{table}` | Drop table |
-| `POST` | `/v1/namespaces/{ns}/tables/{table}` | Commit table update |
-| `HEAD` | `/v1/namespaces/{ns}/tables/{table}` | Check table exists |
-| `POST` | `/v1/namespaces/{ns}/tables/{table}/metrics` | Report metrics |
-| `POST` | `/v1/tables/rename` | Rename table |
-| `POST` | `/v1/transactions/commit` | Multi-table transaction |
+The warehouse is independent of either: local filesystem, S3, GCS or ADLS.
 
-### Example: Create a Table
+→ [Catalog and warehouse](https://hupe1980.github.io/rustberg/docs/storage/) ·
+[Kubernetes](https://hupe1980.github.io/rustberg/docs/kubernetes/) ·
+[Library](https://hupe1980.github.io/rustberg/docs/library/)
 
-```bash
-curl -X POST https://localhost:8000/v1/namespaces/my_ns/tables \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: rb_abc123..." \
-  -d '{
-    "name": "my_table",
-    "schema": {
-      "type": "struct",
-      "fields": [
-        {"id": 1, "name": "id", "type": "long", "required": true},
-        {"id": 2, "name": "data", "type": "string", "required": false}
-      ]
-    }
-  }'
-```
-
----
-
-## Configuration
-
-### TOML Configuration File
-
-```toml
-# rustberg.toml
-
-[server]
-host = "0.0.0.0"
-port = 8000
-
-[server.auth]
-api_key_enabled = true
-jwt_enabled = false
-
-[tls]
-enabled = true
-cert_path = "/etc/rustberg/tls/cert.pem"
-key_path = "/etc/rustberg/tls/key.pem"
-
-[storage]
-# Single-node (local storage)
-backend = "file:///var/lib/rustberg/data"
-
-# K8s HA (S3-compatible)
-# backend = "s3://rustberg-bucket/catalog?region=us-east-1"
-
-[kms]
-provider = "env"  # or "aws-kms", "vault"
-cache_ttl_seconds = 300
-circuit_breaker_enabled = true
-
-[rate_limit]
-enabled = true
-requests_per_second = 100
-burst_size = 200
-
-[logging]
-level = "info"
-json_format = false
-```
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `RUSTBERG_HOST` | `0.0.0.0` | Bind address |
-| `RUSTBERG_PORT` | `8000` | Bind port |
-| `RUSTBERG_WAREHOUSE` | - | Warehouse location |
-| `RUSTBERG_TENANT_ID` | `default` | Default tenant |
-| `RUSTBERG_NO_AUTH` | `false` | Disable authentication (dev only) |
-| `RUSTBERG_TLS_CERT` | - | TLS certificate path |
-| `RUSTBERG_TLS_KEY` | - | TLS key path |
-| `RUSTBERG_INSECURE_HTTP` | `false` | Allow HTTP (dev only) |
-| `RUSTBERG_MASTER_KEY` | - | Encryption master key (hex) |
-| `RUST_LOG` | `info` | Log level |
-
----
-
-## Deployment
-
-### Production Checklist
-
-- [ ] TLS enabled with valid certificates
-- [ ] Authentication enabled (default - ensure `RUSTBERG_NO_AUTH` is NOT set)
-- [ ] Master key stored securely (KMS recommended)
-- [ ] Rate limiting configured appropriately
-- [ ] Audit logging to persistent storage
-- [ ] Health checks configured in orchestrator
-- [ ] Backup schedule established
-
-### Kubernetes
-
-Rustberg supports both single-node (with PVC) and highly-available (with S3) deployments:
-
-#### Single-Node (PVC Storage)
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: rustberg
-spec:
-  replicas: 1  # Single node only with file:// storage
-  template:
-    spec:
-      containers:
-        - name: rustberg
-          image: ghcr.io/hupe1980/rustberg:latest
-          ports:
-            - containerPort: 8000
-          env:
-            - name: STORAGE_BACKEND
-              value: "file:///var/lib/rustberg/data"
-            - name: RUSTBERG_MASTER_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: rustberg-secrets
-                  key: master-key
-          volumeMounts:
-            - name: data
-              mountPath: /var/lib/rustberg/data
-      volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: rustberg-data
-```
-
-#### High-Availability (S3/GCS/MinIO)
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: rustberg
-spec:
-  replicas: 3  # Multiple replicas with shared S3 storage
-  template:
-    spec:
-      containers:
-        - name: rustberg
-          image: ghcr.io/hupe1980/rustberg:latest
-          ports:
-            - containerPort: 8000
-          env:
-            - name: STORAGE_BACKEND
-              value: "s3://rustberg-bucket/catalog?region=us-east-1"
-            - name: AWS_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: rustberg-secrets
-                  key: aws-access-key
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: rustberg-secrets
-                  key: aws-secret-key
-            - name: RUSTBERG_MASTER_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: rustberg-secrets
-                  key: master-key
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8000
-            initialDelaySeconds: 5
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: 8000
-            initialDelaySeconds: 5
-```
-
-### Backup & Restore
-
-```bash
-# Create backup
-rustberg backup --output /backup/rustberg-$(date +%Y%m%d).tar.gz
-
-# Validate backup
-rustberg validate-backup --input /backup/rustberg-20260123.tar.gz
-
-# Restore (stops server first!)
-rustberg restore --input /backup/rustberg-20260123.tar.gz --force
-```
-
----
-
-## CLI Reference
-
-```bash
-# Start server
-rustberg [OPTIONS]
-
-# Generate API key
-rustberg generate-key --name <NAME> --tenant <TENANT> --roles <ROLES>
-
-# Generate TLS certificate (development)
-rustberg generate-cert --common-name localhost --output-dir /tmp/tls
-
-# Generate sample configuration file
-rustberg generate-config --output config.toml
-
-# Generate OpenAPI specification
-rustberg open-api --format yaml --output openapi.yaml
-
-# Backup catalog
-rustberg backup --output <FILE> --data-dir <DIR>
-
-# Restore catalog
-rustberg restore --input <FILE> --data-dir <DIR> [--force]
-
-# Validate backup
-rustberg validate-backup --input <FILE>
-
-# Show status
-rustberg status --data-dir <DIR>
-
-# Run performance benchmark
-rustberg benchmark --iterations 10
-```
-
----
-
-## Engine Compatibility
+## 🔌 Engine support
 
 | Engine | Read | Write | Notes |
-|--------|------|-------|-------|
-| PyIceberg | ✅ | ✅ | Full support |
-| Trino | ✅ | ✅ | Full support |
-| DuckDB | ✅ | - | Read-only |
+|---|---|---|---|
+| PyIceberg | ✅ | ✅ | |
+| Apache Spark | ✅ | ✅ | including atomic `CREATE TABLE AS SELECT` |
+| Trino | ✅ | ✅ | |
+| DuckDB | ✅ | — | read-only client |
 
----
+Table format versions **1, 2 and 3** are served; new tables default to v2.
 
-## Development
+Conformance suites for PyIceberg, DuckDB and Trino run against the built binary
+on every change.
+
+→ [Client configuration](https://hupe1980.github.io/rustberg/docs/clients/)
+
+## 🚧 What it does not do
+
+Rustberg declines what it has not built, with a status code — never a silent
+partial success.
+
+- **A table under a row filter or column mask is refused a credential and a
+  signature** rather than handed prefix-wide access. Planning still applies the
+  filter, but a plan is advice: nothing makes an unplanned file unfetchable, so
+  this is selection rather than enforcement against a hostile engine.
+- **Asynchronous and incremental scan planning** are not implemented. Every plan
+  is answered inline, and an incremental scan is declined with `501` rather than
+  answered as a full one.
+- **Glue, Hive Metastore and S3 Tables** mounts are not built. `native` (redb,
+  Postgres) and `rest` are.
+- **SQL UDFs** (`…/namespaces/{ns}/functions`) are not built.
+- Rustberg **does not issue tokens**. `POST /v1/oauth/tokens` is deprecated in
+  the spec, and token issuance belongs to your identity provider —
+  `oauth2-server-uri` in the config response points at it.
+
+→ [Known limitations](https://hupe1980.github.io/rustberg/docs/api/#known-limitations)
+
+## ⚡ Measured
+
+Release build, `--all-features`, asserted on every pull request with ceilings
+that fail the build.
+
+| | Target | Measured (p99) |
+|---|---|---|
+| Authorization overhead | < 1 ms for point operations | **31 µs** |
+| `loadTable` | < 5 ms native | **370 µs** |
+| Cold start to serving | < 100 ms | **45 ms** |
+| Idle footprint | < 50 MB RSS | gated on Linux |
+
+→ [Performance](https://hupe1980.github.io/rustberg/docs/benchmarks/)
+
+## 🛠️ Development
 
 ```bash
-# Run tests
-cargo test --all-features
-
-# Run with debug logging
-RUST_LOG=debug cargo run --all-features -- --insecure-http
-
-# Format code
-cargo fmt
-
-# Lint
-cargo clippy --all-features
+just test          # cargo test --all-features
+just lint          # clippy -D warnings, rustfmt
+just site          # serve the documentation site (requires zola)
 ```
 
----
+`just --list` shows the rest.
 
-## License
+## 📄 License
 
-Apache License 2.0
+[Apache License 2.0](LICENSE).

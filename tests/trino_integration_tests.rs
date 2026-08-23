@@ -5,14 +5,16 @@
 //!
 //! Requirements:
 //! - Docker must be running
-//! - Tests are ignored by default (run with `cargo test --ignored trino`)
+//! - Tests that start a Trino container are `#[ignore]`d; run them with
+//!   `cargo test --test trino_integration_tests -- --ignored`
+//! - The rest exercise the REST surface directly and need no container
 
 use std::net::TcpListener;
 use std::time::Duration;
 
 use reqwest::Client;
 use rustberg::server::ServerConfig;
-use rustberg::{start_server, App};
+use rustberg::{App, start_server};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
@@ -43,8 +45,9 @@ impl RustbergTestServer {
         let app = App::builder()
             .with_warehouse_location("/tmp/rustberg-trino-test")
             .with_default_tenant_id("trino-test")
-            .build_async()
-            .await;
+            .build()
+            .await
+            .expect("build app");
 
         let router = app.into_router();
 
@@ -132,7 +135,12 @@ async fn trino_query(trino_url: &str, query: &str) -> Result<serde_json::Value, 
 }
 
 /// Test that Trino can connect to Rustberg and list catalogs
+/// Requires Docker: starts a real Trino container.
+///
+/// Ignored by default so `cargo test` works without a container runtime.
+/// Run with `cargo test --test trino_integration_tests -- --ignored`.
 #[tokio::test]
+#[ignore = "requires Docker"]
 async fn trino_can_connect_to_rustberg() {
     // Start Rustberg
     let rustberg = RustbergTestServer::start().await;
@@ -207,7 +215,12 @@ async fn trino_can_connect_to_rustberg() {
 }
 
 /// Test creating and querying a table through Trino
+/// Requires Docker: starts a real Trino container.
+///
+/// Ignored by default so `cargo test` works without a container runtime.
+/// Run with `cargo test --test trino_integration_tests -- --ignored`.
 #[tokio::test]
+#[ignore = "requires Docker"]
 async fn trino_can_create_and_query_table() {
     // Start Rustberg
     let rustberg = RustbergTestServer::start().await;
@@ -401,8 +414,9 @@ async fn trino_verify_iceberg_rest_api_compatibility() {
     let app = App::builder()
         .with_warehouse_location("/tmp/test-warehouse")
         .with_default_tenant_id("test")
-        .build_async()
-        .await;
+        .build()
+        .await
+        .expect("build app");
 
     // Verify the app can be converted to a router
     let _router = app.into_router();

@@ -55,8 +55,6 @@ pub struct StorageCredential {
     /// For GCS, this typically includes:
     /// - `gcs.oauth2.token` - OAuth2 access token
     ///
-    /// For Azure, this typically includes:
-    /// - `adls.sas-token.<account>` - SAS token for the storage account
     pub config: HashMap<String, String>,
 }
 
@@ -116,15 +114,23 @@ impl StorageCredential {
         Self::new(prefix, config)
     }
 
-    /// Creates an Azure ADLS credential from a SAS token.
-    pub fn azure(
+    /// Creates an ADLS credential from a user-delegation SAS.
+    ///
+    /// There is deliberately **no** `adls.account-key` constructor. An account
+    /// key grants the whole storage account — every container, delete included —
+    /// to anyone permitted to read one table, and it neither scopes nor expires,
+    /// which is the opposite of downgrade-only. A user-delegation SAS is signed
+    /// with a key obtained from the storage account under the server's own Entra
+    /// identity, so what it grants is the intersection of the SAS and that
+    /// identity's RBAC: like an S3 session policy, it can only narrow.
+    pub fn adls(
         prefix: impl Into<String>,
-        account: impl Into<String>,
+        account_name: impl Into<String>,
         sas_token: impl Into<String>,
     ) -> Self {
         let mut config = HashMap::new();
-        let key = format!("adls.sas-token.{}", account.into());
-        config.insert(key, sas_token.into());
+        config.insert("adls.sas-token".to_string(), sas_token.into());
+        config.insert("adls.account-name".to_string(), account_name.into());
         Self::new(prefix, config)
     }
 }
@@ -146,6 +152,14 @@ pub struct StorageCredentialRequest {
 
     /// Whether write access is required.
     pub write_access: bool,
+
+    /// Who the credential is being minted for.
+    ///
+    /// Carried into the STS session name, so the cloud provider's own audit
+    /// trail attributes an object read to a principal rather than only to
+    /// Rustberg's role. Without it CloudTrail can say which table was read and
+    /// not by whom, and joining the two trails means correlating on time.
+    pub principal_id: Option<String>,
 }
 
 impl StorageCredentialRequest {
@@ -162,6 +176,7 @@ impl StorageCredentialRequest {
             table_name: table_name.into(),
             table_location: table_location.into(),
             write_access: false,
+            principal_id: None,
         }
     }
 
@@ -178,16 +193,29 @@ impl StorageCredentialRequest {
             table_name: table_name.into(),
             table_location: table_location.into(),
             write_access: true,
+            principal_id: None,
         }
     }
 
-    /// Returns a session identifier for audit purposes.
+    /// Names the principal this credential is for.
+    pub fn for_principal(mut self, principal_id: impl Into<String>) -> Self {
+        self.principal_id = Some(principal_id.into());
+        self
+    }
+
+    /// The STS session name, which is what CloudTrail records.
+    ///
+    /// Principal first, then table: AWS caps the name at 64 characters and
+    /// truncates the tail, so the identity survives a long namespace path.
+    /// Characters outside the permitted set are dropped rather than escaped —
+    /// AWS rejects them, and a rejected `AssumeRole` is a vend that fails for a
+    /// reason nothing in the message names.
     pub fn session_name(&self) -> String {
-        let ns = self.namespace.join("-");
-        format!("rustberg-{}-{}-{}", self.tenant_id, ns, self.table_name)
+        let principal = self.principal_id.as_deref().unwrap_or(&self.tenant_id);
+        format!("rustberg-{}-{}", principal, self.table_name)
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-            .take(64) // AWS session name limit
+            .take(64)
             .collect()
     }
 }
@@ -277,24 +305,6 @@ mod tests {
     }
 
     #[test]
-    fn test_storage_credential_azure() {
-        let cred = StorageCredential::azure(
-            "abfss://container@account.dfs.core.windows.net/warehouse/",
-            "account",
-            "?sv=2021-06-08&ss=bfqt&srt=sco&sp=rwdlacupitfx",
-        );
-
-        assert_eq!(
-            cred.prefix,
-            "abfss://container@account.dfs.core.windows.net/warehouse/"
-        );
-        assert_eq!(
-            cred.config.get("adls.sas-token.account").unwrap(),
-            "?sv=2021-06-08&ss=bfqt&srt=sco&sp=rwdlacupitfx"
-        );
-    }
-
-    #[test]
     fn test_credential_request_session_name() {
         let request = StorageCredentialRequest::read_only(
             "tenant-123",
@@ -304,8 +314,23 @@ mod tests {
         );
 
         let session_name = request.session_name();
-        assert!(session_name.starts_with("rustberg-tenant-123-prod-analytics-sales_data"));
+        assert_eq!(session_name, "rustberg-tenant-123-sales_data");
         assert!(session_name.len() <= 64);
+
+        // Naming the principal is what lets CloudTrail attribute the access.
+        let named = request.clone().for_principal("svc-etl");
+        assert_eq!(named.session_name(), "rustberg-svc-etl-sales_data");
+
+        // A long path must not push the identity past the 64-character cap.
+        let deep = StorageCredentialRequest::read_only(
+            "tenant-123",
+            (0..20).map(|i| format!("level{i}")).collect(),
+            "sales_data",
+            "s3://bucket/x",
+        )
+        .for_principal("svc-etl");
+        assert!(deep.session_name().starts_with("rustberg-svc-etl-"));
+        assert!(deep.session_name().len() <= 64);
     }
 
     #[tokio::test]
@@ -355,6 +380,29 @@ mod tests {
         );
     }
 
+    /// The SAS is the secret; the account name is not, and an operator reading a
+    /// log needs it to tell which account a credential was for.
+    #[test]
+    fn adls_debug_redacts_the_sas_but_not_the_account() {
+        let cred = StorageCredential::adls(
+            "abfss://fs@acct.dfs.core.windows.net/wh/db/t/",
+            "acct",
+            "sv=2023-11-03&sig=SUPER-SECRET-SIGNATURE",
+        );
+
+        let debug_output = format!("{:?}", cred);
+
+        assert!(
+            !debug_output.contains("SUPER-SECRET-SIGNATURE"),
+            "the SAS must be redacted"
+        );
+        assert!(debug_output.contains("[REDACTED]"));
+        assert!(
+            debug_output.contains("acct"),
+            "the account name identifies the credential and stays visible"
+        );
+    }
+
     #[test]
     fn test_credential_debug_redacts_gcs_token() {
         let cred = StorageCredential::gcs("gs://bucket/", "ya29.super-secret-token");
@@ -364,24 +412,6 @@ mod tests {
         assert!(
             !debug_output.contains("ya29.super-secret-token"),
             "GCS OAuth2 token must be redacted"
-        );
-        assert!(debug_output.contains("[REDACTED]"));
-    }
-
-    #[test]
-    fn test_credential_debug_redacts_azure_sas() {
-        let cred = StorageCredential::azure(
-            "abfss://container@account.dfs.core.windows.net/",
-            "account",
-            "?sv=2021-06-08&ss=bfqt&srt=sco&sp=rwdlacupitfx",
-        );
-
-        let debug_output = format!("{:?}", cred);
-
-        // SAS token key contains "token" so it should be redacted
-        assert!(
-            !debug_output.contains("sv=2021-06-08"),
-            "Azure SAS token must be redacted"
         );
         assert!(debug_output.contains("[REDACTED]"));
     }

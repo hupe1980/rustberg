@@ -1,0 +1,100 @@
+// Syntax highlighting, vendored from Zola's generated theme stylesheets.
+//
+// Zola's `class` highlighting style stamps *both* class sets onto every token
+// — `<span class="z-l-1 z-d-3">` — so the light and dark rules are always both
+// present in the markup and cannot be selected between with a `<link media>`
+// alone. That works for the OS preference and breaks the moment a reader uses
+// the theme toggle.
+//
+// Wrapping each theme in a mixin lets `main.scss` include it under the right
+// root selector, so a dark rule becomes `:root[data-theme="dark"] .z-d-1` and
+// beats the light one on both specificity and order — in both directions.
+//
+// Generated. Run `just site-syntax` after changing the themes in config.toml.
+
+@mixin syntax-light {
+  .z-l-code {
+    color: #5C6166;
+    background-color: #F8F9FA;
+  }
+
+  .z-l-hl {
+    background-color: #828E9F1A;
+  }
+
+  .giallo-ln {
+    color: #828E9F66;
+  }
+
+  .z-l-1 { color: #22A4E6; }
+  .z-l-2 { color: #478ACC; }
+  .z-l-3 { color: #4CBF99; }
+  .z-l-4 { color: #55B4D4; }
+  .z-l-5 { color: #55B4D480; }
+  .z-l-6 { color: #5C6166B3; }
+  .z-l-7 { color: #6CBF43; }
+  .z-l-8 { color: #86B300; }
+  .z-l-9 { color: #A37ACC; }
+  .z-l-10 { color: #ADAEB1; }
+  .z-l-11 { color: #C594C5; }
+  .z-l-12 { color: #E59645; }
+  .z-l-13 { color: #E65050; }
+  .z-l-14 { color: #EBA400; }
+  .z-l-15 { color: #F07171; }
+  .z-l-16 { color: #F2A191; }
+  .z-l-17 { color: #FA8532; }
+  .z-l-18 { color: #FF7383; }
+  .z-l-bg1 { background-color: #5C6166; }
+  .z-l-bg2 { background-color: #5C616605; }
+  .z-l-bg3 { background-color: #5C61660F; }
+  .z-l-bg4 { background-color: #ADAEB1; }
+  .z-l-b { font-weight: bold; }
+  .z-l-i { font-style: italic; }
+  .z-l-u { text-decoration: underline; }
+  .z-l-s { text-decoration: line-through; }
+  .z-l-us { text-decoration: underline line-through; }
+}
+
+@mixin syntax-dark {
+  .z-d-code {
+    color: #BFBDB6;
+    background-color: #0D1017;
+  }
+
+  .z-d-hl {
+    background-color: #161A24;
+  }
+
+  .giallo-ln {
+    color: #5A6378A6;
+  }
+
+  .z-d-1 { color: #39BAE6; }
+  .z-d-2 { color: #39BAE680; }
+  .z-d-3 { color: #59C2FF; }
+  .z-d-4 { color: #5A6673; }
+  .z-d-5 { color: #70BF56; }
+  .z-d-6 { color: #73B8FF; }
+  .z-d-7 { color: #95E6CB; }
+  .z-d-8 { color: #AAD94C; }
+  .z-d-9 { color: #BFBDB6B3; }
+  .z-d-10 { color: #C594C5; }
+  .z-d-11 { color: #D2A6FF; }
+  .z-d-12 { color: #D95757; }
+  .z-d-13 { color: #E6C08A; }
+  .z-d-14 { color: #F07178; }
+  .z-d-15 { color: #F26D78; }
+  .z-d-16 { color: #F29668; }
+  .z-d-17 { color: #FF8F40; }
+  .z-d-18 { color: #FFB454; }
+  .z-d-bg1 { background-color: #5A6673; }
+  .z-d-bg2 { background-color: #BFBDB6; }
+  .z-d-bg3 { background-color: #BFBDB605; }
+  .z-d-bg4 { background-color: #BFBDB60F; }
+  .z-d-b { font-weight: bold; }
+  .z-d-i { font-style: italic; }
+  .z-d-u { text-decoration: underline; }
+  .z-d-s { text-decoration: line-through; }
+  .z-d-us { text-decoration: underline line-through; }
+}
+

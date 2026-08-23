@@ -36,7 +36,8 @@
 pub mod diagnostics;
 pub mod health;
 pub mod metrics;
+pub mod perf;
 
 pub use diagnostics::{StartupDiagnostics, StartupDiagnosticsBuilder};
-pub use health::{create_routes as create_health_routes, HealthStatus, ReadinessStatus};
+pub use health::{HealthStatus, ReadinessStatus, create_routes as create_health_routes};
 pub use metrics::MetricsRegistry;

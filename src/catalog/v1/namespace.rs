@@ -7,22 +7,21 @@ use iceberg::NamespaceIdent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use super::extract::{Json, NamespacePath};
+use super::guard::{self, Target};
+use super::idempotency::{CachedResponse, IDEMPOTENCY_KEY_USED_HEADER, IdempotencyKey};
+use super::ownership::{owner_of, preserve_reserved, reject_reserved, set_owner, strip_reserved};
+use super::pagination::{PaginationQuery, collect_page};
+use super::validation::{validate_namespace, validate_properties};
 use crate::app::AppState;
-use crate::auth::{Action, AuthenticatedPrincipal, AuthzContext, Resource};
-use crate::catalog::extract::NamespacePath;
-use crate::catalog::idempotency::{CachedResponse, IdempotencyKey, IDEMPOTENCY_KEY_USED_HEADER};
-use crate::catalog::pagination::PaginationQuery;
-use crate::catalog::validation::{validate_namespace, validate_properties};
+use crate::auth::{Action, AuthenticatedPrincipal, RequestFacts, Resource};
 use crate::error::{AppError, Result};
-
-/// Reserved property key for storing namespace owner's tenant ID.
-const TENANT_ID_PROPERTY: &str = "_tenant_id";
 
 #[derive(Deserialize)]
 pub struct ListNamespaceQuery {
     /// Parent namespace for hierarchical listing.
     parent: Option<String>,
-    /// Pagination: token for next page.
+    /// Pagination: token for the next page.
     #[serde(rename = "pageToken")]
     page_token: Option<String>,
     /// Pagination: maximum items per page.
@@ -69,62 +68,105 @@ pub struct UpdateNamespacePropertiesResponse {
     missing: Vec<String>, // List of properties requested for removal but not found
 }
 
+/// Lists the namespaces the caller may see.
+///
+/// # Filtering is a policy decision, not a tenant comparison
+///
+/// Each candidate is authorized individually against its own recorded owner, so
+/// the listing agrees with what a subsequent load would answer.
+///
+/// Comparing the recorded owner against the caller's tenant instead would be
+/// wrong twice over: it duplicates an isolation rule the policies already
+/// express, and it ignores narrower grants, so a `forbid` on one namespace would
+/// be enforced on load and invisible in the listing.
+///
+/// A namespace recording no owner is shown to nobody: it cannot be attributed to
+/// a tenant, so no policy can decide it.
 pub async fn list_namespaces(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    RequestFacts(request): RequestFacts,
     Query(query): Query<ListNamespaceQuery>,
 ) -> Result<AxumJson<ListNamespaceResponse>> {
-    // Authorize the request
-    let tenant_id = principal.tenant_id().to_string();
-    let resource = Resource::catalog(&tenant_id);
-    let ctx = AuthzContext::new(principal.clone(), resource, Action::List);
-    state.authorizer.check(&ctx).await?;
+    // Permission to enumerate one's own catalog. Each namespace found is then
+    // authorized on its own merits below.
+    guard::authorize_catalog(&state, &principal, &request, Action::List).await?;
 
     // Record metric
     state.metrics.catalog_list_namespaces.inc();
 
+    // `parent` is a multi-level namespace encoded with the unit separator, the
+    // same as in a path segment. Treating the whole value as one level made
+    // `?parent=a\u{1F}b` search for a namespace literally named "a\u{1F}b".
     let maybe_parent = query
         .parent
         .as_deref()
-        .map(|parent| NamespaceIdent::new(parent.to_string()));
+        .map(|parent| {
+            let parts: Vec<String> = parent.split('\u{1F}').map(str::to_string).collect();
+            validate_namespace(&parts)?;
+            NamespaceIdent::from_vec(parts).map_err(AppError::from)
+        })
+        .transpose()?;
 
-    let namespaces = state.catalog.list_namespaces(maybe_parent.as_ref()).await?;
-
-    // Filter namespaces to only show those owned by the requesting tenant
-    let mut namespace_lists: Vec<Vec<String>> = Vec::new();
-    for namespace in namespaces {
-        // Check if this namespace belongs to the requesting tenant
-        if let Ok(ns) = state.catalog.get_namespace(&namespace).await {
-            let owner = ns.properties().get(TENANT_ID_PROPERTY).map(|s| s.as_str());
-            // Include if: no owner set (legacy) OR owner matches tenant
-            if owner.is_none() || owner == Some(&tenant_id) {
-                namespace_lists.push(namespace.inner().clone());
+    let page = collect_page(
+        PaginationQuery::new(query.page_token, query.page_size).to_request()?,
+        |request| {
+            let state = state.clone();
+            let parent = maybe_parent.clone();
+            async move {
+                state
+                    .catalog
+                    .list_namespaces(parent.as_ref(), &request)
+                    .await
+                    .map_err(AppError::from)
             }
-        }
-    }
-
-    // Sort for consistent pagination
-    namespace_lists.sort();
-
-    // Apply pagination
-    let pagination = PaginationQuery {
-        page_token: query.page_token,
-        page_size: query.page_size,
-    };
-
-    let paged = pagination.paginate(namespace_lists, |ns| ns.join("/"));
+        },
+        |namespace| {
+            let state = state.clone();
+            let principal = principal.clone();
+            let facts = request.clone();
+            async move {
+                // A namespace with no recorded owner is shown to nobody: it
+                // cannot be attributed to a tenant, so no policy can decide it.
+                let Ok(ns) = state.catalog.get_namespace(&namespace).await else {
+                    return (false, namespace);
+                };
+                let Some(owner) = owner_of(ns.properties()).map(str::to_string) else {
+                    return (false, namespace);
+                };
+                let visible = guard::can_see(
+                    &state,
+                    &principal,
+                    &facts,
+                    &owner,
+                    &namespace,
+                    Target::Namespace,
+                )
+                .await;
+                (visible, namespace)
+            }
+        },
+    )
+    .await?;
 
     Ok(AxumJson(ListNamespaceResponse {
-        namespaces: paged.items,
-        next_page_token: paged.next_page_token,
+        namespaces: page.items.iter().map(|ns| ns.as_ref().clone()).collect(),
+        next_page_token: page.next_page_token,
     }))
 }
 
+/// Creates a namespace, stamped with the creating tenant as its owner.
+///
+/// Authorized against the caller's own tenant, which is correct here and only
+/// here: the namespace does not exist yet, so there is no recorded owner to
+/// authorize against, and the caller is asking to create it *in its own tenant*.
+/// Every later request on it authorizes against the owner written now.
 pub async fn create_namespace(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    RequestFacts(request): RequestFacts,
     headers: HeaderMap,
-    AxumJson(payload): AxumJson<CreateNamespacePayload>,
+    Json(payload): Json<CreateNamespacePayload>,
 ) -> Result<axum::response::Response> {
     use axum::http::header::CONTENT_TYPE;
     use axum::response::IntoResponse;
@@ -133,32 +175,42 @@ pub async fn create_namespace(
     validate_namespace(&payload.namespace)?;
     if let Some(ref props) = payload.properties {
         validate_properties(props)?;
+        // Ownership lives in a reserved property; a client that could write it
+        // could create a namespace already owned by another tenant.
+        reject_reserved(props.keys())?;
     }
 
     // Check for idempotency key
-    let idempotency_key = IdempotencyKey::from_headers(&headers, "POST", "/v1/namespaces");
+    let idempotency_key =
+        IdempotencyKey::from_headers(&headers, "POST", "/v1/namespaces", &principal);
 
-    // If idempotency key present, check cache first
-    if let Some(ref key) = idempotency_key {
-        if let Some(cached) = state.idempotency_cache.get(key) {
-            return Ok(cached.into_axum_response());
-        }
-    }
-
-    // Authorize the request
     let tenant_id = principal.tenant_id().to_string();
-    let resource = Resource::namespace(&tenant_id, payload.namespace.clone());
-    let ctx = AuthzContext::new(principal, resource, Action::Create);
-    state.authorizer.check(&ctx).await?;
+    guard::authorize_new(
+        &state,
+        &principal,
+        &request,
+        Resource::namespace(&tenant_id, payload.namespace.clone()),
+        Action::Create,
+    )
+    .await?;
+    // Consulted only after authorization: a cache hit answers without touching
+    // the catalog, so checking it first would serve a request that was never
+    // authorized — and would keep serving it after the grant was revoked.
+    if let Some(ref key) = idempotency_key
+        && let Some(cached) = state.idempotency_cache.get(key).await
+    {
+        return Ok(cached.into_axum_response());
+    }
 
     // Record metric
     state.metrics.catalog_create_namespace.inc();
 
     let namespace_ident = NamespaceIdent::from_vec(payload.namespace.clone())?;
 
-    // Add tenant_id to properties for ownership tracking
+    // Record the owning tenant. Client-supplied reserved keys were rejected above,
+    // so this cannot be overridden from the request.
     let mut properties: HashMap<String, String> = payload.properties.unwrap_or_default();
-    properties.insert(TENANT_ID_PROPERTY.to_string(), tenant_id);
+    set_owner(&mut properties, &tenant_id);
 
     // Create the namespace
     let namespace = state
@@ -166,9 +218,8 @@ pub async fn create_namespace(
         .create_namespace(&namespace_ident, properties.clone())
         .await?;
 
-    // Return properties without internal _tenant_id
     let mut response_props = namespace.properties().clone();
-    response_props.remove(TENANT_ID_PROPERTY);
+    strip_reserved(&mut response_props);
 
     let response_body = CreateNamespaceResponse {
         namespace: namespace.name().to_vec(),
@@ -183,14 +234,14 @@ pub async fn create_namespace(
     );
 
     // Cache if idempotency key was provided
-    if let Some(key) = idempotency_key {
-        if let Some(cached) = CachedResponse::from_json(StatusCode::OK, &response_body) {
-            state.idempotency_cache.set(key, cached);
-            response.headers_mut().insert(
-                IDEMPOTENCY_KEY_USED_HEADER,
-                axum::http::HeaderValue::from_static("true"),
-            );
-        }
+    if let Some(key) = idempotency_key
+        && let Some(cached) = CachedResponse::from_json(StatusCode::OK, &response_body)
+    {
+        state.idempotency_cache.set(key, cached).await;
+        response.headers_mut().insert(
+            IDEMPOTENCY_KEY_USED_HEADER,
+            axum::http::HeaderValue::from_static("true"),
+        );
     }
 
     Ok(response)
@@ -199,26 +250,23 @@ pub async fn create_namespace(
 pub async fn get_namespace(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    RequestFacts(request): RequestFacts,
     namespace: NamespacePath,
 ) -> Result<AxumJson<GetNamespaceResponse>> {
-    // Load namespace first to get its owner
+    guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &namespace,
+        Target::Namespace,
+        Action::Read,
+    )
+    .await?;
+
     let ns = state.catalog.get_namespace(&namespace).await?;
 
-    // Get the namespace's owner tenant
-    let owner_tenant = ns
-        .properties()
-        .get(TENANT_ID_PROPERTY)
-        .cloned()
-        .unwrap_or_else(|| principal.tenant_id().to_string()); // Legacy: assume current tenant if not set
-
-    // Authorize the request against the actual owner
-    let resource = Resource::namespace(&owner_tenant, namespace.clone().inner());
-    let ctx = AuthzContext::new(principal, resource, Action::Read);
-    state.authorizer.check(&ctx).await?;
-
-    // Return properties without internal _tenant_id
     let mut response_props = ns.properties().clone();
-    response_props.remove(TENANT_ID_PROPERTY);
+    strip_reserved(&mut response_props);
 
     Ok(AxumJson(GetNamespaceResponse {
         namespace: ns.name().to_vec(),
@@ -229,50 +277,38 @@ pub async fn get_namespace(
 pub async fn namespace_exists(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    RequestFacts(request): RequestFacts,
     namespace: NamespacePath,
 ) -> Result<StatusCode> {
-    // Try to load the namespace to check ownership
-    match state.catalog.get_namespace(&namespace).await {
-        Ok(ns) => {
-            // Get the namespace's owner tenant
-            let owner_tenant = ns
-                .properties()
-                .get(TENANT_ID_PROPERTY)
-                .cloned()
-                .unwrap_or_else(|| principal.tenant_id().to_string());
+    guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &namespace,
+        Target::Namespace,
+        Action::Read,
+    )
+    .await?;
 
-            // Authorize the request against the actual owner
-            let resource = Resource::namespace(&owner_tenant, namespace.clone().inner());
-            let ctx = AuthzContext::new(principal, resource, Action::Read);
-            state.authorizer.check(&ctx).await?;
-
-            Ok(StatusCode::OK)
-        }
-        Err(_) => Err(AppError::NoSuchNamespace(
-            "The given namespace does not exist".to_string(),
-        )),
-    }
+    // The Iceberg REST spec defines the HEAD responses as 204 No Content.
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn delete_namespace(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    RequestFacts(request): RequestFacts,
     namespace: NamespacePath,
 ) -> Result<StatusCode> {
-    // Load namespace first to get its owner
-    let ns = state.catalog.get_namespace(&namespace).await?;
-
-    // Get the namespace's owner tenant
-    let owner_tenant = ns
-        .properties()
-        .get(TENANT_ID_PROPERTY)
-        .cloned()
-        .unwrap_or_else(|| principal.tenant_id().to_string());
-
-    // Authorize the request against the actual owner
-    let resource = Resource::namespace(&owner_tenant, namespace.clone().inner());
-    let ctx = AuthzContext::new(principal, resource, Action::Delete);
-    state.authorizer.check(&ctx).await?;
+    guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &namespace,
+        Target::Namespace,
+        Action::Delete,
+    )
+    .await?;
 
     // Record metric
     state.metrics.catalog_delete_namespace.inc();
@@ -285,27 +321,28 @@ pub async fn delete_namespace(
 pub async fn update_namespace_properties(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    RequestFacts(request): RequestFacts,
     namespace: NamespacePath,
-    AxumJson(payload): AxumJson<UpdateNamespacePropertiesPayload>,
+    Json(payload): Json<UpdateNamespacePropertiesPayload>,
 ) -> Result<AxumJson<UpdateNamespacePropertiesResponse>> {
     // Validate input
     validate_properties(&payload.updates)?;
+    // Without these two checks, `updates` could set the ownership key to another
+    // tenant and `removals` could erase it — either one is a tenant takeover.
+    reject_reserved(payload.updates.keys())?;
+    reject_reserved(payload.removals.iter())?;
 
-    // Fetch the current namespace properties
+    guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &namespace,
+        Target::Namespace,
+        Action::Update,
+    )
+    .await?;
+
     let ns = state.catalog.get_namespace(&namespace).await?;
-
-    // Get the namespace's owner tenant
-    let owner_tenant = ns
-        .properties()
-        .get(TENANT_ID_PROPERTY)
-        .cloned()
-        .unwrap_or_else(|| principal.tenant_id().to_string());
-
-    // Authorize the request against the actual owner
-    let resource = Resource::namespace(&owner_tenant, namespace.clone().inner());
-    let ctx = AuthzContext::new(principal, resource, Action::Update);
-    state.authorizer.check(&ctx).await?;
-
     let mut properties = ns.properties().clone();
 
     let mut removed = Vec::new();
@@ -327,11 +364,14 @@ pub async fn update_namespace_properties(
         updated.push(key);
     }
 
-    // Update the namespace with the modified properties
+    // Defence in depth: even if a reserved key slipped through validation, the
+    // server-managed values are restored before the write.
+    preserve_reserved(ns.properties(), &mut properties);
+
     state
         .catalog
         .update_namespace(&namespace, properties)
-        .await?; // Automatically convert iceberg::Error to AppError
+        .await?;
 
     Ok(AxumJson(UpdateNamespacePropertiesResponse {
         updated,
@@ -564,11 +604,5 @@ mod tests {
         let payload: CreateNamespacePayload = serde_json::from_str(json).unwrap();
         let props = payload.properties.unwrap();
         assert_eq!(props.get("key"), Some(&"".to_string()));
-    }
-
-    #[test]
-    fn test_tenant_id_property_constant() {
-        // Verify the constant is correctly defined
-        assert_eq!(TENANT_ID_PROPERTY, "_tenant_id");
     }
 }

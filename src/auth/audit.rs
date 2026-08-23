@@ -215,6 +215,30 @@ pub struct AuditEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_id: Option<String>,
 
+    /// Policies that produced this decision.
+    ///
+    /// A first-class field rather than a `details` entry, because it is the one
+    /// an operator greps for: "which rule allowed this?" is the question an
+    /// audit trail exists to answer, and free-form details are neither stable
+    /// nor documented.
+    ///
+    /// On a permit these are the permits that matched. On a denial they are the
+    /// forbids that matched — and **empty on a denial means deny-by-default**:
+    /// nothing forbade the request and nothing permitted it. That is a
+    /// different situation to debug from an explicit `forbid`, so the record
+    /// makes it visible rather than collapsing both into "denied".
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub matched_policies: Vec<String>,
+
+    /// Identifier of the policy set in force when this decision was made.
+    ///
+    /// Content-derived, so two records sharing it were evaluated against
+    /// byte-identical rules — including across replicas. A record whose version
+    /// differs from today's was decided under policies that have since changed,
+    /// which is exactly what makes an old decision reproducible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_set_version: Option<String>,
+
     /// Additional details.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub details: HashMap<String, String>,
@@ -252,6 +276,8 @@ impl AuditEvent {
             request_id: None,
             resource_type: None,
             resource_id: None,
+            matched_policies: Vec::new(),
+            policy_set_version: None,
             details: HashMap::new(),
             error: None,
         }
@@ -329,6 +355,18 @@ impl AuditEvent {
         self
     }
 
+    /// Records the policies that produced the decision, and the policy set they
+    /// came from.
+    pub fn with_policy_provenance(
+        mut self,
+        matched: &[String],
+        policy_set_version: Option<String>,
+    ) -> Self {
+        self.matched_policies = matched.to_vec();
+        self.policy_set_version = policy_set_version;
+        self
+    }
+
     /// Sets the request ID for correlation.
     pub fn with_request_id<S: Into<String>>(mut self, id: S) -> Self {
         self.request_id = Some(id.into());
@@ -370,6 +408,23 @@ impl AuditEvent {
             self.severity = AuditSeverity::Error;
         }
         self
+    }
+
+    /// A record of an authorization decision.
+    ///
+    /// Both outcomes are recorded. A trail of denials alone answers "who was
+    /// turned away" but not "who read this table", which is where an
+    /// investigation actually starts.
+    pub fn decision(action: &str, resource_type: &str, resource: &str, allowed: bool) -> Self {
+        let outcome = if allowed {
+            AuditOutcome::Success
+        } else {
+            AuditOutcome::Denied
+        };
+        Self::new(AuditCategory::Authorization, AuditAction::PermissionCheck)
+            .with_outcome(outcome)
+            .with_resource(resource_type, resource)
+            .with_detail("action", action)
     }
 
     // ========================================================================
@@ -489,56 +544,6 @@ pub fn log_rate_limit(client_ip: &str, tenant_id: Option<&str>, limit_type: &str
     }
 
     event.emit();
-}
-
-/// Logs a namespace operation.
-pub fn log_namespace_operation(
-    action: AuditAction,
-    principal_id: &str,
-    tenant_id: &str,
-    namespace: &str,
-    outcome: AuditOutcome,
-) {
-    AuditEvent::data_access(action)
-        .with_principal_id(principal_id)
-        .with_tenant_id(tenant_id)
-        .with_namespace(namespace)
-        .with_outcome(outcome)
-        .emit();
-}
-
-/// Logs a table operation.
-pub fn log_table_operation(
-    action: AuditAction,
-    principal_id: &str,
-    tenant_id: &str,
-    namespace: &str,
-    table: &str,
-    outcome: AuditOutcome,
-) {
-    AuditEvent::data_access(action)
-        .with_principal_id(principal_id)
-        .with_tenant_id(tenant_id)
-        .with_table(namespace, table)
-        .with_outcome(outcome)
-        .emit();
-}
-
-/// Logs an API key management operation.
-pub fn log_api_key_operation(
-    action: AuditAction,
-    admin_principal_id: &str,
-    admin_tenant_id: &str,
-    target_key_id: &str,
-    target_tenant_id: &str,
-) {
-    AuditEvent::admin(action)
-        .with_principal_id(admin_principal_id)
-        .with_tenant_id(admin_tenant_id)
-        .with_resource("api_key", target_key_id)
-        .with_detail("target_tenant_id", target_tenant_id)
-        .with_outcome(AuditOutcome::Success)
-        .emit();
 }
 
 // ============================================================================

@@ -22,21 +22,21 @@
 //! key_path = "/path/to/key.pem"
 //!
 //! [storage]
-//! backend = "file:///var/lib/rustberg/data"  # or "s3://bucket/prefix?region=us-east-1"
+//! catalog_url = "file:///var/lib/rustberg/data"
+//! warehouse_location = "s3://my-bucket/warehouse"
 //!
-//! [kms]
-//! type = "env"
-//! # For production: type = "aws-kms", key_id = "alias/rustberg"
 //!
 //! [rate_limit]
 //! requests_per_second = 100
 //! burst_size = 200
 //! ```
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 fn default_true() -> bool {
     true
@@ -46,6 +46,7 @@ use crate::auth::JwtConfig;
 
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Server host address
     #[serde(default = "default_host")]
@@ -77,6 +78,7 @@ impl Default for ServerConfig {
 
 /// Authentication configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// Enable API key authentication (default: true)
     #[serde(default = "default_true")]
@@ -89,6 +91,88 @@ pub struct AuthConfig {
     /// JWT/OIDC configuration (required if jwt_enabled is true)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jwt: Option<JwtConfigSerde>,
+
+    /// Path to a Cedar policy file.
+    ///
+    /// When unset, the built-in default policies are used. When set, the file
+    /// *replaces* them — the defaults are not merged in, because silently
+    /// unioning a deployment's policies with grants it did not write is how an
+    /// authorization system ends up permitting more than its operator believes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_file: Option<std::path::PathBuf>,
+
+    /// API keys this server accepts.
+    ///
+    /// Keys are configuration, not state: there is no key store to encrypt, back
+    /// up, or guard with a "who may mint keys" policy, and rotation is a config
+    /// change plus a restart.
+    #[serde(default, rename = "api_keys")]
+    pub api_keys: Vec<ApiKeyConfig>,
+}
+
+/// One configured API key.
+///
+/// The secret itself is read from an environment variable rather than written
+/// here, so the config file can be committed and the credential lives in
+/// whatever secret manager the deployment already uses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiKeyConfig {
+    /// Human-readable name, for audit records.
+    pub name: String,
+
+    /// Tenant this key acts for.
+    pub tenant: String,
+
+    /// Roles the key carries. These become Cedar groups.
+    #[serde(default)]
+    pub roles: Vec<String>,
+
+    /// Environment variable holding the secret.
+    pub key_env: String,
+}
+
+impl ApiKeyConfig {
+    /// Reads the secret and builds the key.
+    ///
+    /// The plaintext is hashed immediately and never retained, so the running
+    /// process holds no usable credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::ValidationError`] if the environment variable is
+    /// unset or empty — failing closed, because a key that silently does not
+    /// exist looks identical to one that was revoked on purpose.
+    pub fn to_api_key(&self) -> Result<crate::auth::ApiKey, ConfigError> {
+        self.build_from(std::env::var(&self.key_env).ok().as_deref())
+    }
+
+    /// The rule, separated from the lookup, so a test can state it without
+    /// mutating the process environment — `set_var` races every other thread
+    /// reading it, which in a parallel test suite is all of them.
+    fn build_from(&self, secret: Option<&str>) -> Result<crate::auth::ApiKey, ConfigError> {
+        // `Zeroizing` wipes the plaintext when it drops, so the secret does not
+        // linger in freed heap memory after hashing. It is still readable in the
+        // process environment — that is the operator's boundary, not ours — but
+        // this keeps the window as short as we control.
+        let secret = Zeroizing::new(secret.map(str::to_string).ok_or_else(|| {
+            ConfigError::ValidationError(format!(
+                "API key '{}' expects its secret in ${}, which is not set",
+                self.name, self.key_env
+            ))
+        })?);
+
+        if secret.trim().is_empty() {
+            return Err(ConfigError::ValidationError(format!(
+                "API key '{}': ${} is empty",
+                self.name, self.key_env
+            )));
+        }
+
+        Ok(crate::auth::ApiKeyBuilder::new(&self.name, &self.tenant)
+            .with_roles(self.roles.clone())
+            .build_with_key(&secret))
+    }
 }
 
 impl Default for AuthConfig {
@@ -96,6 +180,8 @@ impl Default for AuthConfig {
         Self {
             api_key_enabled: true,
             jwt_enabled: false,
+            policy_file: None,
+            api_keys: Vec::new(),
             jwt: None,
         }
     }
@@ -103,6 +189,7 @@ impl Default for AuthConfig {
 
 /// JWT configuration (serializable version of JwtConfig)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JwtConfigSerde {
     /// OIDC issuer URL (e.g., "<https://accounts.google.com>")
     pub issuer: String,
@@ -128,6 +215,19 @@ pub struct JwtConfigSerde {
     /// JWKS cache TTL in seconds (default: 3600)
     #[serde(default = "default_jwks_cache_ttl")]
     pub jwks_cache_ttl_seconds: u64,
+
+    /// Your identity provider's OAuth2 token endpoint.
+    ///
+    /// Advertised to clients as `oauth2-server-uri` in `/v1/config`, so a client
+    /// configured with only a catalog URI can find where to authenticate. This
+    /// is the migration path the Iceberg spec recommends in place of the
+    /// deprecated `oauth/tokens` endpoint.
+    ///
+    /// Set explicitly rather than derived from `issuer`: deriving it would mean
+    /// OIDC discovery at startup, and a wrong guess sends credentials to the
+    /// wrong host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth2_server_uri: Option<String>,
 }
 
 impl From<JwtConfigSerde> for JwtConfig {
@@ -147,6 +247,7 @@ impl From<JwtConfigSerde> for JwtConfig {
 
 /// CORS configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CorsConfig {
     /// Allowed origins (default: ["*"])
     #[serde(default = "default_allowed_origins")]
@@ -177,7 +278,9 @@ fn default_host() -> String {
 }
 
 fn default_port() -> u16 {
-    8080
+    // The same value the CLI falls back to. Two defaults for one setting is how
+    // a deployment ends up on a port neither its config nor its flags name.
+    8000
 }
 
 fn default_tenant_id() -> String {
@@ -196,8 +299,17 @@ fn default_jwks_cache_ttl() -> u64 {
     3600
 }
 
+/// No cross-origin access by default.
+///
+/// CORS exists to let a *browser* make cross-origin requests. The clients here
+/// are Spark, Trino, PyIceberg and DuckDB, none of which is a browser, so a
+/// permissive default buys nothing — and production mode refuses to serve with
+/// wildcard CORS, so it would also make the default configuration unstartable in
+/// the default mode.
+///
+/// A deployment serving a browser UI sets `allowed_origins` explicitly.
 fn default_allowed_origins() -> Vec<String> {
-    vec!["*".to_string()]
+    Vec::new()
 }
 
 fn default_allowed_methods() -> Vec<String> {
@@ -220,6 +332,7 @@ fn default_allowed_headers() -> Vec<String> {
 
 /// Full configuration file structure.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RustbergConfig {
     /// Server configuration.
     #[serde(default)]
@@ -229,13 +342,9 @@ pub struct RustbergConfig {
     #[serde(default)]
     pub tls: TlsConfigFile,
 
-    /// Storage backend configuration.
+    /// Catalog and warehouse locations.
     #[serde(default)]
     pub storage: StorageConfig,
-
-    /// KMS configuration.
-    #[serde(default)]
-    pub kms: KmsConfigFile,
 
     /// Rate limiting configuration.
     #[serde(default)]
@@ -244,10 +353,313 @@ pub struct RustbergConfig {
     /// Logging configuration.
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    /// Where authorization decisions are recorded.
+    #[serde(default)]
+    pub audit: AuditConfig,
+
+    /// Storage credential vending.
+    #[serde(default)]
+    pub credentials: CredentialsConfig,
+
+    /// Federated mounts, keyed by top-level namespace.
+    ///
+    /// Empty — the default — means one catalog and no routing.
+    #[serde(default)]
+    pub mount: std::collections::HashMap<String, MountConfig>,
+}
+
+// ============================================================================
+// Federation
+// ============================================================================
+
+/// One mounted catalog.
+///
+/// The key in `[mount.<name>]` becomes the top-level namespace. Everything
+/// beneath it is served by this backend, with the mount name stripped on the way
+/// down — a mounted catalog has its own namespaces and has never heard of the
+/// name it is mounted under.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MountConfig {
+    /// Backend type.
+    ///
+    /// - `native` — another Rustberg catalog: a redb file or a Postgres
+    ///   database, addressed exactly like `storage.catalog_url`.
+    /// - `rest` — somebody else's Iceberg REST catalog, served **read-only**.
+    #[serde(default = "default_mount_backend")]
+    pub backend: String,
+
+    /// Where the backend lives.
+    ///
+    /// For `native`: `file:///path`, `memory://`, or a Postgres DSN.
+    /// For `rest`: the base URI, e.g. `https://catalog.partner.example`.
+    pub catalog_url: String,
+
+    /// Warehouse for tables in this mount.
+    ///
+    /// Separate from the main warehouse, because the point of a mount is usually
+    /// that its data lives somewhere else. Unused by `rest`, which reads
+    /// locations from the remote's own metadata.
+    #[serde(default)]
+    pub warehouse_location: String,
+
+    /// Environment variable holding a bearer token for a `rest` mount.
+    ///
+    /// Named rather than inlined, so this file holds no credential. A variable
+    /// that is set but empty is a startup failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env: Option<String>,
+
+    /// Tenant that owns everything in this mount.
+    ///
+    /// Authoritative for the whole mount, not a default. A mount is a separate
+    /// catalog whose namespace properties Rustberg does not control, so reading
+    /// ownership from inside it would let whoever can write there decide who
+    /// owns it here.
+    pub owner: String,
+
+    /// Refuse every mutating operation on this mount.
+    ///
+    /// For mounting a catalog that another system owns: reads are served, and a
+    /// write is refused with `501` naming the mount rather than reaching a
+    /// catalog somebody else is responsible for.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+fn default_mount_backend() -> String {
+    "native".to_string()
+}
+
+// ============================================================================
+// Credential vending
+// ============================================================================
+
+/// Storage credential vending.
+///
+/// When a provider is configured, a client that asks for delegation
+/// (`X-Iceberg-Access-Delegation: vended-credentials`) receives a short-lived
+/// credential scoped to the one table it named — never the server's own rights.
+/// With no provider, nothing is vended and the credentials endpoint answers
+/// `501`, which is the honest report for a deployment where engines carry their
+/// own storage credentials.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialsConfig {
+    /// Which provider to use: `none` (default), `aws`, or `gcs`.
+    #[serde(default = "default_credentials_provider")]
+    pub provider: String,
+
+    /// Locations this server will ever mint a credential for.
+    ///
+    /// Left empty — the normal case — this becomes every warehouse the server
+    /// manages: its own, plus each mount's. That is the right default and not
+    /// merely a convenient one: the catalog already refuses to record a table
+    /// outside one of them, so a wider prefix could only ever authorize a
+    /// location the catalog will not serve.
+    ///
+    /// Set it only to *narrow* vending. Setting it replaces the list entirely,
+    /// so a federated deployment that sets it must name each mount's warehouse
+    /// it wants credentials for — omitting one makes that mount's tables
+    /// silently un-credentialed.
+    #[serde(default)]
+    pub allowed_prefixes: Vec<String>,
+
+    /// AWS STS settings, required when `provider = "aws"`.
+    #[serde(default)]
+    pub aws: Option<AwsCredentialsConfig>,
+
+    /// GCS settings, required when `provider = "gcs"`.
+    #[serde(default)]
+    pub gcs: Option<GcsCredentialsConfig>,
+
+    /// Azure settings, required when `provider = "azure"`.
+    #[serde(default)]
+    pub azure: Option<AzureCredentialsConfig>,
+
+    /// Remote request signing.
+    ///
+    /// Independent of `provider`: a deployment may offer signing, vending, both,
+    /// or neither, and a client picks with `X-Iceberg-Access-Delegation`. Signing
+    /// is the stronger form — the engine holds no credential and every object
+    /// request is authorized here — and the more expensive one, at a round trip
+    /// per object.
+    #[serde(default)]
+    pub signing: Option<SigningConfig>,
+}
+
+/// Remote request signing (`POST …/tables/{table}/sign`).
+///
+/// Only S3 and S3-compatible storage today. GCS and ADLS have no equivalent
+/// request-signing protocol in the Iceberg spec, so a deployment on those uses
+/// vending.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SigningConfig {
+    /// Whether to serve the sign endpoint.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Region to sign for when a client does not name one.
+    ///
+    /// A client normally sends the region it resolved, and that value is used.
+    /// This is the fallback for clients that send an empty one.
+    #[serde(default)]
+    pub region: Option<String>,
+
+    /// How to read a bucket out of a request URI: `auto`, `path` or
+    /// `virtual-host`.
+    ///
+    /// `auto` recognises AWS's own hostnames and falls back to path style for
+    /// anything else, which is what MinIO, Ceph and R2 deployments use. Set it
+    /// explicitly when a custom endpoint serves virtual-host style, because
+    /// guessing wrong here fails **closed** — the bucket is read from the wrong
+    /// place, the location does not match the table, and the request is
+    /// refused rather than mis-signed.
+    #[serde(default = "default_url_style")]
+    pub url_style: String,
+
+    /// Host of a custom S3 endpoint, when one is used.
+    ///
+    /// Lets `auto` tell `minio:9000/bucket/key` (path style) from
+    /// `bucket.minio:9000/key` (virtual-host style) on the same endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_host: Option<String>,
+}
+
+fn default_url_style() -> String {
+    "auto".to_string()
+}
+
+impl Default for SigningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            region: None,
+            url_style: default_url_style(),
+            endpoint_host: None,
+        }
+    }
+}
+
+fn default_credentials_provider() -> String {
+    "none".to_string()
+}
+
+/// AWS STS credential vending.
+///
+/// Rustberg calls `AssumeRole` with an inline session policy scoped to the
+/// requested table's prefix, so the returned credential is the intersection of
+/// this role and that one prefix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AwsCredentialsConfig {
+    /// Region for the STS endpoint.
+    pub region: String,
+
+    /// Role to assume. It needs access to the warehouse; the session policy
+    /// narrows each vended credential to one table beneath it.
+    pub role_arn: String,
+
+    /// Environment variable holding the STS external ID, for cross-account
+    /// assumption. Named rather than inlined so this file holds no secret; a
+    /// variable that is set but empty is a startup failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id_env: Option<String>,
+
+    /// Lifetime of a vended credential, in seconds.
+    #[serde(default = "default_credential_duration")]
+    pub duration_seconds: i32,
+}
+
+/// GCS credential vending, via a Credential Access Boundary token exchange.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GcsCredentialsConfig {
+    /// Path to the service-account JSON key used as the exchange's input.
+    pub service_account_key_path: String,
+}
+
+/// Azure credential vending, via user-delegation SAS.
+///
+/// Rustberg authenticates as a Microsoft Entra service principal, asks the
+/// storage account for a user delegation key, and signs a SAS scoped to one
+/// table prefix. It has no code path that can emit an account key: that would
+/// grant the whole storage account to anyone permitted to read one table.
+///
+/// The principal needs **Storage Blob Data Contributor** (or Reader, for a
+/// read-only deployment) on the account — a SAS can only ever narrow those
+/// rights, never widen them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AzureCredentialsConfig {
+    /// Storage account name, without the domain.
+    pub account: String,
+
+    /// Microsoft Entra tenant the service principal lives in.
+    pub tenant_id: String,
+
+    /// The service principal's application (client) ID.
+    pub client_id: String,
+
+    /// Environment variable holding the service principal's secret. Named
+    /// rather than inlined, so this file holds no credential.
+    pub client_secret_env: String,
+
+    /// Lifetime of a vended SAS, in seconds.
+    #[serde(default = "default_azure_duration")]
+    pub duration_seconds: i64,
+}
+
+/// One hour, matching the other providers.
+fn default_azure_duration() -> i64 {
+    3600
+}
+
+/// One hour: long enough for a large write, short enough that a leaked
+/// credential expires before it is useful.
+fn default_credential_duration() -> i32 {
+    3600
+}
+
+/// Where authorization decisions are recorded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditConfig {
+    /// Sink: `stdout`, `file`, or `none`.
+    #[serde(default = "default_audit_sink")]
+    pub sink: String,
+
+    /// Path for the `file` sink.
+    #[serde(default)]
+    pub path: Option<std::path::PathBuf>,
+
+    /// Refuse a mutating request whose record could not be written.
+    ///
+    /// An unrecorded change is the one event an audit exists to capture, so the
+    /// default is to refuse. Reads are unaffected either way.
+    #[serde(default = "default_true")]
+    pub fail_closed: bool,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            sink: default_audit_sink(),
+            path: None,
+            fail_closed: true,
+        }
+    }
+}
+
+fn default_audit_sink() -> String {
+    "stdout".to_string()
 }
 
 /// TLS configuration from file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfigFile {
     /// Enable TLS.
     #[serde(default)]
@@ -277,154 +689,66 @@ impl Default for TlsConfigFile {
     }
 }
 
-/// Storage backend configuration.
+/// Catalog and warehouse locations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
-    /// Storage backend URL.
+    /// Where the catalog database lives.
     ///
-    /// Supported schemes:
-    /// - `file:///path` - Local filesystem (single-node, default)
-    /// - `s3://bucket/prefix?region=us-east-1` - Amazon S3 (K8s HA)
-    /// - `gs://bucket/prefix` - Google Cloud Storage (K8s HA)
-    /// - `az://container/prefix` - Azure Blob Storage (K8s HA)
-    /// - `memory://` - In-memory only (testing)
-    #[serde(default = "default_storage_type")]
-    pub backend: String,
+    /// The catalog is a local redb file, so only two forms are valid:
+    /// - `file:///path/to/dir` — a directory holding `catalog.redb` (default)
+    /// - `memory://` — ephemeral, discarded on shutdown; for tests only
+    ///
+    /// Object-store URLs are **not** valid here and are rejected at startup.
+    /// Earlier versions advertised `s3://`/`gs://`/`az://` for this field, from
+    /// when catalog state itself lived on object storage. The *warehouse* still
+    /// may — see [`warehouse_location`](Self::warehouse_location).
+    #[serde(default = "default_catalog_url")]
+    pub catalog_url: String,
 
-    /// Warehouse location for table data.
+    /// Warehouse location for table data and metadata.
+    ///
+    /// Any storage scheme compiled in: `file://`, `s3://`, `gs://`, `az://`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warehouse_location: Option<String>,
 
-    /// AWS region for S3 object store (can also be in URL query string).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub aws_region: Option<String>,
-
-    /// Local cache directory for SlateDB (optional, improves read latency).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_dir: Option<String>,
-
-    /// Timeout in seconds for metadata read operations (e.g., loading table metadata).
-    /// Default: 60 seconds. Increase for high-latency storage backends.
-    #[serde(default = "default_read_timeout_secs")]
-    pub read_timeout_secs: u64,
-
-    /// Timeout in seconds for metadata write operations (e.g., committing table changes).
-    /// Default: 30 seconds.
-    #[serde(default = "default_write_timeout_secs")]
-    pub write_timeout_secs: u64,
+    /// Object-store configuration, by Iceberg property name.
+    ///
+    /// Passed to the `FileIO` every catalog in this process reads and writes
+    /// through: `s3.endpoint`, `s3.region`, `s3.path-style-access`,
+    /// `gcs.project-id`, and so on. Without it a warehouse on object storage
+    /// works only when the backend finds ambient credentials, and an
+    /// S3-compatible endpoint — MinIO, Ceph, R2 — cannot be reached at all.
+    ///
+    /// One set for the whole process. Keys are scheme-prefixed, so different
+    /// clouds compose; two accounts on the *same* cloud do not, and need a
+    /// process each.
+    ///
+    /// Secrets belong in the environment rather than in this file. A value of
+    /// the form `env:NAME` is read from that environment variable at startup,
+    /// and a variable that is unset or empty is a startup failure rather than a
+    /// silently absent property.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub properties: HashMap<String, String>,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            backend: default_storage_type(),
+            catalog_url: default_catalog_url(),
             warehouse_location: None,
-            aws_region: None,
-            cache_dir: None,
-            read_timeout_secs: default_read_timeout_secs(),
-            write_timeout_secs: default_write_timeout_secs(),
+            properties: HashMap::new(),
         }
     }
 }
 
-fn default_storage_type() -> String {
+fn default_catalog_url() -> String {
     "file:///var/lib/rustberg/data".to_string()
-}
-
-fn default_read_timeout_secs() -> u64 {
-    60
-}
-
-fn default_write_timeout_secs() -> u64 {
-    30
-}
-
-/// KMS configuration from file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KmsConfigFile {
-    /// KMS provider type: "env", "aws-kms", "vault", "gcp-kms", "azure-keyvault".
-    #[serde(default = "default_kms_type")]
-    pub provider: String,
-
-    /// AWS KMS key ID (for aws-kms provider).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub aws_key_id: Option<String>,
-
-    /// AWS region (for aws-kms provider).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub aws_region: Option<String>,
-
-    /// Vault address (for vault provider).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vault_address: Option<String>,
-
-    /// Vault key name (for vault provider).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vault_key_name: Option<String>,
-
-    /// GCP project ID (for gcp-kms provider).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gcp_project_id: Option<String>,
-
-    /// GCP location/region (for gcp-kms provider).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gcp_location: Option<String>,
-
-    /// GCP key ring name (for gcp-kms provider).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gcp_key_ring: Option<String>,
-
-    /// GCP key name (for gcp-kms provider).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gcp_key_name: Option<String>,
-
-    /// Azure Key Vault URL (for azure-keyvault provider).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub azure_vault_url: Option<String>,
-
-    /// Azure key name (for azure-keyvault provider).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub azure_key_name: Option<String>,
-
-    /// Cache TTL in seconds (default: 300).
-    #[serde(default = "default_kms_cache_ttl")]
-    pub cache_ttl_seconds: u64,
-
-    /// Enable circuit breaker.
-    #[serde(default = "default_true")]
-    pub circuit_breaker_enabled: bool,
-}
-
-impl Default for KmsConfigFile {
-    fn default() -> Self {
-        Self {
-            provider: default_kms_type(),
-            aws_key_id: None,
-            aws_region: None,
-            vault_address: None,
-            vault_key_name: None,
-            gcp_project_id: None,
-            gcp_location: None,
-            gcp_key_ring: None,
-            gcp_key_name: None,
-            azure_vault_url: None,
-            azure_key_name: None,
-            cache_ttl_seconds: default_kms_cache_ttl(),
-            circuit_breaker_enabled: true,
-        }
-    }
-}
-
-fn default_kms_type() -> String {
-    "env".to_string()
-}
-
-fn default_kms_cache_ttl() -> u64 {
-    300
 }
 
 /// Rate limiting configuration from file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitConfigFile {
     /// Enable rate limiting.
     #[serde(default = "default_true")]
@@ -493,6 +817,7 @@ fn default_lockout_duration() -> u64 {
 
 /// Logging configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Log level: "trace", "debug", "info", "warn", "error".
     #[serde(default = "default_log_level")]
@@ -514,6 +839,49 @@ impl Default for LoggingConfig {
             json_format: false,
             with_span_events: true,
         }
+    }
+}
+
+impl StorageConfig {
+    /// Marks a property value that names an environment variable to read.
+    const ENV_PREFIX: &'static str = "env:";
+
+    /// The storage properties with every `env:NAME` value resolved.
+    ///
+    /// Object-store configuration is mostly not secret — an endpoint, a region,
+    /// a bucket-addressing style — but the access key beside it is, and a
+    /// deployment should not have to choose between committing its config file
+    /// and configuring its storage. `env:` follows the same rule the rest of
+    /// this file already applies to secrets ([`crate::config::secret`]): a named
+    /// variable that is unset or blank is a startup failure, never a silently
+    /// absent property.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::AppError`] naming the property and the variable when a named
+    /// variable is unset or empty.
+    pub fn resolved_properties(&self) -> Result<HashMap<String, String>, crate::error::AppError> {
+        self.resolve_with(|var| std::env::var(var).ok())
+    }
+
+    /// The rule, separated from the lookup. See
+    /// [`ApiKeyConfig::build_from`](ApiKeyConfig::to_api_key) for why.
+    fn resolve_with(
+        &self,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<HashMap<String, String>, crate::error::AppError> {
+        self.properties
+            .iter()
+            .map(|(key, value)| match value.strip_prefix(Self::ENV_PREFIX) {
+                Some(var) => crate::config::secret::resolve(
+                    lookup(var).as_deref(),
+                    var,
+                    &format!("storage.properties.{key}"),
+                )
+                .map(|resolved| (key.clone(), resolved)),
+                None => Ok((key.clone(), value.clone())),
+            })
+            .collect()
     }
 }
 
@@ -585,11 +953,11 @@ impl RustbergConfig {
         ];
 
         for path in search_paths {
-            if Path::new(path).exists() {
-                if let Ok(config) = Self::from_file(path) {
-                    tracing::info!(path = %path, "Discovered configuration file");
-                    return config;
-                }
+            if Path::new(path).exists()
+                && let Ok(config) = Self::from_file(path)
+            {
+                tracing::info!(path = %path, "Discovered configuration file");
+                return config;
             }
         }
 
@@ -598,44 +966,17 @@ impl RustbergConfig {
     }
 
     /// Validates the configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::ValidationError`] describing the first problem found.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        // Validate TLS configuration
-        if self.tls.enabled {
-            if self.tls.cert_path.is_none() && !self.tls.insecure_http {
-                return Err(ConfigError::ValidationError(
-                    "TLS enabled but no cert_path provided and insecure_http is false".to_string(),
-                ));
-            }
-            if self.tls.key_path.is_none() && self.tls.cert_path.is_some() {
-                return Err(ConfigError::ValidationError(
-                    "TLS cert_path provided but no key_path".to_string(),
-                ));
-            }
-        }
-
-        // Validate KMS configuration
-        match self.kms.provider.as_str() {
-            "env" => { /* No additional config needed */ }
-            "aws-kms" => {
-                if self.kms.aws_key_id.is_none() {
-                    return Err(ConfigError::ValidationError(
-                        "AWS KMS provider requires aws_key_id".to_string(),
-                    ));
-                }
-            }
-            "vault" => {
-                if self.kms.vault_address.is_none() || self.kms.vault_key_name.is_none() {
-                    return Err(ConfigError::ValidationError(
-                        "Vault provider requires vault_address and vault_key_name".to_string(),
-                    ));
-                }
-            }
-            provider => {
-                return Err(ConfigError::ValidationError(format!(
-                    "Unknown KMS provider: {}",
-                    provider
-                )));
-            }
+        // TLS needs both halves of the keypair, or neither.
+        if self.tls.enabled && (self.tls.cert_path.is_none() != self.tls.key_path.is_none()) {
+            return Err(ConfigError::ValidationError(
+                "TLS requires both cert_path and key_path, or neither (for a self-signed cert)"
+                    .to_string(),
+            ));
         }
 
         // Validate rate limit configuration
@@ -663,6 +1004,8 @@ impl RustbergConfig {
                     api_key_enabled: true,
                     jwt_enabled: false,
                     jwt: None,
+                    policy_file: None,
+                    api_keys: Vec::new(),
                 },
                 cors: CorsConfig::default(),
             },
@@ -673,30 +1016,26 @@ impl RustbergConfig {
                 insecure_http: false,
             },
             storage: StorageConfig {
-                backend: "file:///var/lib/rustberg/data".to_string(),
+                catalog_url: default_catalog_url(),
                 warehouse_location: Some("s3://my-bucket/warehouse".to_string()),
-                aws_region: None,
-                cache_dir: None,
-                read_timeout_secs: default_read_timeout_secs(),
-                write_timeout_secs: default_write_timeout_secs(),
-            },
-            kms: KmsConfigFile {
-                provider: "env".to_string(),
-                aws_key_id: None,
-                aws_region: None,
-                vault_address: None,
-                vault_key_name: None,
-                gcp_project_id: None,
-                gcp_location: None,
-                gcp_key_ring: None,
-                gcp_key_name: None,
-                azure_vault_url: None,
-                azure_key_name: None,
-                cache_ttl_seconds: 300,
-                circuit_breaker_enabled: true,
+                properties: HashMap::from([
+                    ("s3.region".to_string(), "us-east-1".to_string()),
+                    (
+                        "s3.access-key-id".to_string(),
+                        "env:RUSTBERG_S3_ACCESS_KEY_ID".to_string(),
+                    ),
+                ]),
             },
             rate_limit: RateLimitConfigFile::default(),
             logging: LoggingConfig::default(),
+            audit: AuditConfig::default(),
+            // The sample ships vending off. It needs a real role ARN or key
+            // file, and a sample that looks configured but names a role nobody
+            // owns fails at startup for a reason the operator did not choose.
+            credentials: CredentialsConfig::default(),
+            // No mounts in the sample: federation is opt-in, and a sample
+            // naming catalogs nobody has would fail at startup.
+            mount: std::collections::HashMap::new(),
         };
 
         sample.to_toml().unwrap_or_default()
@@ -711,10 +1050,78 @@ mod tests {
     fn test_default_server_config() {
         let config = ServerConfig::default();
         assert_eq!(config.host, "0.0.0.0");
-        assert_eq!(config.port, 8080);
+        assert_eq!(config.port, 8000);
         assert!(config.auth.api_key_enabled);
         assert!(!config.auth.jwt_enabled);
         assert!(config.auth.jwt.is_none());
+    }
+
+    // ── Storage properties ────────────────────────────────────────────────
+
+    /// The gap this closed: three storage Cargo features and a documented
+    /// `warehouse_location = "s3://…"` with no way to say *which* S3 — so an
+    /// S3-compatible endpoint could not be reached at all.
+    #[test]
+    fn plain_storage_properties_pass_through() {
+        let storage = StorageConfig {
+            catalog_url: default_catalog_url(),
+            warehouse_location: None,
+            properties: HashMap::from([
+                (
+                    "s3.endpoint".to_string(),
+                    "http://localhost:9000".to_string(),
+                ),
+                ("s3.path-style-access".to_string(), "true".to_string()),
+            ]),
+        };
+
+        let resolved = storage.resolved_properties().unwrap();
+        assert_eq!(
+            resolved.get("s3.endpoint").map(String::as_str),
+            Some("http://localhost:9000")
+        );
+        assert_eq!(
+            resolved.get("s3.path-style-access").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn an_env_property_is_read_from_the_environment() {
+        let storage = StorageConfig {
+            catalog_url: default_catalog_url(),
+            warehouse_location: None,
+            properties: HashMap::from([(
+                "s3.access-key-id".to_string(),
+                "env:RUSTBERG_TEST_S3_KEY".to_string(),
+            )]),
+        };
+
+        let resolved = storage
+            .resolve_with(|var| (var == "RUSTBERG_TEST_S3_KEY").then(|| "AKIAEXAMPLE".to_string()))
+            .unwrap();
+        assert_eq!(
+            resolved.get("s3.access-key-id").map(String::as_str),
+            Some("AKIAEXAMPLE")
+        );
+    }
+
+    /// A named-but-missing secret is a startup failure, never a silently absent
+    /// property — the same rule `config::secret` applies everywhere else.
+    #[test]
+    fn a_missing_env_property_names_itself_and_its_setting() {
+        let storage = StorageConfig {
+            catalog_url: default_catalog_url(),
+            warehouse_location: None,
+            properties: HashMap::from([(
+                "s3.secret-access-key".to_string(),
+                "env:RUSTBERG_TEST_DEFINITELY_UNSET_STORAGE".to_string(),
+            )]),
+        };
+
+        let message = storage.resolved_properties().unwrap_err().to_string();
+        assert!(message.contains("RUSTBERG_TEST_DEFINITELY_UNSET_STORAGE"));
+        assert!(message.contains("storage.properties.s3.secret-access-key"));
     }
 
     #[test]
@@ -727,6 +1134,7 @@ mod tests {
             tenant_claim: "custom_tenant".to_string(),
             roles_claim: "custom_roles".to_string(),
             jwks_cache_ttl_seconds: 7200,
+            oauth2_server_uri: None,
         };
 
         let jwt_config: JwtConfig = jwt_config_serde.into();
@@ -746,6 +1154,8 @@ mod tests {
             auth: AuthConfig {
                 api_key_enabled: true,
                 jwt_enabled: true,
+                policy_file: None,
+                api_keys: Vec::new(),
                 jwt: Some(JwtConfigSerde {
                     issuer: "https://issuer.example.com".to_string(),
                     audience: "rustberg-api".to_string(),
@@ -754,6 +1164,7 @@ mod tests {
                     tenant_claim: "tenant_id".to_string(),
                     roles_claim: "roles".to_string(),
                     jwks_cache_ttl_seconds: 3600,
+                    oauth2_server_uri: None,
                 }),
             },
             cors: CorsConfig::default(),
@@ -785,10 +1196,7 @@ mod tests {
             insecure_http = true
 
             [storage]
-            backend = "file:///tmp/rustberg"
-
-            [kms]
-            provider = "env"
+            catalog_url = "file:///tmp/rustberg"
 
             [rate_limit]
             enabled = true
@@ -802,8 +1210,7 @@ mod tests {
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 9000);
         assert!(!config.tls.enabled);
-        assert!(config.storage.backend.starts_with("file://"));
-        assert_eq!(config.kms.provider, "env");
+        assert!(config.storage.catalog_url.starts_with("file://"));
         assert_eq!(config.rate_limit.requests_per_second, 50);
         assert_eq!(config.logging.level, "debug");
     }
@@ -825,27 +1232,11 @@ mod tests {
     }
 
     #[test]
-    fn test_rustberg_config_validation_kms() {
-        let config = RustbergConfig {
-            kms: KmsConfigFile {
-                provider: "aws-kms".to_string(),
-                aws_key_id: None, // Missing required field
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let result = config.validate();
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_rustberg_config_sample() {
         let sample = RustbergConfig::sample();
         assert!(sample.contains("[server]"));
         assert!(sample.contains("[tls]"));
         assert!(sample.contains("[storage]"));
-        assert!(sample.contains("[kms]"));
     }
 
     #[test]
@@ -856,6 +1247,241 @@ mod tests {
 
         assert_eq!(config.server.host, parsed.server.host);
         assert_eq!(config.server.port, parsed.server.port);
-        assert_eq!(config.kms.provider, parsed.kms.provider);
+    }
+    // ── API keys from configuration ──────────────────────────────────────
+
+    #[test]
+    fn api_keys_parse_from_toml() {
+        let toml = r#"
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[[server.auth.api_keys]]
+name = "ci"
+tenant = "acme"
+roles = ["writer"]
+key_env = "RUSTBERG_KEY_CI"
+"#;
+        let config: RustbergConfig = toml::from_str(toml).unwrap();
+        let keys = &config.server.auth.api_keys;
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "ci");
+        assert_eq!(keys[0].tenant, "acme");
+        assert_eq!(keys[0].roles, vec!["writer"]);
+        assert_eq!(keys[0].key_env, "RUSTBERG_KEY_CI");
+    }
+
+    #[test]
+    fn no_api_keys_is_valid() {
+        let config: RustbergConfig =
+            toml::from_str("[server]\nhost = \"0.0.0.0\"\nport = 8000\n").unwrap();
+        assert!(config.server.auth.api_keys.is_empty());
+    }
+
+    /// The secret lives in the environment, so the config file itself never
+    /// holds a usable credential.
+    #[test]
+    fn key_is_built_from_the_environment() {
+        let cfg = ApiKeyConfig {
+            name: "ci".into(),
+            tenant: "acme".into(),
+            roles: vec!["reader".into()],
+            key_env: "RUSTBERG_TEST_KEY_PRESENT".into(),
+        };
+
+        let key = cfg
+            .build_from(Some("rb_supersecretvalue"))
+            .expect("secret is set");
+        assert_eq!(key.name, "ci");
+        assert_eq!(key.tenant_id, "acme");
+        assert_eq!(key.roles, vec!["reader".to_string()]);
+        // Only the hash is retained.
+        assert_ne!(key.key_hash, "rb_supersecretvalue");
+        assert!(!key.key_hash.is_empty());
+    }
+
+    /// A missing secret must fail loudly: a key that silently does not exist is
+    /// indistinguishable from one revoked on purpose.
+    #[test]
+    fn missing_secret_is_rejected() {
+        let cfg = ApiKeyConfig {
+            name: "ci".into(),
+            tenant: "acme".into(),
+            roles: vec![],
+            key_env: "RUSTBERG_TEST_KEY_DEFINITELY_UNSET".into(),
+        };
+
+        let err = cfg.to_api_key().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("RUSTBERG_TEST_KEY_DEFINITELY_UNSET")
+        );
+    }
+
+    #[test]
+    fn empty_secret_is_rejected() {
+        let cfg = ApiKeyConfig {
+            name: "ci".into(),
+            tenant: "acme".into(),
+            roles: vec![],
+            key_env: "RUSTBERG_TEST_KEY_EMPTY".into(),
+        };
+
+        assert!(cfg.build_from(Some("   ")).is_err());
+        assert!(cfg.build_from(None).is_err());
+    }
+    /// An unknown key is an error rather than a silent no-op, so a typo or a
+    /// setting that does not exist fails at startup instead of being ignored.
+    #[test]
+    fn an_unknown_storage_key_is_rejected() {
+        let err = RustbergConfig::parse_str(
+            r#"
+            [storage]
+            backend = "file:///srv/rustberg"
+        "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("backend"), "{err}");
+    }
+
+    /// An unset `[storage]` section must still name a durable path. If it
+    /// defaulted to nothing, the server would fall back to a temp catalog and
+    /// lose every table on restart.
+    #[test]
+    fn storage_defaults_to_a_durable_path() {
+        let config = RustbergConfig::parse_str("[server]\nport = 8000\n").unwrap();
+        assert_eq!(config.storage.catalog_url, "file:///var/lib/rustberg/data");
+    }
+    // ── Documented configuration must parse ─────────────────────────────
+
+    /// Every ```toml block in the docs is parsed against the real schema.
+    ///
+    /// A documented key that is not a real key fails the build. Without this,
+    /// documentation drifts silently: `deny_unknown_fields` catches it at load
+    /// time for an operator, but only this test catches it for a reader.
+    #[test]
+    fn documented_toml_matches_the_schema() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        // TOML embedded in a Kubernetes ConfigMap is what an operator copies, so
+        // it is checked alongside the fenced blocks.
+        fn configmap_blocks(doc: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut rest = doc;
+            while let Some(at) = rest.find("config.toml: |") {
+                rest = &rest[at + "config.toml: |".len()..];
+                let mut block = String::new();
+                for line in rest.lines() {
+                    // The block ends at the first line that is neither blank nor
+                    // indented into it.
+                    if !line.trim().is_empty() && !line.starts_with("    ") {
+                        break;
+                    }
+                    block.push_str(line.trim_start());
+                    block.push('\n');
+                }
+                out.push(block);
+            }
+            out
+        }
+
+        let mut sources: Vec<(String, String)> = vec![(
+            "config.example.toml".to_string(),
+            std::fs::read_to_string(root.join("config.example.toml")).expect("read example config"),
+        )];
+
+        // The whole documentation tree, discovered rather than listed: a page
+        // added later is covered without anyone remembering to add it here.
+        let mut files: Vec<std::path::PathBuf> =
+            std::fs::read_dir(root.join("site").join("content").join("docs"))
+                .expect("read the documentation directory")
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|e| e == "md"))
+                .collect();
+        files.push(root.join("README.md"));
+        files.sort();
+
+        for path in files {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let label = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            for (n, block) in extract_toml_blocks(&text).into_iter().enumerate() {
+                sources.push((format!("{label} block {}", n + 1), block));
+            }
+            for (n, block) in configmap_blocks(&text).into_iter().enumerate() {
+                sources.push((format!("{label} ConfigMap {}", n + 1), block));
+            }
+        }
+
+        assert!(sources.len() > 10, "expected to find documented TOML");
+
+        let mut failures = Vec::new();
+        for (label, body) in &sources {
+            if let Err(e) = toml::from_str::<RustbergConfig>(body) {
+                failures.push(format!("{label}: {e}"));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "documented TOML does not match the config schema:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Pulls fenced ```toml blocks out of markdown.
+    ///
+    /// Blocks tagged `toml,ignore` are skipped: those are deliberate fragments
+    /// (a single section shown out of context) rather than whole configs.
+    fn extract_toml_blocks(markdown: &str) -> Vec<String> {
+        let mut blocks = Vec::new();
+        let mut current: Option<String> = None;
+
+        for line in markdown.lines() {
+            match current.as_mut() {
+                Some(buf) => {
+                    if line.trim_start().starts_with("```") {
+                        blocks.push(std::mem::take(buf));
+                        current = None;
+                    } else {
+                        buf.push_str(line);
+                        buf.push('\n');
+                    }
+                }
+                None => {
+                    if line.trim() == "```toml" {
+                        current = Some(String::new());
+                    }
+                }
+            }
+        }
+
+        blocks
+    }
+
+    /// A key that does not exist must be rejected, not ignored. Silently
+    /// accepting a typo means an operator's setting never takes effect and
+    /// nothing says so.
+    #[test]
+    fn unknown_keys_are_rejected() {
+        let err = RustbergConfig::parse_str(
+            r#"
+            [storage]
+            catalog_url = "file:///tmp/x"
+            read_timeout_secs = 60
+        "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("read_timeout_secs"),
+            "error should name the offending key: {err}"
+        );
     }
 }

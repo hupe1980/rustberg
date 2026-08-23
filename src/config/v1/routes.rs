@@ -1,4 +1,4 @@
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 
 use super::handlers::get_config;
 use crate::app::AppState;

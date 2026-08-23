@@ -3,11 +3,8 @@
 //! This module provides the main App structure that configures and runs
 //! the Iceberg REST Catalog service.
 
-use axum::http::{HeaderName, HeaderValue, Method};
 use axum::Router;
-use iceberg::memory::MemoryCatalogBuilder;
-use iceberg::CatalogBuilder;
-use std::collections::HashMap;
+use axum::http::{HeaderName, HeaderValue, Method};
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::compression::CompressionLayer;
@@ -18,27 +15,87 @@ use tracing::Level;
 
 use crate::auth::{
     AllowAllAuthenticator, AllowAllAuthorizer, ApiKeyAuthenticator, Authenticator, Authorizer,
-    ChainAuthenticator, ChainAuthorizer, InMemoryApiKeyStore, JwtAuthenticator, JwtConfig,
-    RateLimitConfig, RateLimiter, RbacAuthorizer, TenantIsolationAuthorizer,
+    CedarAuthorizer, ChainAuthenticator, InMemoryApiKeyStore, JwtAuthenticator, JwtConfig,
+    RateLimitConfig, RateLimiter,
 };
-use crate::catalog::{
-    self, CatalogExt, EncryptedCatalog, ExtendedCatalog, IdempotencyCache, MemoryViewStore,
-    ViewStorage, ViewStore,
-};
+use crate::catalog::{self, CatalogStore, IdempotencyCache};
 use crate::config;
 use crate::config::CorsConfig;
 use crate::credentials::{NoopCredentialProvider, StorageCredentialProvider};
-use crate::crypto::create_kms;
-#[cfg(feature = "slatedb-storage")]
-use crate::crypto::{Aes256GcmProvider, EncryptionProvider};
 use crate::observability::metrics::MetricsRegistry;
-#[cfg(feature = "slatedb-storage")]
-use crate::storage::KvApiKeyStore;
 use crate::utils::temp_path;
 
 // ============================================================================
 // App State
 // ============================================================================
+
+/// This server's own warehouse.
+///
+/// A newtype rather than a `String`, and deliberately without `Display` or
+/// `Deref`, so it cannot be passed anywhere a warehouse is expected. Under
+/// federation there is no such thing as *the* warehouse — each mount has its
+/// own — and reaching for this one has twice produced a bug that compiled
+/// perfectly: once checking a client-supplied location against the wrong
+/// warehouse, once building a view's default location in it.
+///
+/// The two accessors name the only situations where "this server's own" is the
+/// right question. Anything else wants [`AppState::warehouse_for`], and now has
+/// to say so to the type checker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultWarehouse(String);
+
+impl DefaultWarehouse {
+    /// Wraps the configured warehouse.
+    pub fn new(location: impl Into<String>) -> Self {
+        Self(location.into())
+    }
+
+    /// The value `GET /v1/config` advertises as `overrides.warehouse`.
+    ///
+    /// The override names the catalog a client is talking to, and no namespace
+    /// is in scope to resolve a mount's warehouse from. It is the default, not
+    /// a claim that everything lives there.
+    pub fn advertised(&self) -> &str {
+        &self.0
+    }
+
+    /// The warehouse to use when a catalog declares none of its own.
+    ///
+    /// Only [`AppState::warehouse_for`] should call this; it is the tail of
+    /// that resolution, not a way around it.
+    pub fn as_fallback(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Everything needed to administer policy at runtime.
+///
+/// Absent for a deployment whose authorizer does not evaluate policy — the
+/// `--no-auth` development mode — where the management endpoints answer `501`
+/// rather than pretending to administer something nothing consults.
+#[derive(Clone)]
+pub struct PolicyAdmin {
+    /// The append-only log of policy revisions.
+    pub store: Arc<dyn crate::auth::policy_store::PolicyStore>,
+    /// The live authorizer, so a change takes effect without a restart.
+    pub authorizer: Arc<crate::auth::reloadable::ReloadableAuthorizer>,
+    /// Keeps the replica in step with the store; stops when the last clone of
+    /// this state is dropped.
+    ///
+    /// Never read, and that is the whole mechanism: the field exists so the
+    /// poller's lifetime is tied to the application's. Removing it because
+    /// nothing reads it would restore the leak it was added to close.
+    #[allow(dead_code, reason = "held for its Drop; see above")]
+    poller: Arc<crate::auth::reloadable::PolicyPoller>,
+}
+
+impl std::fmt::Debug for PolicyAdmin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PolicyAdmin")
+            .field("loaded_sequence", &self.authorizer.loaded_sequence())
+            .finish_non_exhaustive()
+    }
+}
 
 /// Shared application state passed to all request handlers.
 #[derive(Clone)]
@@ -48,25 +105,61 @@ pub struct AppState {
     /// The authorizer for checking permissions.
     pub authorizer: Arc<dyn Authorizer>,
     /// The Iceberg catalog implementation with extended commit capabilities.
-    pub catalog: Arc<dyn CatalogExt + Send + Sync>,
+    pub catalog: Arc<dyn CatalogStore>,
     /// Storage credential provider for vending temporary credentials.
     pub credential_provider: Arc<dyn StorageCredentialProvider>,
+    /// Signs individual storage requests, for clients that hold no credential.
+    pub request_signer: Arc<dyn crate::credentials::RequestSigner>,
+    /// How the sign endpoint reads storage addresses, and whether it is served.
+    pub signing: crate::catalog::v1::sign::SigningEndpointConfig,
     /// Rate limiter for protecting against DoS and brute-force attacks.
     pub rate_limiter: Arc<RateLimiter>,
     /// Idempotency cache for preventing duplicate request processing.
     pub idempotency_cache: Arc<IdempotencyCache>,
-    /// View storage for view CRUD operations.
-    /// Can be backed by in-memory (development) or SlateDB (production).
-    pub view_storage: Arc<dyn ViewStore>,
     /// Prometheus metrics registry for observability.
     pub metrics: Arc<MetricsRegistry>,
-    /// Base warehouse location for table storage.
-    pub warehouse_location: String,
+    /// Where authorization decisions are recorded.
+    pub auditor: Arc<crate::auth::Auditor>,
+    /// Fallback warehouse, for a namespace whose catalog declares none.
+    ///
+    /// **Prefer [`warehouse_for`](Self::warehouse_for).** Under federation this
+    /// is not "the" warehouse — each mount has its own, and a table created in a
+    /// mount belongs in that one. Reading this field where a namespace is in
+    /// scope confines a location to the wrong warehouse, or builds a default
+    /// location in it.
+    ///
+    /// Legitimate uses are the ones that genuinely mean *this server's own*:
+    /// the `warehouse` override in `GET /v1/config`, and the fallback inside
+    /// `warehouse_for` itself. Its type enforces that.
+    pub default_warehouse: DefaultWarehouse,
     /// Default tenant ID for single-tenant deployments.
     pub default_tenant_id: String,
+    /// The identity provider's token endpoint, advertised to clients.
+    pub oauth2_server_uri: Option<String>,
+    /// Runtime policy administration, when this deployment evaluates policy.
+    pub policy_admin: Option<PolicyAdmin>,
+    /// What every mount supports, which is what `/v1/config` advertises.
+    pub capabilities: crate::catalog::Capabilities,
 }
 
 impl AppState {
+    /// The warehouse governing `namespace`.
+    ///
+    /// The answer differs per namespace once mounts exist, so this asks the
+    /// catalog rather than assuming. Falls back to
+    /// [`default_warehouse`](Self::default_warehouse) for a backend that
+    /// declares none — a remote mount, which stores nothing of its own.
+    ///
+    /// Every location decision goes through here: the confinement check that
+    /// keeps a client-supplied location inside a warehouse, and the default
+    /// location a view is created at.
+    pub async fn warehouse_for(&self, namespace: &iceberg::NamespaceIdent) -> String {
+        self.catalog
+            .warehouse_for(namespace)
+            .await
+            .unwrap_or_else(|| self.default_warehouse.as_fallback().to_string())
+    }
+
     /// Returns the default tenant ID.
     pub fn default_tenant_id(&self) -> &str {
         &self.default_tenant_id
@@ -97,9 +190,26 @@ impl App {
         &self.app_state
     }
 
+    /// The catalog as Rust, acting as `principal`.
+    ///
+    /// This is the in-process form of the product: the same operations the REST
+    /// handlers expose, authorized by the same [`guard`], with no router and no
+    /// serialisation. Authentication is the host's — it has already established
+    /// who the caller is, and should not have to attach a JWKS client to say so.
+    ///
+    /// A policy reading `context.source_ip` fails closed here unless the host
+    /// supplies it with
+    /// [`Session::with_request_context`](crate::catalog::Session::with_request_context),
+    /// which is correct: an in-process call has no connection behind it.
+    ///
+    /// [`guard`]: crate::catalog::v1::guard
+    pub fn as_principal(&self, principal: crate::auth::Principal) -> crate::catalog::Session {
+        crate::catalog::Session::new(self.app_state.clone(), principal)
+    }
+
     /// Converts the App into an Axum Router ready for serving.
     pub fn into_router(self) -> Router {
-        use crate::auth::{auth_middleware, routes as auth_routes, AuthState};
+        use crate::auth::{AuthState, auth_middleware, routes as auth_routes};
         use crate::observability;
         use axum::middleware;
         use tower_http::limit::RequestBodyLimitLayer;
@@ -114,6 +224,9 @@ impl App {
         let catalog_routes = catalog::create_routes(self.app_state.clone());
         let config_routes = config::create_routes(self.app_state.clone());
         let auth_context_routes = auth_routes::create_routes(self.app_state.clone());
+        // Rustberg's own administration surface, deliberately outside `/v1`
+        // so `GET /v1/config` stays a complete description of the Iceberg API.
+        let management_routes = crate::management::create_routes(self.app_state.clone());
         let health_routes = observability::create_health_routes(Arc::new(self.app_state.clone()));
         let metrics_routes =
             observability::metrics::create_routes(Arc::new(self.app_state.clone()));
@@ -129,11 +242,9 @@ impl App {
         // Request ID header for distributed tracing
         let x_request_id = HeaderName::from_static("x-request-id");
 
-        // CORS configuration from App settings
-        let is_permissive = self.cors_config.allowed_origins.is_empty()
-            || self.cors_config.allowed_origins.iter().any(|o| o == "*");
-
-        if is_permissive {
+        // Only an explicit `*` is permissive. An empty list means no cross-origin
+        // access, which is the default — see `default_allowed_origins`.
+        if self.cors_config.allowed_origins.iter().any(|o| o == "*") {
             tracing::warn!(
                 "CORS is configured to allow all origins. \
                  For production, restrict allowed_origins in configuration."
@@ -156,7 +267,12 @@ impl App {
             HeaderName::from_static("content-security-policy"),
             HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
         );
-        let cache_control = SetResponseHeaderLayer::overriding(
+        // A default rather than an override: catalog responses carry metadata and
+        // credentials and must not be cached, but the sign endpoint is required
+        // to mark a read signature `private` so a client may reuse it. An
+        // overriding layer erased that and turned one signature per file into one
+        // per request.
+        let cache_control = SetResponseHeaderLayer::if_not_present(
             HeaderName::from_static("cache-control"),
             HeaderValue::from_static("no-store, no-cache, must-revalidate"),
         );
@@ -165,22 +281,40 @@ impl App {
             HeaderValue::from_static("1; mode=block"),
         );
 
-        Router::new()
-            // Observability endpoints (no auth required for health/metrics)
-            .merge(health_routes)
-            .merge(metrics_routes)
-            // Catalog and config endpoints (auth required)
+        // Everything that speaks for a caller, and therefore needs one.
+        //
+        // Layered onto *these routes only*. A `layer` applies to every route
+        // merged above it, so layering auth onto the whole router would make
+        // `/health` answer `401` — and a Kubernetes liveness probe carries no
+        // credential, so every pod would restart-loop.
+        let protected = Router::new()
             .merge(catalog_routes)
             .merge(config_routes)
-            // Auth introspection endpoints (auth required)
             .merge(auth_context_routes)
+            .nest("/management", management_routes)
+            .layer(middleware::from_fn_with_state(auth_state, auth_middleware));
+
+        // Open by design: a liveness probe cannot hold a credential, and a
+        // Prometheus scrape should not need one. Neither endpoint reveals
+        // catalog contents — `/health` and `/ready` report reachability, and the
+        // metrics are aggregate counters with no tenant, namespace or table
+        // labels. Restrict them at the network layer if a deployment needs to;
+        // the Helm chart's NetworkPolicy is where that belongs.
+        let public = Router::new()
+            .merge(health_routes)
+            .merge(metrics_routes)
+            .merge(auth_routes::create_public_routes());
+
+        Router::new()
+            .merge(public)
+            .merge(protected)
             .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_SIZE))
             .layer(TimeoutLayer::with_status_code(
                 axum::http::StatusCode::REQUEST_TIMEOUT,
                 REQUEST_TIMEOUT,
             ))
-            .layer(middleware::from_fn_with_state(auth_state, auth_middleware))
-            // CORS (must be before auth for preflight requests)
+            // Outside the auth layer, so a CORS preflight — which carries no
+            // credentials by design — is answered rather than rejected.
             .layer(cors)
             // Request ID propagation for distributed tracing
             .layer(PropagateRequestIdLayer::new(x_request_id.clone()))
@@ -201,6 +335,15 @@ impl App {
     }
 
     /// Builds the CORS layer from the configuration.
+    ///
+    /// An empty origin list yields a layer that permits no origin, so no
+    /// `Access-Control-Allow-Origin` is sent and a browser blocks the response.
+    /// Non-browser clients are unaffected — CORS is enforced by the browser, not
+    /// by the server.
+    ///
+    /// A configured origin that fails to parse is **dropped with a warning**,
+    /// never widened to `Any`. Falling back to `Any` on an empty parse result
+    /// would turn a single typo in one origin into an open policy.
     fn build_cors_layer(&self, x_request_id: &HeaderName) -> CorsLayer {
         use tower_http::cors::AllowOrigin;
 
@@ -231,27 +374,26 @@ impl App {
             .expose_headers([x_request_id.clone()]);
 
         // Configure allowed origins
-        if self.cors_config.allowed_origins.is_empty()
-            || self.cors_config.allowed_origins.iter().any(|o| o == "*")
-        {
+        if self.cors_config.allowed_origins.iter().any(|o| o == "*") {
             cors = cors.allow_origin(Any);
         } else {
-            // Parse specific origins
-            let origins: Vec<_> = self
-                .cors_config
-                .allowed_origins
-                .iter()
-                .filter_map(|o| o.parse().ok())
-                .collect();
-
-            if origins.is_empty() {
-                cors = cors.allow_origin(Any);
-            } else {
-                cors = cors.allow_origin(AllowOrigin::list(origins));
+            let mut origins = Vec::new();
+            for origin in &self.cors_config.allowed_origins {
+                match origin.parse() {
+                    Ok(parsed) => origins.push(parsed),
+                    Err(_) => tracing::warn!(
+                        origin = %origin,
+                        "Ignoring unparseable CORS origin; it will not be allowed"
+                    ),
+                }
             }
+            // An empty list permits nothing. This is the default.
+            cors = cors.allow_origin(AllowOrigin::list(origins));
         }
 
-        // Configure allowed headers
+        // Configure allowed headers. Unlike origins, `*` here is the sensible
+        // default: the headers an Iceberg client sends are fixed by the spec, and
+        // restricting them protects nothing that the origin check does not.
         if self.cors_config.allowed_headers.is_empty()
             || self.cors_config.allowed_headers.iter().any(|h| h == "*")
         {
@@ -275,6 +417,18 @@ impl App {
     }
 }
 
+/// Builds the Cedar authorizer from an optional policy source.
+///
+/// Panics on invalid policies: serving with an authorization policy the operator
+/// believes is active but which does not typecheck is strictly worse than
+/// refusing to start.
+fn build_authorizer(policies: Option<&str>) -> CedarAuthorizer {
+    match policies {
+        Some(src) => CedarAuthorizer::new(src).expect("Cedar policies must validate"),
+        None => CedarAuthorizer::with_default_policies().expect("default policies must validate"),
+    }
+}
+
 // ============================================================================
 // App Builder
 // ============================================================================
@@ -282,34 +436,40 @@ impl App {
 /// Builder for constructing an App with custom configuration.
 #[derive(Default)]
 pub struct AppBuilder {
-    catalog: Option<Arc<dyn CatalogExt + Send + Sync>>,
+    catalog: Option<Arc<dyn CatalogStore>>,
     warehouse_location: Option<String>,
     authenticator: Option<Arc<dyn Authenticator>>,
     authorizer: Option<Arc<dyn Authorizer>>,
     credential_provider: Option<Arc<dyn StorageCredentialProvider>>,
+    request_signer: Option<Arc<dyn crate::credentials::RequestSigner>>,
     rate_limit_config: Option<RateLimitConfig>,
     idempotency_ttl: Option<Duration>,
     default_tenant_id: Option<String>,
     enable_auth: bool,
     jwt_config: Option<JwtConfig>,
     cors_config: Option<CorsConfig>,
-    kms_config: Option<crate::crypto::KmsConfig>,
-    storage_backend_url: Option<String>,
-    encryption_key: Option<[u8; 32]>,
-    /// Whether to enable table metadata encryption via EncryptedCatalog
-    enable_table_encryption: bool,
-    /// KMS key ID for table metadata encryption
-    kms_key_id: Option<String>,
-    /// IO timeout configuration for storage operations
-    #[cfg(feature = "slatedb-storage")]
-    io_timeout_config: Option<crate::catalog::IoTimeoutConfig>,
+    catalog_url: Option<String>,
+    /// Cedar policy source; the built-in defaults are used when absent.
+    policies: Option<String>,
+    /// API keys, supplied by configuration rather than stored.
+    api_keys: Vec<crate::auth::ApiKey>,
+    /// Where authorization decisions are recorded.
+    auditor: Option<Arc<crate::auth::Auditor>>,
+    /// The identity provider's token endpoint, advertised to clients.
+    oauth2_server_uri: Option<String>,
+    /// Credential vending, from the `[credentials]` config section.
+    credentials_config: Option<crate::config::server_config::CredentialsConfig>,
+    /// Federated mounts, from `[mount.*]`.
+    mounts: Vec<crate::catalog::Mount>,
+    /// Where policy revisions live, when supplied directly.
+    policy_store: Option<Arc<dyn crate::auth::policy_store::PolicyStore>>,
 }
 
 impl AppBuilder {
     /// Sets a custom Iceberg catalog implementation.
     ///
-    /// The catalog must implement `CatalogExt` for table commit support.
-    pub fn with_catalog(mut self, catalog: Arc<dyn CatalogExt + Send + Sync>) -> Self {
+    /// The catalog must implement [`CatalogStore`].
+    pub fn with_catalog(mut self, catalog: Arc<dyn CatalogStore>) -> Self {
         self.catalog = Some(catalog);
         self
     }
@@ -340,6 +500,57 @@ impl AppBuilder {
         provider: Arc<dyn StorageCredentialProvider>,
     ) -> Self {
         self.credential_provider = Some(provider);
+        self
+    }
+
+    /// Sets a custom request signer, for remote signing.
+    pub fn with_request_signer(
+        mut self,
+        signer: Arc<dyn crate::credentials::RequestSigner>,
+    ) -> Self {
+        self.request_signer = Some(signer);
+        self
+    }
+
+    /// Configures credential vending from a `[credentials]` section.
+    ///
+    /// The provider is constructed during [`build`](Self::build), because it
+    /// needs the resolved warehouse location to default its allowed prefixes.
+    /// An explicit [`with_credential_provider`](Self::with_credential_provider)
+    /// takes precedence, so a library embedding Rustberg can supply its own.
+    pub fn with_credentials_config(
+        mut self,
+        config: crate::config::server_config::CredentialsConfig,
+    ) -> Self {
+        self.credentials_config = Some(config);
+        self
+    }
+
+    /// Sets where policy revisions are stored.
+    ///
+    /// Only needed alongside [`with_catalog`](Self::with_catalog): a catalog
+    /// Rustberg opens itself also serves as the policy store, but one supplied
+    /// from outside is not required to. Without this, such a deployment has no
+    /// runtime policy administration and the management endpoints say so.
+    ///
+    /// The two may be the same object — [`RedbCatalog`](crate::catalog::RedbCatalog)
+    /// and `PostgresCatalog` implement both traits, which is what keeps a
+    /// deployment to one database to back up.
+    pub fn with_policy_store(
+        mut self,
+        store: Arc<dyn crate::auth::policy_store::PolicyStore>,
+    ) -> Self {
+        self.policy_store = Some(store);
+        self
+    }
+
+    /// Adds federated mounts.
+    ///
+    /// Each mount claims a top-level namespace; everything beneath it is served
+    /// by that backend. Mounting is additive — names no mount claims still reach
+    /// the catalog underneath.
+    pub fn with_mounts(mut self, mounts: Vec<crate::catalog::Mount>) -> Self {
+        self.mounts = mounts;
         self
     }
 
@@ -396,6 +607,45 @@ impl AppBuilder {
         self
     }
 
+    /// Sets the API keys this server accepts.
+    ///
+    /// Keys are configuration, not state: they arrive from a config file or a
+    /// mounted secret and are held only in memory. There is deliberately no key
+    /// store — nothing to encrypt at rest, back up, or guard with a
+    /// "who may mint keys" policy, and rotation is a config change.
+    pub fn with_api_keys(mut self, keys: impl IntoIterator<Item = crate::auth::ApiKey>) -> Self {
+        self.api_keys = keys.into_iter().collect();
+        self
+    }
+
+    /// Advertises the identity provider's OAuth2 token endpoint to clients.
+    ///
+    /// Sent as `oauth2-server-uri` in `/v1/config`, which is what the Iceberg
+    /// spec recommends instead of hosting a token endpoint here.
+    pub fn with_oauth2_server_uri(mut self, uri: impl Into<String>) -> Self {
+        self.oauth2_server_uri = Some(uri.into());
+        self
+    }
+
+    /// Sets where authorization decisions are recorded.
+    ///
+    /// Defaults to discarding them, which suits an embedding host that audits
+    /// through its own pipeline. The binary configures a real sink.
+    pub fn with_auditor(mut self, auditor: Arc<crate::auth::Auditor>) -> Self {
+        self.auditor = Some(auditor);
+        self
+    }
+
+    /// Sets the Cedar policy source.
+    ///
+    /// Replaces the built-in default policies entirely. Policies are validated
+    /// against the schema when the app is built, so a policy that does not
+    /// typecheck is a startup failure rather than a rule that never matches.
+    pub fn with_policies<S: Into<String>>(mut self, policies: S) -> Self {
+        self.policies = Some(policies.into());
+        self
+    }
+
     /// Sets CORS configuration.
     ///
     /// Use this to configure Cross-Origin Resource Sharing (CORS) policy.
@@ -413,1125 +663,484 @@ impl AppBuilder {
     ///     allowed_methods: vec!["GET".to_string(), "POST".to_string()],
     ///     allowed_headers: vec!["Authorization".to_string(), "Content-Type".to_string()],
     /// };
-    /// let app = App::builder().with_cors_config(cors).build();
+    /// # async fn example(cors: CorsConfig) {
+    /// let app = App::builder().with_cors_config(cors).build().await.unwrap();
+    /// # }
     /// ```
     pub fn with_cors_config(mut self, config: CorsConfig) -> Self {
         self.cors_config = Some(config);
         self
     }
 
-    /// Sets the KMS configuration for encryption-at-rest.
+    /// Sets where the catalog database lives.
+    ///
+    /// The catalog is a local redb file, so only two forms are accepted:
+    /// - `file:///path/to/dir` — a directory holding `catalog.redb`
+    /// - `memory://` — ephemeral, for tests
+    ///
+    /// Object-store URLs are rejected at build time. The *warehouse* is
+    /// separate and may live on any compiled-in scheme — see
+    /// [`with_warehouse_location`](Self::with_warehouse_location).
+    ///
+    /// Leaving this unset gives an ephemeral catalog in a temp directory, which
+    /// is only appropriate for tests.
     ///
     /// # Example
     /// ```no_run
     /// use rustberg::App;
-    /// use rustberg::crypto::KmsConfig;
-    ///
-    /// let kms_config = KmsConfig::Env; // Use environment variables
-    /// let app = App::builder().with_kms_config(kms_config).build();
-    /// ```
-    pub fn with_kms_config(mut self, config: crate::crypto::KmsConfig) -> Self {
-        self.kms_config = Some(config);
-        self
-    }
-
-    /// Sets the storage backend URL.
-    ///
-    /// Supported schemes:
-    /// - `file:///path` - Local filesystem (default)
-    /// - `s3://bucket/prefix` - Amazon S3
-    /// - `gs://bucket/prefix` - Google Cloud Storage
-    /// - `az://container/prefix` - Azure Blob Storage
-    ///
-    /// # Example
-    /// ```no_run
-    /// use rustberg::App;
-    ///
-    /// let app = App::builder()
-    ///     .with_storage_backend("s3://my-bucket/catalog")
-    ///     .build();
-    /// ```
-    pub fn with_storage_backend<S: Into<String>>(mut self, url: S) -> Self {
-        self.storage_backend_url = Some(url.into());
-        self
-    }
-
-    /// Sets the encryption key for API key storage encryption-at-rest.
-    ///
-    /// When set, API keys stored in persistent storage (KvApiKeyStore) will be
-    /// encrypted using AES-256-GCM. The key must be exactly 32 bytes.
-    ///
-    /// # Security
-    ///
-    /// - Store this key securely (e.g., in a secrets manager)
-    /// - Loss of this key = loss of access to stored API keys
-    /// - Use `Aes256GcmProvider::generate_key()` to create a secure random key
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use rustberg::App;
-    /// use rustberg::crypto::Aes256GcmProvider;
     ///
     /// # async fn example() {
-    /// // Generate a new key (store this securely!)
-    /// let key = Aes256GcmProvider::generate_key();
-    ///
-    /// let (app, api_key_store) = App::builder()
-    ///     .with_encryption_key(key)
-    ///     .build_with_api_key_auth_async()
-    ///     .await;
-    /// # }
-    /// ```
-    pub fn with_encryption_key(mut self, key: [u8; 32]) -> Self {
-        self.encryption_key = Some(key);
-        self
-    }
-
-    /// Enables table metadata encryption using the configured KMS.
-    ///
-    /// When enabled, table metadata properties are encrypted at rest using
-    /// envelope encryption. Requires a KMS configuration to be set.
-    ///
-    /// # Security
-    ///
-    /// - Uses envelope encryption: per-table DEKs wrapped by KMS master key
-    /// - DEKs are cached with configurable TTL for performance
-    /// - Master key never leaves the KMS (AWS KMS, Vault, GCP, Azure)
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use rustberg::App;
-    /// use rustberg::crypto::KmsConfig;
-    ///
-    /// # async fn example() {
-    /// let (app, store) = App::builder()
-    ///     .with_kms_config(KmsConfig::Env)
-    ///     .with_table_encryption("rustberg-master")
-    ///     .build_with_api_key_auth_async()
-    ///     .await;
-    /// # }
-    /// ```
-    pub fn with_table_encryption<S: Into<String>>(mut self, kms_key_id: S) -> Self {
-        self.enable_table_encryption = true;
-        self.kms_key_id = Some(kms_key_id.into());
-        self
-    }
-
-    /// Sets IO timeout configuration for storage operations.
-    ///
-    /// Controls how long FileIO operations (metadata reads/writes) are allowed
-    /// to take before being cancelled. Useful for preventing stalled cloud
-    /// storage connections from blocking workers indefinitely.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use rustberg::App;
-    /// use std::time::Duration;
-    ///
     /// let app = App::builder()
-    ///     .with_io_timeouts(Duration::from_secs(90), Duration::from_secs(45))
-    ///     .build();
+    ///     .with_catalog_url("file:///var/lib/rustberg/data")
+    ///     .build().await.unwrap();
+    /// # }
     /// ```
-    #[cfg(feature = "slatedb-storage")]
-    pub fn with_io_timeouts(mut self, read_timeout: Duration, write_timeout: Duration) -> Self {
-        self.io_timeout_config = Some(crate::catalog::IoTimeoutConfig::new(
-            read_timeout,
-            write_timeout,
-        ));
+    pub fn with_catalog_url<S: Into<String>>(mut self, url: S) -> Self {
+        self.catalog_url = Some(url.into());
         self
     }
 
-    /// Creates a catalog based on the storage backend URL.
-    /// Creates both a catalog and view store based on the storage backend URL.
-    /// Uses the same SlateDB instance for both, ensuring persistent views.
+    /// Creates the catalog for a catalog URL.
     ///
-    /// Supported backends:
-    /// - `memory://` or None → MemoryCatalog (development/testing)
-    /// - `file:///path` → SlateCatalog with local filesystem
-    /// - `s3://bucket/path` → SlateCatalog with S3
-    /// - `gs://bucket/path` → SlateCatalog with GCS
-    /// - `az://container/path` → SlateCatalog with Azure Blob
-    #[cfg(feature = "slatedb-storage")]
-    async fn create_catalog_and_view_store(
-        backend_url: Option<&str>,
-        warehouse_location: &str,
-        io_timeout_config: Option<crate::catalog::IoTimeoutConfig>,
-    ) -> Result<(Arc<dyn CatalogExt + Send + Sync>, Arc<dyn ViewStore>), crate::error::AppError>
-    {
-        let (catalog, view_storage, _) =
-            Self::create_all_stores(backend_url, warehouse_location, io_timeout_config).await?;
-        Ok((catalog, view_storage))
-    }
-
-    /// Creates catalog, view store, and idempotency store based on storage backend URL.
-    /// Uses the same SlateDB instance for all, ensuring persistence across restarts.
-    #[cfg(feature = "slatedb-storage")]
+    /// `memory://` (or no URL) gives an ephemeral catalog for tests; anything
+    /// else is a redb file path, and the warehouse may live on any storage
+    /// scheme compiled in.
     async fn create_all_stores(
-        backend_url: Option<&str>,
+        catalog_url: Option<&str>,
         warehouse_location: &str,
-        io_timeout_config: Option<crate::catalog::IoTimeoutConfig>,
     ) -> Result<
         (
-            Arc<dyn CatalogExt + Send + Sync>,
-            Arc<dyn ViewStore>,
-            Option<Arc<dyn crate::catalog::IdempotencyStore>>,
+            Arc<dyn CatalogStore>,
+            Option<Arc<dyn crate::auth::policy_store::PolicyStore>>,
+            Option<Arc<dyn crate::catalog::v1::idempotency::SharedIdempotencyStore>>,
         ),
         crate::error::AppError,
     > {
-        use crate::catalog::{SlateCatalog, SlateDbIdempotencyStore, SlateDbViewStore};
-        use object_store::local::LocalFileSystem;
-        use object_store::ObjectStore;
-        use slatedb::Db;
+        use crate::catalog::RedbCatalog;
 
-        match backend_url {
-            Some(url) if url.starts_with("file://") => {
-                let path = url.strip_prefix("file://").unwrap_or(url);
-                tracing::info!(
-                    backend = url,
-                    path = path,
-                    "Creating SlateDB catalog with local filesystem"
-                );
-
-                // Create directory if it doesn't exist
-                std::fs::create_dir_all(path).map_err(|e| {
-                    crate::error::AppError::Internal(format!("Failed to create directory: {}", e))
+        #[cfg(feature = "catalog-postgres")]
+        if let Some(url) = catalog_url
+            && crate::catalog::PostgresCatalog::handles(url)
+        {
+            tracing::info!("Opening Postgres catalog");
+            let catalog = crate::catalog::PostgresCatalog::connect(url, warehouse_location)
+                .await
+                .map_err(|e| {
+                    crate::error::AppError::Internal(format!(
+                        "Failed to open Postgres catalog: {e}"
+                    ))
                 })?;
+            // One handle serving all three traits, so a deployment has one
+            // database to configure, back up and make durable.
+            let catalog = Arc::new(catalog);
+            return Ok((
+                catalog.clone() as Arc<dyn CatalogStore>,
+                Some(catalog.clone() as Arc<dyn crate::auth::policy_store::PolicyStore>),
+                Some(catalog as Arc<dyn crate::catalog::v1::idempotency::SharedIdempotencyStore>),
+            ));
+        }
 
-                // Create local filesystem object store for SlateDB
-                let object_store: Arc<dyn ObjectStore> =
-                    Arc::new(LocalFileSystem::new_with_prefix(path).map_err(|e| {
-                        crate::error::AppError::Internal(format!(
-                            "Failed to create LocalFileSystem: {}",
-                            e
-                        ))
-                    })?);
-
-                // Create SlateDB instance at "catalog" path within the object store
-                let db = Arc::new(Db::builder("catalog", object_store).build().await.map_err(
-                    |e| crate::error::AppError::Internal(format!("Failed to open SlateDB: {}", e)),
-                )?);
-
-                // Create SlateDbViewStore with shared db instance
-                let view_storage: Arc<dyn ViewStore> = Arc::new(SlateDbViewStore::new(db.clone()));
-
-                // Create SlateDbIdempotencyStore with shared db instance
-                let idempotency_store: Arc<dyn crate::catalog::IdempotencyStore> =
-                    Arc::new(SlateDbIdempotencyStore::new(db.clone()));
-
-                // Create SlateCatalog with FileIO pointed at warehouse location
-                let io_timeouts = io_timeout_config.clone().unwrap_or_default();
-                let slate_catalog =
-                    SlateCatalog::with_timeouts(db, warehouse_location.to_string(), io_timeouts)
-                        .await
-                        .map_err(|e| {
-                            crate::error::AppError::Internal(format!(
-                                "Failed to create SlateCatalog: {}",
-                                e
-                            ))
-                        })?;
-
-                Ok((
-                    Arc::new(ExtendedCatalog::new(slate_catalog)),
-                    view_storage,
-                    Some(idempotency_store),
-                ))
-            }
-            Some(url)
-                if url.starts_with("s3://")
-                    || url.starts_with("gs://")
-                    || url.starts_with("az://") =>
-            {
-                tracing::info!(backend = url, "Creating SlateDB catalog with cloud storage");
-
-                // Parse cloud storage URL and create object store
-                let (object_store, cloud_path) =
-                    object_store::parse_url(&url::Url::parse(url).map_err(|e| {
-                        crate::error::AppError::Internal(format!("Invalid URL: {}", e))
-                    })?)
-                    .map_err(|e| {
-                        crate::error::AppError::Internal(format!(
-                            "Failed to create object store: {}",
-                            e
-                        ))
-                    })?;
-
-                // Create SlateDB instance at "catalog" path within the cloud path
-                let catalog_path = format!("{}/catalog", cloud_path);
-                let db = Arc::new(
-                    Db::builder(catalog_path, Arc::new(object_store))
-                        .build()
-                        .await
-                        .map_err(|e| {
-                            crate::error::AppError::Internal(format!(
-                                "Failed to open SlateDB: {}",
-                                e
-                            ))
-                        })?,
-                );
-
-                // Create SlateDbViewStore with shared db instance
-                let view_storage: Arc<dyn ViewStore> = Arc::new(SlateDbViewStore::new(db.clone()));
-
-                // Create SlateDbIdempotencyStore with shared db instance
-                let idempotency_store: Arc<dyn crate::catalog::IdempotencyStore> =
-                    Arc::new(SlateDbIdempotencyStore::new(db.clone()));
-
-                // Create SlateCatalog with FileIO pointed at warehouse location
-                let io_timeouts = io_timeout_config.unwrap_or_default();
-                let slate_catalog =
-                    SlateCatalog::with_timeouts(db, warehouse_location.to_string(), io_timeouts)
-                        .await
-                        .map_err(|e| {
-                            crate::error::AppError::Internal(format!(
-                                "Failed to create SlateCatalog: {}",
-                                e
-                            ))
-                        })?;
-
-                Ok((
-                    Arc::new(ExtendedCatalog::new(slate_catalog)),
-                    view_storage,
-                    Some(idempotency_store),
-                ))
-            }
+        let db_path = match catalog_url {
             Some("memory://") | None => {
-                tracing::info!("Creating MemoryCatalog for development/testing");
-
-                let mut props = HashMap::new();
-                props.insert("warehouse".to_string(), warehouse_location.to_string());
-
-                let memory_catalog: iceberg::MemoryCatalog = MemoryCatalogBuilder::default()
-                    .load("memory", props)
-                    .await
-                    .map_err(|e| {
-                        crate::error::AppError::Internal(format!(
-                            "Failed to create MemoryCatalog: {}",
-                            e
-                        ))
-                    })?;
-
-                // Use in-memory view storage for MemoryCatalog
-                let view_storage: Arc<dyn ViewStore> = Arc::new(ViewStorage::new());
-
-                // No persistent idempotency store for memory backend
-                Ok((
-                    Arc::new(ExtendedCatalog::new(memory_catalog)),
-                    view_storage,
-                    None,
-                ))
+                if catalog_url.is_none() {
+                    tracing::warn!(
+                        "No catalog URL configured; using an ephemeral temp catalog. \
+                         All state is lost on shutdown. Set `storage.catalog_url`."
+                    );
+                }
+                std::env::temp_dir()
+                    .join(format!("rustberg-{}", uuid::Uuid::new_v4()))
+                    .join("catalog.redb")
             }
-            Some(url) => Err(crate::error::AppError::Internal(format!(
-                "Unsupported storage backend: {}",
-                url
-            ))),
-        }
-    }
-
-    /// Creates a catalog when SlateDB feature is disabled.
-    #[cfg(not(feature = "slatedb-storage"))]
-    #[allow(dead_code)]
-    async fn create_catalog(
-        backend_url: Option<&str>,
-        warehouse_location: &str,
-    ) -> Result<Arc<dyn CatalogExt + Send + Sync>, crate::error::AppError> {
-        let (catalog, _) =
-            Self::create_catalog_and_view_store(backend_url, warehouse_location).await?;
-        Ok(catalog)
-    }
-
-    /// Creates both a catalog and view store when SlateDB feature is disabled.
-    #[cfg(not(feature = "slatedb-storage"))]
-    async fn create_catalog_and_view_store(
-        backend_url: Option<&str>,
-        warehouse_location: &str,
-    ) -> Result<(Arc<dyn CatalogExt + Send + Sync>, Arc<dyn ViewStore>), crate::error::AppError>
-    {
-        if let Some(url) = backend_url {
-            if !url.starts_with("memory://") {
-                tracing::warn!(
-                    backend = url,
-                    "Storage backend specified but slatedb-storage feature not enabled. Using MemoryCatalog."
-                );
+            Some(url) => {
+                let base = url.strip_prefix("file://").unwrap_or(url);
+                if base.contains("://") {
+                    return Err(crate::error::AppError::Internal(format!(
+                        "Unsupported catalog URL '{url}'. The catalog is a local redb file \
+                         (or Postgres, with the `catalog-postgres` feature); \
+                         use `file:///path` or `memory://`. The *warehouse* may still live on \
+                         object storage."
+                    )));
+                }
+                std::path::PathBuf::from(base).join("catalog.redb")
             }
-        }
+        };
 
-        let mut props = HashMap::new();
-        props.insert("warehouse".to_string(), warehouse_location.to_string());
+        tracing::info!(path = %db_path.display(), "Opening redb catalog");
 
-        let memory_catalog: iceberg::MemoryCatalog = MemoryCatalogBuilder::default()
-            .load("memory", props)
+        let catalog = RedbCatalog::open(&db_path, warehouse_location)
             .await
             .map_err(|e| {
-                crate::error::AppError::Internal(format!("Failed to create MemoryCatalog: {}", e))
+                crate::error::AppError::Internal(format!("Failed to open redb catalog: {e}"))
             })?;
 
-        // Always use in-memory view storage when slatedb-storage is disabled
-        let view_storage: Arc<dyn ViewStore> = Arc::new(ViewStorage::new());
-
-        Ok((Arc::new(ExtendedCatalog::new(memory_catalog)), view_storage))
+        let catalog = Arc::new(catalog);
+        // No shared idempotency store: redb takes an exclusive file lock, so a
+        // second replica cannot open it and there is nobody to share with.
+        Ok((
+            catalog.clone() as Arc<dyn CatalogStore>,
+            Some(catalog as Arc<dyn crate::auth::policy_store::PolicyStore>),
+            None,
+        ))
     }
 
-    /// Creates an App with API key authentication pre-configured (async version).
+    /// Builds a mount's backend from its configuration.
     ///
-    /// Returns both the App and the API key store for management.
-    /// Use this when building from within an async context.
-    pub async fn build_with_api_key_auth_async(self) -> (App, Arc<InMemoryApiKeyStore>) {
-        let warehouse_location = self.warehouse_location.unwrap_or_else(temp_path);
-        let default_tenant_id = self
-            .default_tenant_id
-            .unwrap_or_else(|| "default".to_string());
+    /// Only `native` exists today: another Rustberg catalog — a redb file or a
+    /// Postgres database — with its own warehouse. That is genuinely useful on
+    /// its own (per-team files, per-tenant databases, warehouses in different
+    /// regions) and it is the same routing every future adapter will use.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown backend, or when the backend cannot be
+    /// opened. Both are startup failures: a mount that silently did not load
+    /// would make its whole namespace subtree vanish.
+    pub async fn build_mount(
+        name: &str,
+        config: &crate::config::server_config::MountConfig,
+    ) -> Result<crate::catalog::Mount, crate::error::AppError> {
+        use crate::catalog::{Capabilities, Mount};
 
-        let (base_catalog, view_storage) = if let Some(catalog) = self.catalog {
-            // When custom catalog is provided, use in-memory view storage
-            (catalog, Arc::new(ViewStorage::new()) as Arc<dyn ViewStore>)
-        } else {
-            // Create catalog and view storage based on storage backend URL
-            #[cfg(feature = "slatedb-storage")]
-            let result = Self::create_catalog_and_view_store(
-                self.storage_backend_url.as_deref(),
-                &warehouse_location,
-                self.io_timeout_config.clone(),
-            )
-            .await
-            .expect("Failed to create catalog");
-            #[cfg(not(feature = "slatedb-storage"))]
-            let result = Self::create_catalog_and_view_store(
-                self.storage_backend_url.as_deref(),
-                &warehouse_location,
-            )
-            .await
-            .expect("Failed to create catalog");
-            result
-        };
-
-        // Wrap catalog with encryption if enabled, and capture KMS metrics
-        let (catalog, kms_metrics): (
-            Arc<dyn CatalogExt + Send + Sync>,
-            Option<Arc<crate::crypto::KmsMetrics>>,
-        ) = if self.enable_table_encryption {
-            if let Some(kms_config) = self.kms_config {
-                let kms = create_kms(kms_config, None)
+        let (store, capabilities): (Arc<dyn CatalogStore>, Capabilities) =
+            match config.backend.trim().to_ascii_lowercase().as_str() {
+                "native" => {
+                    let (store, _policy, _idempotency) = Self::create_all_stores(
+                        Some(&config.catalog_url),
+                        &config.warehouse_location,
+                    )
                     .await
-                    .expect("Failed to create KMS for table encryption");
+                    .map_err(|e| {
+                        crate::error::AppError::Internal(format!(
+                            "Mount '{name}' could not be opened: {e}"
+                        ))
+                    })?;
 
-                // Extract KMS metrics before moving kms into EncryptedCatalog
-                let kms_metrics = kms.kms_metrics();
+                    // A read-only native mount is refused every mutation rather than
+                    // trusted not to attempt one. The point of the flag is that
+                    // another system owns that catalog.
+                    let capabilities = if config.read_only {
+                        Capabilities::read_only()
+                    } else {
+                        Capabilities::full()
+                    };
+                    (store, capabilities)
+                }
 
-                let key_id = self
-                    .kms_key_id
-                    .unwrap_or_else(|| "rustberg-master".to_string());
-                tracing::info!(key_id = %key_id, "Table metadata encryption enabled with KMS");
-                (
-                    Arc::new(EncryptedCatalog::new(base_catalog, kms, key_id)),
-                    kms_metrics,
-                )
-            } else {
-                tracing::warn!(
-                    "Table encryption requested but no KMS configured. \
-                         Use with_kms_config() to configure KMS. Proceeding without encryption."
-                );
-                (base_catalog, None)
-            }
-        } else {
-            (base_catalog, None)
-        };
+                "rest" => {
+                    // Read from the environment, so the config file holds no
+                    // credential.
+                    let token = match config.token_env.as_deref() {
+                        Some(var) => Some(crate::config::secret::from_env(
+                            var,
+                            &format!("mount.{name}.token_env"),
+                        )?),
+                        None => None,
+                    };
 
-        // Create API key store
-        let api_key_store = Arc::new(InMemoryApiKeyStore::new());
-
-        // Create authenticator: API Key + optional JWT
-        let authenticator: Arc<dyn Authenticator> = if let Some(jwt_config) = self.jwt_config {
-            // Create JWT authenticator
-            let jwt_auth = Arc::new(
-                JwtAuthenticator::new(jwt_config).expect("Failed to create JWT authenticator"),
-            );
-            let api_key_auth = Arc::new(ApiKeyAuthenticator::new(api_key_store.clone()));
-
-            // Chain: JWT first (Bearer token), then API Key
-            Arc::new(ChainAuthenticator::new(vec![jwt_auth, api_key_auth]))
-        } else {
-            // API Key only
-            Arc::new(ApiKeyAuthenticator::new(api_key_store.clone()))
-        };
-
-        // Create authorizer with tenant isolation and RBAC
-        let rbac = Arc::new(RbacAuthorizer::new());
-        let authorizer: Arc<dyn Authorizer> = Arc::new(ChainAuthorizer::new(vec![
-            Arc::new(TenantIsolationAuthorizer::new(rbac.clone())),
-            rbac,
-        ]));
-
-        // Use provided credential provider or default to noop
-        let credential_provider = self
-            .credential_provider
-            .unwrap_or_else(|| Arc::new(NoopCredentialProvider::new()));
-
-        // Create rate limiter (enabled by default for API key auth)
-        let rate_limiter = Arc::new(RateLimiter::new(self.rate_limit_config.unwrap_or_default()));
-
-        // Create idempotency cache
-        let idempotency_cache = Arc::new(IdempotencyCache::new(
-            self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL),
-        ));
-
-        // Create metrics registry with optional KMS metrics
-        let mut registry = MetricsRegistry::new();
-        if let Some(kms_m) = kms_metrics {
-            registry.set_kms_metrics(kms_m);
-            tracing::debug!("KMS metrics integrated with /metrics endpoint");
-        }
-        let metrics = Arc::new(registry);
-
-        let app_state = AppState {
-            authenticator,
-            authorizer,
-            catalog,
-            credential_provider,
-            rate_limiter,
-            idempotency_cache,
-            view_storage,
-            metrics,
-            warehouse_location,
-            default_tenant_id,
-        };
-
-        let cors_config = self.cors_config.clone().unwrap_or_default();
-
-        (
-            App {
-                app_state,
-                cors_config,
-            },
-            api_key_store,
-        )
-    }
-
-    /// Creates an App with persistent API key storage using KvApiKeyStore.
-    ///
-    /// Unlike `build_with_api_key_auth_async`, this method stores API keys in
-    /// persistent storage (SlateDB) that survives server restarts.
-    ///
-    /// # Features
-    ///
-    /// - **Persistent storage**: API keys survive restarts
-    /// - **Optional encryption**: AES-256-GCM encryption when key is provided
-    /// - **K8s ready**: Horizontal scaling with S3/GCS object storage
-    ///
-    /// # Storage Backend
-    ///
-    /// Uses the same storage backend URL as the catalog:
-    /// - `file:///path` - Local filesystem (single node)
-    /// - `s3://bucket/prefix` - S3 (K8s horizontal scaling)
-    /// - `memory://` - In-memory (testing only)
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use rustberg::App;
-    /// use rustberg::crypto::Aes256GcmProvider;
-    ///
-    /// # async fn example() {
-    /// // With encryption (recommended for production)
-    /// let key = Aes256GcmProvider::generate_key();
-    /// let (app, store) = App::builder()
-    ///     .with_storage_backend("file:///data/catalog")
-    ///     .with_encryption_key(key)
-    ///     .build_with_persistent_api_key_auth_async()
-    ///     .await;
-    ///
-    /// // Without encryption (for development)
-    /// let (app, store) = App::builder()
-    ///     .with_storage_backend("memory://")
-    ///     .build_with_persistent_api_key_auth_async()
-    ///     .await;
-    /// # }
-    /// ```
-    #[cfg(feature = "slatedb-storage")]
-    pub async fn build_with_persistent_api_key_auth_async(self) -> (App, Arc<KvApiKeyStore>) {
-        use crate::storage::SlateDbStore;
-
-        let warehouse_location = self.warehouse_location.unwrap_or_else(temp_path);
-        let default_tenant_id = self
-            .default_tenant_id
-            .unwrap_or_else(|| "default".to_string());
-        let storage_backend_url = self.storage_backend_url.clone();
-        let enable_table_encryption = self.enable_table_encryption;
-        let kms_config = self.kms_config.clone();
-        let kms_key_id = self.kms_key_id.clone();
-        let idempotency_ttl = self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL);
-
-        // Create catalog, view storage, and idempotency store based on storage backend URL
-        let (base_catalog, view_storage, idempotency_store) = if let Some(catalog) = self.catalog {
-            // When custom catalog is provided, use in-memory stores
-            (
-                catalog,
-                Arc::new(ViewStorage::new()) as Arc<dyn ViewStore>,
-                None,
-            )
-        } else {
-            Self::create_all_stores(
-                storage_backend_url.as_deref(),
-                &warehouse_location,
-                self.io_timeout_config.clone(),
-            )
-            .await
-            .expect("Failed to create catalog and storage")
-        };
-
-        // Wrap catalog with encryption if enabled, and capture KMS metrics
-        let (catalog, kms_metrics): (
-            Arc<dyn CatalogExt + Send + Sync>,
-            Option<Arc<crate::crypto::KmsMetrics>>,
-        ) = if enable_table_encryption {
-            if let Some(kms_config) = kms_config {
-                let kms = create_kms(kms_config, None)
-                    .await
-                    .expect("Failed to create KMS for table encryption");
-
-                // Extract KMS metrics before moving kms into EncryptedCatalog
-                let kms_metrics = kms.kms_metrics();
-
-                let key_id = kms_key_id.unwrap_or_else(|| "rustberg-master".to_string());
-                tracing::info!(key_id = %key_id, "Table metadata encryption enabled with KMS");
-                (
-                    Arc::new(EncryptedCatalog::new(base_catalog, kms, key_id)),
-                    kms_metrics,
-                )
-            } else {
-                tracing::warn!(
-                    "Table encryption requested but no KMS configured. \
-                         Use with_kms_config() to configure KMS. Proceeding without encryption."
-                );
-                (base_catalog, None)
-            }
-        } else {
-            (base_catalog, None)
-        };
-
-        // Create KvStore for API key storage
-        // Use "apikeys" subdirectory to separate from catalog data
-        let kv_url = match &storage_backend_url {
-            Some(url) if url.starts_with("file://") => {
-                let base = url.strip_prefix("file://").unwrap_or(url);
-                format!("file://{}/apikeys", base)
-            }
-            Some(url)
-                if url.starts_with("s3://")
-                    || url.starts_with("gs://")
-                    || url.starts_with("az://") =>
-            {
-                format!("{}/apikeys", url.trim_end_matches('/'))
-            }
-            _ => "memory://apikeys".to_string(),
-        };
-
-        // Ensure directory exists for file:// URLs
-        if kv_url.starts_with("file://") {
-            let path = kv_url.strip_prefix("file://").unwrap_or(&kv_url);
-            if let Err(e) = std::fs::create_dir_all(path) {
-                tracing::warn!(path = %path, error = %e, "Failed to create API key storage directory");
-            }
-        }
-
-        let kv = Arc::new(
-            SlateDbStore::open_url(&kv_url)
-                .await
-                .expect("Failed to open API key storage"),
-        );
-
-        // Create encryption provider if key is provided
-        let encryption: Option<Arc<dyn EncryptionProvider>> = self.encryption_key.map(|key| {
-            Arc::new(Aes256GcmProvider::new(&key).expect("Invalid encryption key"))
-                as Arc<dyn EncryptionProvider>
-        });
-
-        // Log encryption status
-        if encryption.is_some() {
-            tracing::info!(
-                storage = %kv_url,
-                "Created persistent API key store with AES-256-GCM encryption"
-            );
-        } else {
-            tracing::warn!(
-                storage = %kv_url,
-                "Created persistent API key store WITHOUT encryption. \
-                 Use with_encryption_key() for production deployments."
-            );
-        }
-
-        // Create persistent API key store
-        let api_key_store = Arc::new(KvApiKeyStore::new(kv, encryption));
-
-        // Create authenticator: API Key + optional JWT
-        let authenticator: Arc<dyn Authenticator> = if let Some(jwt_config) = self.jwt_config {
-            let jwt_auth = Arc::new(
-                JwtAuthenticator::new(jwt_config).expect("Failed to create JWT authenticator"),
-            );
-            let api_key_auth = Arc::new(ApiKeyAuthenticator::new(api_key_store.clone()));
-            Arc::new(ChainAuthenticator::new(vec![jwt_auth, api_key_auth]))
-        } else {
-            Arc::new(ApiKeyAuthenticator::new(api_key_store.clone()))
-        };
-
-        // Create authorizer with tenant isolation and RBAC
-        let rbac = Arc::new(RbacAuthorizer::new());
-        let authorizer: Arc<dyn Authorizer> = Arc::new(ChainAuthorizer::new(vec![
-            Arc::new(TenantIsolationAuthorizer::new(rbac.clone())),
-            rbac,
-        ]));
-
-        // Use provided credential provider or default to noop
-        let credential_provider = self
-            .credential_provider
-            .unwrap_or_else(|| Arc::new(NoopCredentialProvider::new()));
-
-        // Create rate limiter (enabled by default for API key auth)
-        let rate_limiter = Arc::new(RateLimiter::new(self.rate_limit_config.unwrap_or_default()));
-
-        // Create idempotency cache with optional persistent backing store
-        let idempotency_cache = if let Some(store) = idempotency_store {
-            let cache = IdempotencyCache::with_persistent_store(idempotency_ttl, store);
-            // Bootstrap from persistent store
-            if let Err(e) = cache.bootstrap_from_store().await {
-                tracing::warn!(error = %e, "Failed to bootstrap idempotency cache from persistent store");
-            }
-            Arc::new(cache)
-        } else {
-            Arc::new(IdempotencyCache::new(idempotency_ttl))
-        };
-
-        // Create metrics registry with optional KMS metrics
-        let mut registry = MetricsRegistry::new();
-        if let Some(kms_m) = kms_metrics {
-            registry.set_kms_metrics(kms_m);
-            tracing::debug!("KMS metrics integrated with /metrics endpoint");
-        }
-        let metrics = Arc::new(registry);
-
-        let app_state = AppState {
-            authenticator,
-            authorizer,
-            catalog,
-            credential_provider,
-            rate_limiter,
-            idempotency_cache,
-            view_storage,
-            metrics,
-            warehouse_location,
-            default_tenant_id,
-        };
-
-        let cors_config = self.cors_config.clone().unwrap_or_default();
-
-        (
-            App {
-                app_state,
-                cors_config,
-            },
-            api_key_store,
-        )
-    }
-
-    /// Creates an App with API key authentication pre-configured.
-    ///
-    /// Returns both the App and the API key store for management.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called from within an async context (use `build_with_api_key_auth_async` instead).
-    /// Also panics if the Tokio runtime, catalog, or KMS cannot be created.
-    pub fn build_with_api_key_auth(self) -> (App, Arc<InMemoryApiKeyStore>) {
-        let warehouse_location = self.warehouse_location.unwrap_or_else(temp_path);
-        let default_tenant_id = self
-            .default_tenant_id
-            .unwrap_or_else(|| "default".to_string());
-        let rate_limit_config = self.rate_limit_config.clone();
-        let idempotency_ttl = self.idempotency_ttl;
-        let jwt_config = self.jwt_config.clone();
-        let storage_backend_url = self.storage_backend_url.clone();
-        let warehouse_clone = warehouse_location.clone();
-        let enable_table_encryption = self.enable_table_encryption;
-        let kms_config = self.kms_config.clone();
-
-        let (base_catalog, view_storage): (Arc<dyn CatalogExt + Send + Sync>, Arc<dyn ViewStore>) =
-            if let Some(catalog) = self.catalog {
-                (catalog, Arc::new(ViewStorage::new()))
-            } else {
-                // Create catalog and view storage using tokio runtime
-                tokio::runtime::Runtime::new()
-                    .expect("Failed to create Tokio runtime — do not call from async context, use build_with_api_key_auth_async() instead")
-                    .block_on(async {
-                    #[cfg(feature = "slatedb-storage")]
-                    let result = Self::create_catalog_and_view_store(storage_backend_url.as_deref(), &warehouse_clone, self.io_timeout_config.clone())
+                    let remote = crate::catalog::RestCatalog::connect(&config.catalog_url, token)
                         .await
-                        .expect("Failed to create catalog");
-                    #[cfg(not(feature = "slatedb-storage"))]
-                    let result = Self::create_catalog_and_view_store(storage_backend_url.as_deref(), &warehouse_clone)
-                        .await
-                        .expect("Failed to create catalog");
-                    result
-                })
+                        .map_err(|e| {
+                            crate::error::AppError::Internal(format!(
+                                "Mount '{name}' could not connect: {e}"
+                            ))
+                        })?;
+
+                    // Negotiated from the remote's own config response rather than
+                    // assumed: a remote serving no views produces a mount reporting
+                    // none, instead of one that offers them and fails on use.
+                    let capabilities = remote.capabilities();
+                    (Arc::new(remote) as Arc<dyn CatalogStore>, capabilities)
+                }
+
+                other => {
+                    return Err(crate::error::AppError::Internal(format!(
+                        "Mount '{name}' names backend '{other}', which does not exist. \
+                     Supported backends: native, rest."
+                    )));
+                }
             };
 
-        // Wrap catalog with encryption if enabled, and capture KMS metrics
-        let (catalog, kms_metrics): (
-            Arc<dyn CatalogExt + Send + Sync>,
-            Option<Arc<crate::crypto::KmsMetrics>>,
-        ) = if enable_table_encryption {
-            if let Some(kms_config) = kms_config {
-                // Create KMS using tokio runtime
-                let kms = tokio::runtime::Runtime::new()
-                    .expect("Failed to create Tokio runtime for KMS")
-                    .block_on(async {
-                        create_kms(kms_config, None)
-                            .await
-                            .expect("Failed to create KMS for table encryption")
-                    });
+        // Only a backend that stores something has a warehouse. A `rest` mount
+        // reads from a catalog Rustberg does not own, so it contributes no
+        // prefix that credentials may be vended for.
+        let warehouse = match config.backend.trim().to_ascii_lowercase().as_str() {
+            "rest" => None,
+            _ => Some(config.warehouse_location.clone()),
+        };
 
-                // Extract KMS metrics before moving kms into EncryptedCatalog
-                let kms_metrics = kms.kms_metrics();
+        Ok(Mount {
+            name: name.to_string(),
+            store,
+            capabilities,
+            owner: config.owner.clone(),
+            warehouse,
+        })
+    }
 
-                let key_id = self
-                    .kms_key_id
-                    .unwrap_or_else(|| "rustberg-master".to_string());
-                tracing::info!(key_id = %key_id, "Table metadata encryption enabled with KMS");
-                (
-                    Arc::new(EncryptedCatalog::new(base_catalog, kms, key_id)),
-                    kms_metrics,
-                )
-            } else {
-                tracing::warn!(
-                    "Table encryption requested but no KMS configured. \
-                         Use with_kms_config() to configure KMS. Proceeding without encryption."
-                );
-                (base_catalog, None)
+    /// Loads the policy set from the store, seeding it when empty.
+    ///
+    /// # Precedence, and why the store wins
+    ///
+    /// A configured policy file **seeds an empty store** and is then no longer
+    /// authoritative. The alternative — file wins on every start — would
+    /// silently discard every change made through the API the moment a pod
+    /// restarted, which is a data-loss bug wearing a configuration hat.
+    ///
+    /// Divergence between the two is logged loudly at startup, because an
+    /// operator who edits the file and restarts expecting it to apply is
+    /// otherwise left with no signal at all.
+    ///
+    /// # Errors
+    ///
+    /// Refuses to start when the effective policy set permits nothing. An
+    /// authenticated deployment whose policy set is empty accepts nobody — for
+    /// anything, including fixing the policy set — so coming up would produce a
+    /// server that cannot be recovered without a restart it did not ask for.
+    async fn load_policy_admin(
+        store: Arc<dyn crate::auth::policy_store::PolicyStore>,
+        configured: Option<&str>,
+    ) -> Result<PolicyAdmin, crate::error::AppError> {
+        use crate::auth::DEFAULT_POLICIES;
+        use crate::auth::policy_store::version_of;
+        use crate::auth::reloadable::ReloadableAuthorizer;
+
+        let revision = match store.current().await? {
+            Some(current) => {
+                if let Some(configured) = configured
+                    && version_of(configured) != current.version
+                {
+                    tracing::warn!(
+                        stored_version = %current.version,
+                        stored_sequence = current.sequence,
+                        "The configured policy file differs from the stored policy set, \
+                         and the STORE is authoritative. The file seeds an empty store \
+                         only. Change policy through PUT /management/v1/policies."
+                    );
+                }
+                current
             }
-        } else {
-            (base_catalog, None)
+            None => {
+                let seed = configured.unwrap_or(DEFAULT_POLICIES);
+                let source = if configured.is_some() {
+                    "file"
+                } else {
+                    "defaults"
+                };
+                let revision = store
+                    .append(seed, "system:bootstrap", Some("Seeded at startup"))
+                    .await?;
+                tracing::info!(
+                    seeded_from = source,
+                    version = %revision.version,
+                    "Policy store was empty; seeded it"
+                );
+                revision
+            }
         };
 
-        // Create API key store
-        let api_key_store = Arc::new(InMemoryApiKeyStore::new());
+        let authorizer = CedarAuthorizer::new(&revision.source).map_err(|e| {
+            crate::error::AppError::Internal(format!(
+                "The stored policy set (revision {}) is not usable: {e}. It \
+                 typechecked when it was stored, so the schema has changed \
+                 underneath it.",
+                revision.sequence
+            ))
+        })?;
 
-        // Create authenticator: API Key + optional JWT
-        let authenticator: Arc<dyn Authenticator> = if let Some(jwt_config) = jwt_config {
-            // Create JWT authenticator
-            let jwt_auth = Arc::new(
-                JwtAuthenticator::new(jwt_config).expect("Failed to create JWT authenticator"),
-            );
-            let api_key_auth = Arc::new(ApiKeyAuthenticator::new(api_key_store.clone()));
-
-            // Chain: JWT first (Bearer token), then API Key
-            Arc::new(ChainAuthenticator::new(vec![jwt_auth, api_key_auth]))
-        } else {
-            // API Key only
-            Arc::new(ApiKeyAuthenticator::new(api_key_store.clone()))
-        };
-
-        // Create authorizer with tenant isolation and RBAC
-        let rbac = Arc::new(RbacAuthorizer::new());
-        let authorizer: Arc<dyn Authorizer> = Arc::new(ChainAuthorizer::new(vec![
-            Arc::new(TenantIsolationAuthorizer::new(rbac.clone())),
-            rbac,
-        ]));
-
-        // Use provided credential provider or default to noop
-        let credential_provider = self
-            .credential_provider
-            .unwrap_or_else(|| Arc::new(NoopCredentialProvider::new()));
-
-        // Create rate limiter (enabled by default for API key auth)
-        let rate_limiter = Arc::new(RateLimiter::new(rate_limit_config.unwrap_or_default()));
-
-        // Create idempotency cache
-        let idempotency_cache = Arc::new(IdempotencyCache::new(
-            idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL),
-        ));
-
-        // Create metrics registry with optional KMS metrics
-        let mut registry = MetricsRegistry::new();
-        if let Some(kms_m) = kms_metrics {
-            registry.set_kms_metrics(kms_m);
-            tracing::debug!("KMS metrics integrated with /metrics endpoint");
+        if authorizer.is_empty() {
+            return Err(crate::error::AppError::Internal(format!(
+                "The policy set (revision {}) contains no policies, so this server would \
+                 accept nobody — including anyone trying to fix it. Configure \
+                 `server.auth.policy_file`, or start with the built-in defaults.",
+                revision.sequence
+            )));
         }
-        let metrics = Arc::new(registry);
 
-        let app_state = AppState {
-            authenticator,
+        tracing::info!(
+            sequence = revision.sequence,
+            version = %revision.version,
+            "Policy set loaded"
+        );
+
+        let authorizer = Arc::new(ReloadableAuthorizer::new(authorizer, revision.sequence));
+
+        // Replicas converge by polling. A single-replica deployment swaps
+        // locally on write and never needs this, but it is harmless there and
+        // its absence would be silently wrong the moment a second replica
+        // appeared.
+        // Held, not discarded: a spawned task keeps its own `Arc`s alive, so a
+        // forgotten poller outlives the application and goes on querying the
+        // database until the process exits.
+        let poller = crate::auth::reloadable::spawn_policy_poller(
+            store.clone(),
+            authorizer.clone(),
+            crate::auth::reloadable::POLL_INTERVAL,
+        );
+
+        Ok(PolicyAdmin {
+            store,
             authorizer,
-            catalog,
-            credential_provider,
-            rate_limiter,
-            idempotency_cache,
-            view_storage,
-            metrics,
-            warehouse_location,
-            default_tenant_id,
-        };
-
-        let cors_config = self.cors_config.unwrap_or_default();
-
-        (
-            App {
-                app_state,
-                cors_config,
-            },
-            api_key_store,
-        )
+            poller: Arc::new(poller),
+        })
     }
 
     /// Builds the App with the configured options (async version).
     ///
-    /// Use this when building from within an async context.
-    pub async fn build_async(self) -> App {
-        let warehouse_location = self.warehouse_location.unwrap_or_else(temp_path);
-        let default_tenant_id = self
-            .default_tenant_id
-            .unwrap_or_else(|| "default".to_string());
-
-        let (catalog, view_storage) = if let Some(catalog) = self.catalog {
-            // If custom catalog provided, use MemoryViewStore
-            (
-                catalog,
-                Arc::new(MemoryViewStore::new()) as Arc<dyn ViewStore>,
-            )
-        } else {
-            // Create catalog and view store based on storage backend URL
-            #[cfg(feature = "slatedb-storage")]
-            let result = Self::create_catalog_and_view_store(
-                self.storage_backend_url.as_deref(),
-                &warehouse_location,
-                self.io_timeout_config.clone(),
-            )
-            .await
-            .expect("Failed to create catalog and view store");
-            #[cfg(not(feature = "slatedb-storage"))]
-            let result = Self::create_catalog_and_view_store(
-                self.storage_backend_url.as_deref(),
-                &warehouse_location,
-            )
-            .await
-            .expect("Failed to create catalog and view store");
-            result
-        };
-
-        let (authenticator, authorizer): (Arc<dyn Authenticator>, Arc<dyn Authorizer>) = if self
-            .enable_auth
-        {
-            // Default secure configuration
-            let api_key_store = Arc::new(InMemoryApiKeyStore::new());
-
-            // Create authenticator: API Key + optional JWT
-            let authenticator: Arc<dyn Authenticator> = if let Some(jwt_config) = self.jwt_config {
-                // Create JWT authenticator
-                let jwt_auth = Arc::new(
-                    JwtAuthenticator::new(jwt_config).expect("Failed to create JWT authenticator"),
-                );
-                let api_key_auth = Arc::new(ApiKeyAuthenticator::new(api_key_store));
-
-                // Chain: JWT first (Bearer token), then API Key
-                Arc::new(ChainAuthenticator::new(vec![jwt_auth, api_key_auth]))
-            } else {
-                // API Key only
-                Arc::new(ApiKeyAuthenticator::new(api_key_store))
-            };
-
-            let rbac = Arc::new(RbacAuthorizer::new());
-            let authorizer = Arc::new(ChainAuthorizer::new(vec![
-                Arc::new(TenantIsolationAuthorizer::new(rbac.clone())),
-                rbac,
-            ]));
-
-            (authenticator, authorizer)
-        } else {
-            // Development mode - allow all
-            let authenticator = self
-                .authenticator
-                .unwrap_or_else(|| Arc::new(AllowAllAuthenticator));
-
-            let authorizer = self
-                .authorizer
-                .unwrap_or_else(|| Arc::new(AllowAllAuthorizer));
-
-            (authenticator, authorizer)
-        };
-
-        // Use provided credential provider or default to noop
-        let credential_provider = self
-            .credential_provider
-            .unwrap_or_else(|| Arc::new(NoopCredentialProvider::new()));
-
-        // Create rate limiter (disabled by default in dev mode for build_async, unless explicitly configured)
-        let rate_limiter = Arc::new(RateLimiter::new(self.rate_limit_config.unwrap_or_else(
-            || {
-                if self.enable_auth {
-                    RateLimitConfig::default()
-                } else {
-                    RateLimitConfig::disabled()
-                }
-            },
-        )));
-
-        // Create idempotency cache
-        let idempotency_cache = Arc::new(IdempotencyCache::new(
-            self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL),
-        ));
-
-        // Create metrics registry
-        let metrics = Arc::new(MetricsRegistry::new());
-
-        let app_state = AppState {
-            authenticator,
-            authorizer,
-            catalog,
-            credential_provider,
-            rate_limiter,
-            idempotency_cache,
-            view_storage,
-            metrics,
-            warehouse_location,
-            default_tenant_id,
-        };
-
-        let cors_config = self.cors_config.clone().unwrap_or_default();
-
-        App {
-            app_state,
-            cors_config,
-        }
-    }
-
     /// Builds the App with the configured options.
     ///
-    /// # Panics
+    /// Builds the app.
     ///
-    /// Panics if called from within an async context (use `build_async` instead).
-    /// Also panics if the Tokio runtime, catalog, or KMS cannot be created.
-    pub fn build(self) -> App {
+    /// Async because opening the catalog is async. There is deliberately no
+    /// blocking variant: one would need a temporary Tokio runtime, which panics
+    /// when called from an async context and leaves the catalog holding a handle
+    /// to a runtime that is about to be dropped.
+    pub async fn build(self) -> Result<App, crate::error::AppError> {
+        self.assemble(None).await
+    }
+
+    /// Builds the app with API-key authentication.
+    ///
+    /// Keys come from configuration ([`Self::with_api_keys`]); there is no
+    /// key store to manage, encrypt, or back up.
+    pub async fn build_with_api_keys(
+        self,
+    ) -> Result<(App, Arc<InMemoryApiKeyStore>), crate::error::AppError> {
+        let keys = Arc::new(InMemoryApiKeyStore::with_keys(self.api_keys.clone()));
+        let store = keys.clone();
+        Ok((self.assemble(Some(keys)).await?, store))
+    }
+
+    /// The single assembly path.
+    ///
+    /// The public builders differ only in how API keys are stored, so that is
+    /// the only thing parameterised here. Catalog construction, authenticator
+    /// wiring, rate-limit defaults and state assembly happen once, so they
+    /// cannot drift between entry points.
+    async fn assemble(
+        self,
+        api_keys: Option<Arc<InMemoryApiKeyStore>>,
+    ) -> Result<App, crate::error::AppError> {
         let warehouse_location = self.warehouse_location.unwrap_or_else(temp_path);
         let default_tenant_id = self
             .default_tenant_id
             .unwrap_or_else(|| "default".to_string());
-        let storage_backend_url = self.storage_backend_url.clone();
-        let warehouse_clone = warehouse_location.clone();
-        let enable_table_encryption = self.enable_table_encryption;
-        let kms_config = self.kms_config.clone();
 
-        let (base_catalog, view_storage): (Arc<dyn CatalogExt + Send + Sync>, Arc<dyn ViewStore>) =
-            if let Some(catalog) = self.catalog {
-                // If custom catalog provided, use MemoryViewStore
-                (
-                    catalog,
-                    Arc::new(MemoryViewStore::new()) as Arc<dyn ViewStore>,
-                )
-            } else {
-                // Create catalog and view store using tokio runtime
-                tokio::runtime::Runtime::new()
-                .expect("Failed to create Tokio runtime — do not call from async context, use build_async() instead")
-                .block_on(async {
-                #[cfg(feature = "slatedb-storage")]
-                let result = Self::create_catalog_and_view_store(storage_backend_url.as_deref(), &warehouse_clone, self.io_timeout_config.clone())
-                    .await
-                    .expect("Failed to create catalog and view store");
-                #[cfg(not(feature = "slatedb-storage"))]
-                let result = Self::create_catalog_and_view_store(storage_backend_url.as_deref(), &warehouse_clone)
-                    .await
-                    .expect("Failed to create catalog and view store");
-                result
-            })
-            };
-
-        // Wrap catalog with encryption if enabled, and capture KMS metrics
-        let (catalog, kms_metrics): (
-            Arc<dyn CatalogExt + Send + Sync>,
-            Option<Arc<crate::crypto::KmsMetrics>>,
-        ) = if enable_table_encryption {
-            if let Some(kms_config) = kms_config {
-                // Create KMS using tokio runtime
-                let kms = tokio::runtime::Runtime::new()
-                    .expect("Failed to create Tokio runtime for KMS")
-                    .block_on(async {
-                        create_kms(kms_config, None)
-                            .await
-                            .expect("Failed to create KMS for table encryption")
-                    });
-
-                // Extract KMS metrics before moving kms into EncryptedCatalog
-                let kms_metrics = kms.kms_metrics();
-
-                let key_id = self
-                    .kms_key_id
-                    .clone()
-                    .unwrap_or_else(|| "rustberg-master".to_string());
-                tracing::info!(key_id = %key_id, "Table metadata encryption enabled with KMS");
-                (
-                    Arc::new(EncryptedCatalog::new(base_catalog, kms, key_id)),
-                    kms_metrics,
-                )
-            } else {
-                tracing::warn!(
-                    "Table encryption requested but no KMS configured. \
-                         Use with_kms_config() to configure KMS. Proceeding without encryption."
-                );
-                (base_catalog, None)
+        // A catalog Rustberg opens is also the policy store. One supplied from
+        // outside is not required to be, so such a deployment gets runtime
+        // policy administration only if it also supplies a store — otherwise the
+        // management endpoints say it is unavailable rather than half-working.
+        let (catalog, opened_policy_store, shared_idempotency) = match self.catalog {
+            Some(catalog) => (catalog, None, None),
+            None => {
+                Self::create_all_stores(self.catalog_url.as_deref(), &warehouse_location).await?
             }
+        };
+        let policy_store = self.policy_store.or(opened_policy_store);
+
+        // Mounts layer over whatever catalog was built, so adding one does not
+        // disturb the namespaces that were already there.
+        let mut capabilities = crate::catalog::Capabilities::full();
+        // Every warehouse this server manages, which is what credential vending
+        // may be scoped to. A mount's warehouse missing from here would make its
+        // tables silently un-credentialed: the provider refuses, the request
+        // still succeeds, and the client gets metadata it cannot read.
+        let mut managed_warehouses = vec![warehouse_location.clone()];
+        let catalog: Arc<dyn CatalogStore> = if self.mounts.is_empty() {
+            catalog
         } else {
-            (base_catalog, None)
+            let names: Vec<String> = self.mounts.iter().map(|m| m.name.clone()).collect();
+            let federated = crate::catalog::FederatedCatalog::new(catalog, self.mounts)
+                .map_err(|e| crate::error::AppError::Internal(format!("Invalid mounts: {e}")))?;
+            // A mount whose name already exists underneath would hide it, and a
+            // subtree that silently does not exist is worse than a server that
+            // refuses to start — the same rule C1 applies to a mount that cannot
+            // be opened.
+            federated
+                .ensure_no_shadowing()
+                .await
+                .map_err(|e| crate::error::AppError::Internal(e.to_string()))?;
+            capabilities = federated.effective_capabilities();
+            managed_warehouses = federated.warehouses(&warehouse_location);
+            tracing::info!(
+                mounts = ?names,
+                ?capabilities,
+                "Federating mounted catalogs"
+            );
+            Arc::new(federated)
         };
 
-        let (authenticator, authorizer): (Arc<dyn Authenticator>, Arc<dyn Authorizer>) = if self
-            .enable_auth
+        // Every configured mechanism, tried in order: an explicitly supplied
+        // authenticator wins outright, then OIDC/JWT, then API keys.
+        //
+        // Assembled from what was configured, never from one of its inputs. A
+        // chain keyed on "is there an API key store" answers the wrong question:
+        // a host that configures OIDC alone has no key store, and would fall
+        // through to a fallback that authenticates nobody while its own
+        // configuration says otherwise. A mechanism that was asked for and does
+        // not attach is a startup failure rather than an open door.
+        let mut mechanisms: Vec<Arc<dyn Authenticator>> = Vec::new();
+        if let Some(explicit) = self.authenticator {
+            mechanisms.push(explicit);
+        }
+        if let Some(cfg) = self.jwt_config {
+            // A `Result` builder has no business panicking on a configuration
+            // value: an unreachable JWKS URL or a missing audience is an
+            // operator error to report, not a crash to debug from a backtrace.
+            mechanisms.push(Arc::new(JwtAuthenticator::new(cfg).map_err(|e| {
+                crate::error::AppError::Internal(format!(
+                    "OIDC/JWT authentication was configured but could not be built: {e}"
+                ))
+            })?));
+        }
+        if let Some(store) = api_keys.clone() {
+            mechanisms.push(Arc::new(ApiKeyAuthenticator::new(store)));
+        }
+
+        let authenticated = !mechanisms.is_empty();
+        let authenticator: Arc<dyn Authenticator> = if mechanisms.is_empty() {
+            // Nothing was configured, so there is nothing to check. Said out
+            // loud, because the difference between "no authentication" and
+            // "authentication that silently did not attach" is the whole finding
+            // above, and a log line is what makes the two distinguishable.
+            tracing::warn!(
+                "No authenticator configured: every request is the anonymous principal. \
+                 Policy still decides what it may do, and by default that is nothing. \
+                 Configure OIDC (`with_jwt_config`) or API keys (`build_with_api_keys`)."
+            );
+            Arc::new(AllowAllAuthenticator)
+        } else if mechanisms.len() == 1 {
+            mechanisms.remove(0)
+        } else {
+            Arc::new(ChainAuthenticator::new(mechanisms))
+        };
+
+        let (authorizer, policy_admin): (Arc<dyn Authorizer>, Option<PolicyAdmin>) = match self
+            .authorizer
         {
-            // Default secure configuration
-            let api_key_store = Arc::new(InMemoryApiKeyStore::new());
-
-            // Create authenticator: API Key + optional JWT
-            let authenticator: Arc<dyn Authenticator> = if let Some(jwt_config) = self.jwt_config {
-                // Create JWT authenticator
-                let jwt_auth = Arc::new(
-                    JwtAuthenticator::new(jwt_config).expect("Failed to create JWT authenticator"),
-                );
-                let api_key_auth = Arc::new(ApiKeyAuthenticator::new(api_key_store));
-
-                // Chain: JWT first (Bearer token), then API Key
-                Arc::new(ChainAuthenticator::new(vec![jwt_auth, api_key_auth]))
-            } else {
-                // API Key only
-                Arc::new(ApiKeyAuthenticator::new(api_key_store))
-            };
-
-            let rbac = Arc::new(RbacAuthorizer::new());
-            let authorizer = Arc::new(ChainAuthorizer::new(vec![
-                Arc::new(TenantIsolationAuthorizer::new(rbac.clone())),
-                rbac,
-            ]));
-
-            (authenticator, authorizer)
-        } else {
-            // Development mode - allow all
-            let authenticator = self
-                .authenticator
-                .unwrap_or_else(|| Arc::new(AllowAllAuthenticator));
-
-            let authorizer = self
-                .authorizer
-                .unwrap_or_else(|| Arc::new(AllowAllAuthorizer));
-
-            (authenticator, authorizer)
+            // An explicitly supplied authorizer always wins, and is not
+            // administrable: Rustberg does not know how to rebuild it.
+            Some(authorizer) => (authorizer, None),
+            None if authenticated => match policy_store {
+                Some(store) => {
+                    let admin = Self::load_policy_admin(store, self.policies.as_deref()).await?;
+                    let authorizer = admin.authorizer.clone() as Arc<dyn Authorizer>;
+                    (authorizer, Some(admin))
+                }
+                // Cedar without a store: policy is whatever was configured,
+                // and changing it is a restart.
+                None => (
+                    Arc::new(build_authorizer(self.policies.as_deref())) as Arc<dyn Authorizer>,
+                    None,
+                ),
+            },
+            // Unauthenticated development mode.
+            None => (Arc::new(AllowAllAuthorizer), None),
         };
 
-        // Use provided credential provider or default to noop
-        let credential_provider = self
-            .credential_provider
-            .unwrap_or_else(|| Arc::new(NoopCredentialProvider::new()));
-
-        // Create rate limiter (disabled by default in dev mode, unless explicitly configured)
         let rate_limiter = Arc::new(RateLimiter::new(self.rate_limit_config.unwrap_or_else(
             || {
-                if self.enable_auth {
+                if authenticated {
                     RateLimitConfig::default()
                 } else {
                     RateLimitConfig::disabled()
@@ -1539,38 +1148,83 @@ impl AppBuilder {
             },
         )));
 
-        // Create idempotency cache
-        let idempotency_cache = Arc::new(IdempotencyCache::new(
-            self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL),
-        ));
+        // An explicitly supplied provider wins; otherwise the `[credentials]`
+        // section decides. It is resolved here rather than at the call site
+        // because defaulting the allowed prefixes needs the warehouse location,
+        // which is only settled by this point.
+        let credential_provider: Arc<dyn StorageCredentialProvider> = match self.credential_provider
+        {
+            Some(provider) => provider,
+            None => match self.credentials_config.as_ref() {
+                Some(config) => {
+                    crate::credentials::build_credential_provider(config, &managed_warehouses)
+                        .await?
+                }
+                None => Arc::new(NoopCredentialProvider::new()),
+            },
+        };
 
-        // Create metrics registry with optional KMS metrics
-        let mut registry = MetricsRegistry::new();
-        if let Some(kms_m) = kms_metrics {
-            registry.set_kms_metrics(kms_m);
-            tracing::debug!("KMS metrics integrated with /metrics endpoint");
-        }
-        let metrics = Arc::new(registry);
+        // Signing is configured alongside vending and is independent of it: a
+        // deployment may offer either, both or neither.
+        let signing_config = self
+            .credentials_config
+            .as_ref()
+            .and_then(|config| config.signing.clone())
+            .unwrap_or_default();
+
+        let request_signer: Arc<dyn crate::credentials::RequestSigner> = match self.request_signer {
+            Some(signer) => signer,
+            None => match self.credentials_config.as_ref() {
+                Some(config) => {
+                    crate::credentials::build_request_signer(config, &managed_warehouses).await?
+                }
+                None => Arc::new(crate::credentials::NoopRequestSigner),
+            },
+        };
+
+        let signing = crate::catalog::v1::sign::SigningEndpointConfig {
+            // A host that supplied its own signer means to serve the endpoint,
+            // whether or not it wrote a `[credentials.signing]` section.
+            enabled: signing_config.enabled || !request_signer.allowed_prefixes().is_empty(),
+            url_style: Some(crate::catalog::v1::sign::UrlStyle::parse(
+                &signing_config.url_style,
+            )?),
+            endpoint_host: signing_config.endpoint_host.clone(),
+            fallback_region: signing_config.region.clone(),
+        };
 
         let app_state = AppState {
             authenticator,
             authorizer,
             catalog,
             credential_provider,
+            request_signer,
+            signing,
             rate_limiter,
-            idempotency_cache,
-            view_storage,
-            metrics,
-            warehouse_location,
+            idempotency_cache: Arc::new({
+                let cache = IdempotencyCache::new(
+                    self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL),
+                );
+                match shared_idempotency {
+                    Some(store) => cache.with_shared_store(store),
+                    None => cache,
+                }
+            }),
+            metrics: Arc::new(MetricsRegistry::new()),
+            auditor: self
+                .auditor
+                .unwrap_or_else(|| Arc::new(crate::auth::Auditor::disabled())),
+            default_warehouse: DefaultWarehouse::new(warehouse_location),
             default_tenant_id,
+            oauth2_server_uri: self.oauth2_server_uri,
+            policy_admin,
+            capabilities,
         };
 
-        let cors_config = self.cors_config.unwrap_or_default();
-
-        App {
+        Ok(App {
             app_state,
-            cors_config,
-        }
+            cors_config: self.cors_config.unwrap_or_default(),
+        })
     }
 }
 
@@ -1578,68 +1232,165 @@ impl AppBuilder {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_app_builder_default() {
-        let app = App::builder().build();
-        assert!(!app.state().warehouse_location.is_empty());
-        assert_eq!(app.state().default_tenant_id(), "default");
-    }
+    #[tokio::test]
+    async fn builds_with_defaults() {
+        let app = App::builder()
+            .with_warehouse_location(crate::utils::temp_path())
+            .build()
+            .await
+            .unwrap();
 
-    #[test]
-    fn test_app_builder_custom_warehouse() {
-        // Use a cross-platform compatible path format
-        // On Windows, paths with drive letters are misinterpreted as URL schemes
-        let warehouse = if cfg!(windows) {
-            "file:///C:/custom/warehouse".to_string()
-        } else {
-            "/custom/warehouse".to_string()
-        };
-
-        let app = App::builder().with_warehouse_location(&warehouse).build();
-
-        assert_eq!(app.state().warehouse_location, warehouse);
-    }
-
-    #[test]
-    fn test_app_builder_custom_tenant() {
-        let app = App::builder().with_default_tenant_id("my-tenant").build();
-
-        assert_eq!(app.state().default_tenant_id(), "my-tenant");
-    }
-
-    #[test]
-    fn test_app_with_api_key_auth() {
-        let (app, store) = App::builder().build_with_api_key_auth();
-        assert!(Arc::strong_count(&store) >= 1);
+        assert!(!app.state().default_warehouse.advertised().is_empty());
         assert_eq!(app.state().default_tenant_id(), "default");
     }
 
     #[tokio::test]
-    async fn test_security_headers_present() {
+    async fn honours_the_configured_tenant() {
+        let app = App::builder()
+            .with_warehouse_location(crate::utils::temp_path())
+            .with_default_tenant_id("acme")
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(app.state().default_tenant_id(), "acme");
+    }
+
+    // ── Authentication attaches, or the build fails ───────────────────────
+
+    fn jwt_config() -> crate::auth::JwtConfig {
+        crate::auth::JwtConfig {
+            issuer: "https://issuer.example.com".to_string(),
+            audience: "rustberg-api".to_string(),
+            jwks_url: "https://issuer.example.com/.well-known/jwks.json".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Configuring OIDC alone must install the JWT authenticator and a real
+    /// authorizer.
+    ///
+    /// The binary always builds with an API key store, so a fallback keyed on
+    /// that store is never exercised there — only on the library surface, which
+    /// is documented as carrying the same guarantees as the server.
+    #[tokio::test]
+    async fn configuring_oidc_alone_still_authenticates_and_authorizes() {
+        let app = App::builder()
+            .with_warehouse_location(crate::utils::temp_path())
+            .with_jwt_config(jwt_config())
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            app.state().authenticator.auth_method(),
+            crate::auth::AuthMethod::Bearer,
+            "the configured JWT authenticator must be the one installed"
+        );
+
+        // An anonymous caller must not be permitted anything.
+        let anonymous = crate::auth::AuthzContext::new(
+            crate::auth::Principal::anonymous(),
+            crate::auth::Resource::table("default", ["ns".to_string()], "t"),
+            crate::auth::Action::Read,
+        );
+        assert!(
+            !app.state().authorizer.permits(&anonymous).await,
+            "an unauthenticated caller must be denied by policy"
+        );
+    }
+
+    /// The same hole, reached through a host's own authenticator rather than
+    /// through OIDC: it too left `authenticated` false and the authorizer open.
+    #[tokio::test]
+    async fn a_host_supplied_authenticator_also_engages_policy() {
+        let app = App::builder()
+            .with_warehouse_location(crate::utils::temp_path())
+            .with_authenticator(Arc::new(crate::auth::DenyAllAuthenticator))
+            .build()
+            .await
+            .unwrap();
+
+        let anonymous = crate::auth::AuthzContext::new(
+            crate::auth::Principal::anonymous(),
+            crate::auth::Resource::table("default", ["ns".to_string()], "t"),
+            crate::auth::Action::Read,
+        );
+        assert!(!app.state().authorizer.permits(&anonymous).await);
+    }
+
+    /// A configuration error is reported, not panicked on: a `Result` builder
+    /// has no business aborting the process over a value an operator typed.
+    #[tokio::test]
+    async fn unbuildable_oidc_configuration_is_an_error_not_a_panic() {
+        let err = App::builder()
+            .with_warehouse_location(crate::utils::temp_path())
+            .with_jwt_config(crate::auth::JwtConfig {
+                audience: String::new(), // required
+                ..jwt_config()
+            })
+            .build()
+            .await
+            .err()
+            .expect("an unbuildable authenticator must not silently vanish");
+
+        assert!(
+            err.to_string().contains("OIDC/JWT"),
+            "the message must name what failed to attach: {err}"
+        );
+    }
+
+    /// Keys are configuration: the store is built from what the caller supplied,
+    /// with nothing persisted.
+    #[tokio::test]
+    async fn api_keys_come_from_configuration() {
+        use crate::auth::{ApiKeyBuilder, ApiKeyStore};
+
+        let (key, _plaintext) = ApiKeyBuilder::new("ci", "acme").with_role("reader").build();
+        let id = key.id;
+
+        let (_app, store) = App::builder()
+            .with_warehouse_location(crate::utils::temp_path())
+            .with_api_keys([key])
+            .build_with_api_keys()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get_by_id(&id).await.expect("configured key").name,
+            "ci"
+        );
+    }
+
+    /// Without configured keys there is nothing to authenticate against, so the
+    /// server must not silently accept unauthenticated callers as privileged.
+    #[tokio::test]
+    async fn no_keys_means_an_empty_store() {
+        use crate::auth::ApiKeyStore;
+
+        let (_app, store) = App::builder()
+            .with_warehouse_location(crate::utils::temp_path())
+            .build_with_api_keys()
+            .await
+            .unwrap();
+
+        assert!(store.list_for_tenant("acme").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn security_headers_are_set() {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
 
-        // Build the app synchronously (no async needed for in-memory setup)
-        let warehouse = crate::utils::temp_path();
-        let mut props = HashMap::new();
-        props.insert("warehouse".to_string(), warehouse.clone());
-
-        let memory_catalog: iceberg::MemoryCatalog = MemoryCatalogBuilder::default()
-            .load("memory", props)
+        let app = App::builder()
+            .with_warehouse_location(crate::utils::temp_path())
+            .build()
             .await
             .unwrap();
 
-        let catalog = Arc::new(ExtendedCatalog::new(memory_catalog));
-
-        let app = App::builder()
-            .with_catalog(catalog)
-            .with_warehouse_location(&warehouse)
-            .build();
-        let router = app.into_router();
-
-        // Make a request to the health endpoint
-        let response = router
+        let response = app
+            .into_router()
             .oneshot(
                 Request::builder()
                     .uri("/health")
@@ -1649,89 +1400,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify security headers are present
-        assert!(response.headers().contains_key("x-content-type-options"));
+        let headers = response.headers();
+        assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
         assert_eq!(
-            response.headers().get("x-content-type-options").unwrap(),
-            "nosniff"
-        );
-
-        assert!(response.headers().contains_key("x-frame-options"));
-        assert_eq!(response.headers().get("x-frame-options").unwrap(), "DENY");
-
-        assert!(response.headers().contains_key("content-security-policy"));
-        assert_eq!(
-            response.headers().get("content-security-policy").unwrap(),
+            headers.get("content-security-policy").unwrap(),
             "default-src 'none'; frame-ancestors 'none'"
         );
-
-        assert!(response.headers().contains_key("cache-control"));
-        assert_eq!(
-            response.headers().get("cache-control").unwrap(),
-            "no-store, no-cache, must-revalidate"
-        );
-
-        assert!(response.headers().contains_key("x-xss-protection"));
-        assert_eq!(
-            response.headers().get("x-xss-protection").unwrap(),
-            "1; mode=block"
-        );
-    }
-
-    #[cfg(feature = "slatedb-storage")]
-    #[tokio::test]
-    async fn test_build_with_persistent_api_key_auth_async() {
-        use crate::auth::{ApiKeyBuilder, ApiKeyStore};
-
-        // Build with memory backend (no encryption)
-        let (app, store) = App::builder()
-            .with_storage_backend("memory://")
-            .build_with_persistent_api_key_auth_async()
-            .await;
-
-        assert!(Arc::strong_count(&store) >= 1);
-        assert_eq!(app.state().default_tenant_id(), "default");
-
-        // Verify we can use the store
-        let (key, _plaintext) = ApiKeyBuilder::new("Test Key", "test-tenant")
-            .with_role("read")
-            .build();
-
-        store.store(key.clone()).await.unwrap();
-
-        let loaded = store.get_by_id(&key.id).await;
-        assert!(loaded.is_some());
-        assert_eq!(loaded.unwrap().name, "Test Key");
-    }
-
-    #[cfg(feature = "slatedb-storage")]
-    #[tokio::test]
-    async fn test_build_with_persistent_api_key_auth_with_encryption() {
-        use crate::auth::{ApiKeyBuilder, ApiKeyStore};
-        use crate::crypto::Aes256GcmProvider;
-
-        // Generate encryption key
-        let enc_key = Aes256GcmProvider::generate_key();
-
-        // Build with memory backend + encryption
-        let (app, store) = App::builder()
-            .with_storage_backend("memory://")
-            .with_encryption_key(enc_key)
-            .build_with_persistent_api_key_auth_async()
-            .await;
-
-        assert!(Arc::strong_count(&store) >= 1);
-        assert_eq!(app.state().default_tenant_id(), "default");
-
-        // Verify we can use the store with encryption
-        let (api_key, _plaintext) = ApiKeyBuilder::new("Encrypted Key", "test-tenant")
-            .with_role("admin")
-            .build();
-
-        store.store(api_key.clone()).await.unwrap();
-
-        let loaded = store.get_by_id(&api_key.id).await;
-        assert!(loaded.is_some());
-        assert_eq!(loaded.unwrap().name, "Encrypted Key");
     }
 }

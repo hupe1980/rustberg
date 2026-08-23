@@ -28,10 +28,10 @@
 //! ```
 
 use async_trait::async_trait;
+use google_cloud_auth::credentials::AccessTokenCredentials;
 use google_cloud_auth::credentials::service_account::{
     AccessSpecifier, Builder as ServiceAccountBuilder,
 };
-use google_cloud_auth::credentials::AccessTokenCredentials;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -137,8 +137,11 @@ pub struct GcsCredentialProvider {
     config: GcsConfig,
     /// Credentials provider for obtaining OAuth2 tokens.
     credentials: Arc<AccessTokenCredentials>,
-    /// Cached token for reuse.
+    /// Cached source token. Only ever the *input* to downscoping — the token
+    /// handed to a client is derived per request and never cached.
     cached_token: Arc<RwLock<Option<CachedToken>>>,
+    /// Client for the STS downscoping exchange.
+    http: reqwest::Client,
 }
 
 impl std::fmt::Debug for GcsCredentialProvider {
@@ -160,8 +163,11 @@ impl GcsCredentialProvider {
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// // Using service account key file
+    /// // The prefixes are the provider's whole scope: it vends for these and
+    /// // nothing else, and naming none means it vends for nothing.
     /// let config = GcsConfig::new()
-    ///     .with_service_account_key_path("/path/to/key.json");
+    ///     .with_service_account_key_path("/path/to/key.json")
+    ///     .with_allowed_prefix("gs://my-warehouse/");
     /// let provider = GcsCredentialProvider::new(config).await?;
     /// # Ok(())
     /// # }
@@ -208,20 +214,20 @@ impl GcsCredentialProvider {
             config,
             credentials: Arc::new(credentials),
             cached_token: Arc::new(RwLock::new(None)),
+            http: reqwest::Client::new(),
         })
     }
 
-    /// Checks if the given location starts with any allowed prefix.
-    fn is_location_allowed(&self, location: &str) -> bool {
-        if self.config.allowed_prefixes.is_empty() {
-            // No restrictions - allow any GCS location
-            return true;
-        }
-
-        self.config
-            .allowed_prefixes
-            .iter()
-            .any(|prefix| location.starts_with(prefix))
+    /// Whether `location` falls under one of the configured prefixes.
+    ///
+    /// Containment is segment-wise ([`crate::location::is_within`]), not a
+    /// string prefix test: `gs://bucket/wh-evil/t` merely *spells* like
+    /// `gs://bucket/wh` and must not be admitted by it.
+    ///
+    /// An empty prefix list grants nothing — see [`crate::location::is_vendable`]
+    /// for why that direction and not the other.
+    fn is_location_allowed(config: &GcsConfig, location: &str) -> bool {
+        crate::location::is_vendable(&config.allowed_prefixes, location)
     }
 
     /// Extracts the GCS prefix from a table location.
@@ -238,10 +244,10 @@ impl GcsCredentialProvider {
         // Check cache first
         {
             let cached = self.cached_token.read().await;
-            if let Some(ref token) = *cached {
-                if token.is_valid() {
-                    return Ok(token.token.clone());
-                }
+            if let Some(ref token) = *cached
+                && token.is_valid()
+            {
+                return Ok(token.token.clone());
             }
         }
 
@@ -264,6 +270,116 @@ impl GcsCredentialProvider {
 
         Ok(access_token)
     }
+
+    /// Splits a `gs://bucket/key/prefix` location into `(bucket, key_prefix)`.
+    fn split_location(location: &str) -> Option<(&str, &str)> {
+        let rest = location
+            .strip_prefix("gs://")
+            .or_else(|| location.strip_prefix("gcs://"))?;
+        match rest.split_once('/') {
+            Some((bucket, key)) => Some((bucket, key.trim_end_matches('/'))),
+            None => Some((rest, "")),
+        }
+    }
+
+    /// Builds a Credential Access Boundary scoped to one table's prefix.
+    ///
+    /// A raw service-account token carries every permission the account has, on
+    /// every bucket. Google's downscoping exchange trades it for a token bounded
+    /// by these rules, so what the client receives can only be narrower.
+    ///
+    /// The boundary names the bucket as its resource and constrains objects with
+    /// an `availabilityCondition` on the name prefix; `inRole:` sets the ceiling
+    /// on what is permitted there.
+    fn access_boundary(bucket: &str, key_prefix: &str, write_access: bool) -> serde_json::Value {
+        let role = if write_access {
+            "inRole:roles/storage.objectAdmin"
+        } else {
+            "inRole:roles/storage.objectViewer"
+        };
+
+        // An empty prefix means the whole bucket; anything else is bounded to
+        // objects whose name starts with the table's prefix.
+        let condition = if key_prefix.is_empty() {
+            None
+        } else {
+            Some(serde_json::json!({
+                "title": "table-prefix",
+                "expression": format!(
+                    "resource.name.startsWith('projects/_/buckets/{bucket}/objects/{key_prefix}/')"
+                )
+            }))
+        };
+
+        let mut rule = serde_json::json!({
+            "availableResource": format!("//storage.googleapis.com/projects/_/buckets/{bucket}"),
+            "availablePermissions": [role],
+        });
+        if let Some(condition) = condition {
+            rule["availabilityCondition"] = condition;
+        }
+
+        serde_json::json!({ "accessBoundary": { "accessBoundaryRules": [rule] } })
+    }
+
+    /// Exchanges a full-scope token for one bounded by `boundary`.
+    ///
+    /// Uses Google's STS token-exchange endpoint. A failure here must not fall
+    /// back to the original token: that would hand out exactly the broad
+    /// credential the exchange exists to avoid.
+    async fn downscope(
+        &self,
+        token: &str,
+        boundary: serde_json::Value,
+    ) -> Result<String, StorageCredentialVendingError> {
+        #[derive(serde::Deserialize)]
+        struct TokenResponse {
+            access_token: String,
+        }
+
+        let response = self
+            .http
+            .post("https://sts.googleapis.com/v1/token")
+            .form(&[
+                (
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                ),
+                (
+                    "subject_token_type",
+                    "urn:ietf:params:oauth:token-type:access_token",
+                ),
+                (
+                    "requested_token_type",
+                    "urn:ietf:params:oauth:token-type:access_token",
+                ),
+                ("subject_token", token),
+                ("options", &boundary.to_string()),
+            ])
+            .send()
+            .await
+            .map_err(|e| {
+                StorageCredentialVendingError::GcsError(format!("Downscoping request failed: {e}"))
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(StorageCredentialVendingError::GcsError(format!(
+                "Downscoping rejected with {status}: {body}"
+            )));
+        }
+
+        Ok(response
+            .json::<TokenResponse>()
+            .await
+            .map_err(|e| {
+                StorageCredentialVendingError::GcsError(format!(
+                    "Malformed downscoping response: {e}"
+                ))
+            })?
+            .access_token)
+    }
 }
 
 #[async_trait]
@@ -273,18 +389,28 @@ impl StorageCredentialProvider for GcsCredentialProvider {
         request: &StorageCredentialRequest,
     ) -> Result<Vec<StorageCredential>, StorageCredentialVendingError> {
         // Check if this location is allowed
-        if !self.is_location_allowed(&request.table_location) {
+        if !Self::is_location_allowed(&self.config, &request.table_location) {
             return Ok(vec![]);
         }
 
-        // Get an OAuth2 access token
-        let token = self.get_token().await?;
+        let (bucket, key_prefix) =
+            Self::split_location(&request.table_location).ok_or_else(|| {
+                StorageCredentialVendingError::GcsError(format!(
+                    "Cannot scope credentials: '{}' is not a GCS location",
+                    request.table_location
+                ))
+            })?;
 
-        // Build the storage credential
+        // The service-account token is the ceiling, not the credential. It is
+        // exchanged for one bounded to this table and this access level, so the
+        // client never receives the account's full rights — which is what an
+        // earlier version handed out, cached and shared across every caller.
+        let source = self.get_token().await?;
+        let boundary = Self::access_boundary(bucket, key_prefix, request.write_access);
+        let scoped = self.downscope(&source, boundary).await?;
+
         let prefix = Self::get_table_prefix(&request.table_location);
-        let credential = StorageCredential::gcs(prefix, token);
-
-        Ok(vec![credential])
+        Ok(vec![StorageCredential::gcs(prefix, scoped)])
     }
 
     fn supports_location(&self, location: &str) -> bool {
@@ -340,35 +466,29 @@ mod tests {
     #[test]
     fn test_location_allowed() {
         let config = GcsConfig::new().with_allowed_prefix("gs://allowed-bucket/");
+        let allowed = |loc: &str| GcsCredentialProvider::is_location_allowed(&config, loc);
 
-        let provider = MockGcsProvider { config };
+        assert!(allowed("gs://allowed-bucket/data/table"));
+        assert!(!allowed("gs://other-bucket/data/table"));
 
-        assert!(provider.is_location_allowed("gs://allowed-bucket/data/table"));
-        assert!(!provider.is_location_allowed("gs://other-bucket/data/table"));
-
-        // No restrictions
-        let config_no_restrictions = GcsConfig::new();
-        let provider_no_restrictions = MockGcsProvider {
-            config: config_no_restrictions,
-        };
-        assert!(provider_no_restrictions.is_location_allowed("gs://any-bucket/"));
+        // Nothing configured grants nothing, rather than everything.
+        let unscoped = GcsConfig::new();
+        assert!(!GcsCredentialProvider::is_location_allowed(
+            &unscoped,
+            "gs://any-bucket/"
+        ));
     }
 
-    /// Mock provider for testing location checks without real GCP credentials.
-    struct MockGcsProvider {
-        config: GcsConfig,
-    }
+    /// A bucket that merely *spells* like an allowed prefix is a different
+    /// bucket. A `starts_with` test admits it; containment must not.
+    #[test]
+    fn a_sibling_prefix_is_not_allowed() {
+        let config = GcsConfig::new().with_allowed_prefix("gs://bucket/wh");
+        let allowed = |loc: &str| GcsCredentialProvider::is_location_allowed(&config, loc);
 
-    impl MockGcsProvider {
-        fn is_location_allowed(&self, location: &str) -> bool {
-            if self.config.allowed_prefixes.is_empty() {
-                return true;
-            }
-            self.config
-                .allowed_prefixes
-                .iter()
-                .any(|prefix| location.starts_with(prefix))
-        }
+        assert!(allowed("gs://bucket/wh/db/events"));
+        assert!(!allowed("gs://bucket/wh-evil/db/events"));
+        assert!(!allowed("gs://bucket/whatever"));
     }
 
     #[test]
@@ -379,6 +499,81 @@ mod tests {
         assert_eq!(
             cred.config.get("gcs.oauth2.token").unwrap(),
             "ya29.example-token"
+        );
+    }
+    // ── Access boundary scoping ─────────────────────────────────────────
+
+    #[test]
+    fn splits_gcs_locations() {
+        assert_eq!(
+            GcsCredentialProvider::split_location("gs://bucket/wh/db/t"),
+            Some(("bucket", "wh/db/t"))
+        );
+        assert_eq!(
+            GcsCredentialProvider::split_location("gs://bucket/wh/db/t/"),
+            Some(("bucket", "wh/db/t"))
+        );
+        assert_eq!(
+            GcsCredentialProvider::split_location("gs://bucket"),
+            Some(("bucket", ""))
+        );
+        assert_eq!(GcsCredentialProvider::split_location("s3://b/x"), None);
+    }
+
+    #[test]
+    fn boundary_is_scoped_to_the_table_prefix() {
+        let b = GcsCredentialProvider::access_boundary("bucket", "wh/db/events", false);
+        let rule = &b["accessBoundary"]["accessBoundaryRules"][0];
+
+        assert_eq!(
+            rule["availableResource"],
+            "//storage.googleapis.com/projects/_/buckets/bucket"
+        );
+        let expr = rule["availabilityCondition"]["expression"]
+            .as_str()
+            .unwrap();
+        assert!(
+            expr.contains("buckets/bucket/objects/wh/db/events/"),
+            "{expr}"
+        );
+    }
+
+    /// A read-only request must not carry an object-write role. An earlier
+    /// version returned the raw service-account token, so `write_access` was
+    /// discarded entirely.
+    #[test]
+    fn read_only_request_gets_viewer_role() {
+        let b = GcsCredentialProvider::access_boundary("bucket", "wh/db/t", false);
+        let perms = &b["accessBoundary"]["accessBoundaryRules"][0]["availablePermissions"];
+        assert_eq!(perms[0], "inRole:roles/storage.objectViewer");
+    }
+
+    #[test]
+    fn write_request_gets_admin_role() {
+        let b = GcsCredentialProvider::access_boundary("bucket", "wh/db/t", true);
+        let perms = &b["accessBoundary"]["accessBoundaryRules"][0]["availablePermissions"];
+        assert_eq!(perms[0], "inRole:roles/storage.objectAdmin");
+    }
+
+    #[test]
+    fn sibling_tables_get_different_boundaries() {
+        let a = GcsCredentialProvider::access_boundary("bucket", "wh/db/a", true);
+        let b = GcsCredentialProvider::access_boundary("bucket", "wh/db/b", true);
+        assert_ne!(
+            a["accessBoundary"]["accessBoundaryRules"][0]["availabilityCondition"],
+            b["accessBoundary"]["accessBoundaryRules"][0]["availabilityCondition"]
+        );
+    }
+
+    /// A bucket-root location has nothing to constrain, so no condition is set
+    /// rather than one that would never match.
+    #[test]
+    fn bucket_root_has_no_condition() {
+        let b = GcsCredentialProvider::access_boundary("bucket", "", false);
+        assert!(
+            b["accessBoundary"]["accessBoundaryRules"][0]
+                .get("availabilityCondition")
+                .is_none()
         );
     }
 }

@@ -48,6 +48,16 @@ class RustbergServer:
         env = os.environ.copy()
         env["RUST_LOG"] = "warn"
         
+        # To files, never to a pipe. Rustberg writes its audit trail to stdout as
+        # JSON Lines, so a pipe nobody drains fills its 64 KB buffer and the
+        # server blocks *writing a record* — which looks exactly like a hung
+        # server, part-way through a suite, at whatever test happens to cross
+        # the threshold. Files keep the output readable after a failure.
+        self.stdout_path = os.path.join(self.data_dir, "server.stdout")
+        self.stderr_path = os.path.join(self.data_dir, "server.stderr")
+        self._stdout = open(self.stdout_path, "wb")
+        self._stderr = open(self.stderr_path, "wb")
+
         self.process = subprocess.Popen(
             [
                 self.binary_path,
@@ -58,8 +68,8 @@ class RustbergServer:
                 "--port", str(self.port),
             ],
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=self._stdout,
+            stderr=self._stderr,
         )
         
         # Wait for server to be ready
@@ -76,18 +86,12 @@ class RustbergServer:
         while time.time() - start < RUSTBERG_STARTUP_TIMEOUT:
             # Check if process has exited unexpectedly
             if self.process and self.process.poll() is not None:
-                exit_code = self.process.returncode
-                stderr_output = ""
-                stdout_output = ""
-                if self.process.stderr:
-                    stderr_output = self.process.stderr.read().decode("utf-8", errors="replace")
-                if self.process.stdout:
-                    stdout_output = self.process.stdout.read().decode("utf-8", errors="replace")
                 raise RuntimeError(
-                    f"Rustberg server exited unexpectedly with code {exit_code}\n"
+                    f"Rustberg server exited unexpectedly with code "
+                    f"{self.process.returncode}\n"
                     f"Binary: {self.binary_path}\n"
-                    f"Stdout: {stdout_output}\n"
-                    f"Stderr: {stderr_output}"
+                    f"Stdout: {self._read(self.stdout_path)}\n"
+                    f"Stderr: {self._read(self.stderr_path)}"
                 )
             
             try:
@@ -96,23 +100,19 @@ class RustbergServer:
             except (urllib.error.URLError, ConnectionRefusedError):
                 time.sleep(0.1)
         
-        # On timeout, also try to get any output
-        stderr_output = ""
-        stdout_output = ""
-        if self.process:
-            if self.process.stderr:
-                # Non-blocking read attempt
-                import select
-                if hasattr(select, 'select'):
-                    readable, _, _ = select.select([self.process.stderr], [], [], 0)
-                    if readable:
-                        stderr_output = self.process.stderr.read().decode("utf-8", errors="replace")
-        
         raise TimeoutError(
             f"Rustberg server did not start within {RUSTBERG_STARTUP_TIMEOUT}s\n"
             f"Binary: {self.binary_path}\n"
-            f"Stderr: {stderr_output}"
+            f"Stderr: {self._read(self.stderr_path)}"
         )
+
+    def _read(self, path: str) -> str:
+        """The tail of one of the server's output files, for an error message."""
+        try:
+            with open(path, "rb") as handle:
+                return handle.read()[-4000:].decode("utf-8", errors="replace")
+        except OSError:
+            return ""
         
     def stop(self) -> None:
         """Stop the Rustberg server."""
@@ -126,7 +126,9 @@ class RustbergServer:
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait()
-            
+
+        self._stdout.close()
+        self._stderr.close()
         self.process = None
 
 

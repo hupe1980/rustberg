@@ -63,6 +63,38 @@ impl Principal {
         }
     }
 
+    /// A principal the **host** has already authenticated.
+    ///
+    /// The entry point for the in-process surface: a host embedding Rustberg
+    /// has its own identity system and has already decided who the caller is.
+    /// Making it name a [`PrincipalType`] and an [`AuthMethod`] to say so asks
+    /// it to describe a credential Rustberg never saw.
+    ///
+    /// ```
+    /// # use rustberg::auth::Principal;
+    /// let principal = Principal::embedded("svc-etl", "acme")
+    ///     .with_role("writer")
+    ///     .build();
+    /// ```
+    ///
+    /// `tenant` is load-bearing rather than cosmetic: it is what every policy
+    /// compares a resource's recorded owner against, so a host that passes the
+    /// wrong one grants access across a tenant boundary. It is the caller's
+    /// tenant, never the resource's.
+    ///
+    /// Roles become Cedar groups, so `with_role("writer")` is what makes
+    /// `principal in Rustberg::Group::"writer"` match.
+    pub fn embedded(id: impl Into<String>, tenant: impl Into<String>) -> PrincipalBuilder {
+        let id = id.into();
+        PrincipalBuilder::new(
+            id.clone(),
+            id,
+            PrincipalType::User,
+            tenant,
+            AuthMethod::External,
+        )
+    }
+
     /// Creates an anonymous principal (for testing or when auth is disabled).
     pub fn anonymous() -> Self {
         Self::new(
@@ -262,7 +294,12 @@ pub enum PrincipalType {
     System,
 }
 
-/// Method used to authenticate the principal.
+/// How the caller was authenticated.
+///
+/// One variant per mechanism that exists. `Basic` and `MutualTls` were here
+/// once and constructed nowhere: an enum in a security path that names a
+/// mechanism the server does not implement reads as a supported option, and
+/// `/auth/context` published both to clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
@@ -273,12 +310,15 @@ pub enum AuthMethod {
     ApiKey,
     /// Bearer token (JWT)
     Bearer,
-    /// Basic authentication
-    Basic,
-    /// Mutual TLS client certificate
-    MutualTls,
     /// Internal system call
     Internal,
+    /// The embedding host authenticated the caller; Rustberg saw no credential.
+    ///
+    /// Distinct from [`Internal`](Self::Internal), which means Rustberg acting
+    /// on its own behalf. An audit record has to be able to say which of the two
+    /// a decision came from: one is a real caller whose identity the host
+    /// vouched for, the other is the server itself.
+    External,
 }
 
 #[cfg(test)]

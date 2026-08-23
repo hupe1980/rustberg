@@ -1,3 +1,4 @@
+pub mod secret;
 pub mod server_config;
 mod v1;
 
@@ -7,7 +8,8 @@ use crate::app::AppState;
 
 // Re-export configuration types
 pub use server_config::{
-    AuthConfig, ConfigError, CorsConfig, JwtConfigSerde, KmsConfigFile, LoggingConfig,
+    AuditConfig, AuthConfig, AwsCredentialsConfig, AzureCredentialsConfig, ConfigError, CorsConfig,
+    CredentialsConfig, GcsCredentialsConfig, JwtConfigSerde, LoggingConfig, MountConfig,
     RateLimitConfigFile, RustbergConfig, ServerConfig, StorageConfig, TlsConfigFile,
 };
 

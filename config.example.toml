@@ -16,26 +16,36 @@ port = 8000
 
 # Authentication configuration
 [server.auth]
-# Enable API key authentication
+# API key authentication
 api_key_enabled = true
-# Enable JWT authentication (for SSO/OAuth)
-jwt_enabled = false
 
-# JWT configuration (only used if jwt_enabled = true)
-# [server.auth.jwt]
-# issuer = "https://auth.example.com"
-# audience = "rustberg-api"
-# jwks_url = "https://auth.example.com/.well-known/jwks.json"
-# default_tenant_id = "default"
-# tenant_claim = "tenant_id"
-# roles_claim = "roles"
-# jwks_cache_ttl_seconds = 3600
+# API keys are configuration, not stored state. The secret lives in an
+# environment variable, so this file holds no usable credential and can be
+# committed. A referenced variable that is unset or empty is a startup failure.
+#
+# Rotation is a config change plus a restart. If you need revocation without a
+# restart, use OIDC/JWT instead.
+#
+# [[server.auth.api_keys]]
+# name    = "ci-pipeline"
+# tenant  = "acme"
+# roles   = ["writer"]
+# key_env = "RUSTBERG_KEY_CI"
 
-# CORS configuration
-[server.cors]
-allowed_origins = ["*"]
-allowed_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
-allowed_headers = ["*"]
+# Cedar policy file. When unset, the built-in default policies apply.
+# When set, the file REPLACES them; the defaults are not merged in.
+# policy_file = "/etc/rustberg/policies/catalog.cedar"
+
+# CORS is enforced by browsers. Spark, Trino, PyIceberg and DuckDB are not
+# browsers, so most deployments never need this section: omitting it allows no
+# cross-origin request, which is the default and the safe answer.
+#
+# Set it only when a browser application calls the catalog directly. A wildcard
+# ("*") is refused in production mode.
+# [server.cors]
+# allowed_origins = ["https://dashboard.example.com"]
+# allowed_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+# allowed_headers = ["*"]
 
 # =============================================================================
 # TLS Configuration
@@ -55,48 +65,55 @@ insecure_http = true
 # Storage Configuration
 # =============================================================================
 [storage]
-# Storage backend URL:
-#   - "file:///var/lib/rustberg/data" - Local filesystem (single-node)
-#   - "s3://bucket/prefix?region=us-east-1" - AWS S3 (K8s HA)
-#   - "gs://bucket/prefix" - Google Cloud Storage (K8s HA)
-#   - "az://container/prefix" - Azure Blob Storage (K8s HA)
-#   - "memory://" - In-memory (testing only)
-backend = "file:///var/lib/rustberg/data"
-# Warehouse location for table data (S3, GCS, HDFS, or local path)
+# Where the catalog database lives. The catalog is a local redb file, so only
+# two forms are valid:
+#   - "file:///var/lib/rustberg/data" - a directory holding catalog.redb
+#   - "memory://"                     - ephemeral, tests only
+# Object-store URLs are rejected here. The *warehouse* is a separate setting
+# below and may live on any storage scheme compiled in.
+catalog_url = "file:///var/lib/rustberg/data"
+
+# Warehouse location for table data and metadata.
+# Accepts file://, s3://, gs:// and abfss:// depending on enabled features.
 # warehouse_location = "s3://my-bucket/warehouse"
-# Timeout for metadata read operations in seconds (default: 60)
-# Increase for high-latency or cross-region storage backends.
-# read_timeout_secs = 60
-# Timeout for metadata write operations in seconds (default: 30)
-# write_timeout_secs = 30
 
-# =============================================================================
-# KMS Configuration (Key Management Service)
-# =============================================================================
-[kms]
-# KMS provider: "env" (default), "aws-kms", "vault", "gcp-kms", "azure-keyvault"
-provider = "env"
+# --- Object storage ----------------------------------------------------------
+# How to reach the warehouse, by Iceberg property name. These configure the
+# FileIO every catalog in this process reads and writes metadata through.
+#
+# Without them, an object-store warehouse works only when the storage backend
+# finds ambient credentials (an instance role, a well-known credentials file),
+# and an S3-compatible endpoint — MinIO, Ceph, Cloudflare R2 — cannot be reached
+# at all. A `file://` warehouse needs nothing here.
+#
+# One set for the whole process. Keys are scheme-prefixed, so different clouds
+# compose; two accounts on the *same* cloud do not, and need a process each.
+#
+# A value written as `env:NAME` is read from that environment variable at
+# startup, so this file holds no secret. A variable that is unset or blank is a
+# startup failure rather than a silently absent property — the same rule every
+# other secret in this file follows.
+#
+# [storage.properties]
+# # AWS, with the credentials in the environment.
+# "s3.region"            = "eu-central-1"
+# "s3.access-key-id"     = "env:RUSTBERG_S3_ACCESS_KEY_ID"
+# "s3.secret-access-key" = "env:RUSTBERG_S3_SECRET_ACCESS_KEY"
+#
+# # MinIO, or anything else speaking the S3 API. This is what `just minio` and
+# # `docker compose --profile storage` bring up.
+# # "s3.endpoint"          = "http://localhost:9000"
+# # "s3.path-style-access" = "true"
+# # "s3.region"            = "us-east-1"
+#
+# # Google Cloud Storage.
+# # "gcs.project-id"      = "my-project"
+# # "gcs.credentials-json" = "env:RUSTBERG_GCS_CREDENTIALS"
+#
+# # Azure Data Lake Storage Gen2.
+# # "adls.account-name" = "myaccount"
+# # "adls.account-key"  = "env:RUSTBERG_ADLS_ACCOUNT_KEY"
 
-# For "env" provider:
-# Set RUSTBERG_MASTER_KEY environment variable with a 32-byte hex-encoded key.
-# Generate with: openssl rand -hex 32
-
-# For "aws-kms" provider:
-# aws_key_id = "alias/rustberg-key"
-# aws_region = "us-east-1"
-
-# For "vault" provider:
-# vault_address = "https://vault.example.com:8200"
-# vault_key_name = "rustberg-transit"
-
-# Cache TTL for KMS operations (seconds)
-cache_ttl_seconds = 300
-# Enable circuit breaker for KMS failures (recommended for production)
-circuit_breaker_enabled = true
-
-# =============================================================================
-# Rate Limiting Configuration
-# =============================================================================
 [rate_limit]
 # Enable rate limiting (recommended for production)
 enabled = true
@@ -115,10 +132,177 @@ lockout_duration_seconds = 300
 # =============================================================================
 # Logging Configuration
 # =============================================================================
+# Application logs go to **stderr**, so stdout stays a clean stream of audit
+# records (see [audit] below) and `rustberg serve | jq` works.
 [logging]
-# Log level: "trace", "debug", "info", "warn", "error"
+# Verbosity. Either a bare level — "trace", "debug", "info", "warn", "error" —
+# or a full RUST_LOG filter such as "rustberg=debug,tower_http=info,warn".
+# `--log-level` / the RUST_LOG environment variable override this.
 level = "info"
-# Output logs in JSON format (for SIEM ingestion)
+# One JSON object per log line, for SIEM ingestion. This is the *application*
+# log; the audit trail is separately structured and configured under [audit].
 json_format = false
-# Include span events in tracing output
+# Emit an event when a span opens and closes. Useful for latency attribution,
+# noisy at "debug" and below.
 with_span_events = true
+
+# =============================================================================
+# Audit
+# =============================================================================
+# Every authorization decision is recorded as one JSON object per line.
+
+[audit]
+# stdout | file | none
+#
+# "stdout" is a pure JSON Lines stream: application logs go to stderr precisely
+# so this one can be piped into a log shipper without filtering.
+sink = "stdout"
+
+# Required when sink = "file". A path that cannot be opened is a startup failure.
+# path = "/var/log/rustberg/audit.jsonl"
+
+# Refuse a mutating request whose record could not be written. Reads always
+# continue; the loss is counted.
+fail_closed = true
+
+# =============================================================================
+# Storage access
+# =============================================================================
+# Two forms, and the client picks with the delegation header:
+#
+#   X-Iceberg-Access-Delegation: vended-credentials
+#     A short-lived credential scoped to the one table it named — never this
+#     server's own rights.
+#
+#   X-Iceberg-Access-Delegation: remote-signing
+#     No credential at all: every object request is authorized and signed here,
+#     so a revoked grant takes effect on the next read rather than at expiry.
+#
+# Nothing is vended or signed unrequested: an engine already running with an
+# instance role does not want the catalog minting more.
+#
+# Leave this out entirely if your engines carry their own storage credentials.
+# That is the common case, and it is not a lesser configuration.
+
+[credentials]
+# none (default) | aws | gcs | azure
+provider = "none"
+
+# Locations this server may ever mint a credential for. Left empty, this is
+# every warehouse the server manages: `storage.warehouse_location` plus each
+# `[mount.*]`'s. That is the right default — the catalog already refuses to
+# record a table outside one of them.
+#
+# Setting it REPLACES the list, so a federated deployment that sets it must name
+# each mount's warehouse it wants credentials for; omitting one makes that
+# mount's tables silently un-credentialed.
+# allowed_prefixes = ["s3://my-bucket/warehouse/public"]
+
+# --- AWS ---------------------------------------------------------------------
+# Rustberg calls STS AssumeRole with an inline session policy scoped to the
+# requested table's prefix, so the vended credential is the intersection of this
+# role and that one prefix. The role needs access to the warehouse; it does not
+# need to be narrow itself.
+#
+# [credentials.aws]
+# region   = "us-east-1"
+# role_arn = "arn:aws:iam::123456789012:role/RustbergVending"
+# # Environment variable holding the STS external ID, for cross-account
+# # assumption. Named, not inlined, so this file holds no secret. A variable that
+# # is set but empty is a startup failure.
+# external_id_env  = "RUSTBERG_STS_EXTERNAL_ID"
+# duration_seconds = 3600
+
+# --- GCS ---------------------------------------------------------------------
+# Rustberg performs a Credential Access Boundary token exchange, which is the
+# GCS equivalent of a session policy.
+#
+# [credentials.gcs]
+# service_account_key_path = "/etc/rustberg/gcp-service-account.json"
+
+# --- Azure -------------------------------------------------------------------
+# Rustberg authenticates as a Microsoft Entra service principal, obtains a user
+# delegation key from the storage account, and signs a SAS scoped to one table
+# prefix. It has no code path that can emit an account key: that would grant the
+# whole storage account to anyone permitted to read one table.
+#
+# The principal needs Storage Blob Data Contributor on the account (or Reader,
+# for a read-only deployment). A SAS only ever narrows those rights.
+#
+# [credentials.azure]
+# account           = "mystorageaccount"
+# tenant_id         = "00000000-0000-0000-0000-000000000000"
+# client_id         = "11111111-1111-1111-1111-111111111111"
+# client_secret_env = "RUSTBERG_AZURE_CLIENT_SECRET"
+# duration_seconds  = 3600
+
+# --- Remote signing ----------------------------------------------------------
+# Serves POST /v1/namespaces/{ns}/tables/{table}/sign. Independent of `provider`
+# above: a deployment may offer signing, vending, both, or neither. It uses the
+# same credential chain and the same `allowed_prefixes`, so there is no second
+# set of secrets.
+#
+# S3 and S3-compatible storage only. GCS and ADLS have no equivalent
+# request-signing protocol in the Iceberg spec.
+#
+# [credentials.signing]
+# enabled = true
+# # Region used when a client sends none; clients normally send their own.
+# region  = "us-east-1"
+# # auto | path | virtual-host. `auto` recognises AWS's own hostnames and falls
+# # back to path style, which is what MinIO, Ceph and R2 use. Guessing wrong
+# # fails closed: the request is refused rather than mis-signed.
+# url_style = "auto"
+# # Lets `auto` tell minio:9000/bucket/key from bucket.minio:9000/key.
+# endpoint_host = "minio:9000"
+
+# =============================================================================
+# Federation
+# =============================================================================
+# Mount other catalogs under this endpoint. Each mount claims a top-level
+# namespace; everything beneath it is served by that backend, with the mount
+# name stripped on the way down — a mounted catalog has its own namespaces and
+# has never heard of the name it is mounted under.
+#
+#   prod.analytics.events   -> mount "prod",   namespace analytics.events
+#   scratch.tmp             -> unmounted,      the catalog configured above
+#
+# Mounting is additive: names no mount claims still reach the main catalog.
+#
+# [mount.prod]
+# backend            = "native"                        # only backend today
+# catalog_url        = "postgres://user:pw@host/prod"  # or file:///path
+# warehouse_location = "s3://prod-bucket/warehouse"
+# owner              = "acme"
+#
+# [mount.legacy]
+# backend            = "native"
+# catalog_url        = "file:///var/lib/rustberg/legacy"
+# warehouse_location = "s3://legacy-bucket/warehouse"
+# owner              = "acme"
+# # Refuse every mutation, for a catalog another system owns.
+# read_only          = true
+#
+# Somebody else's Iceberg REST catalog, served read-only. Capabilities are
+# negotiated from the remote's own /v1/config, and the bearer token is named
+# rather than inlined so this file holds no credential.
+#
+# [mount.partner]
+# backend     = "rest"
+# catalog_url = "https://catalog.partner.example"
+# owner       = "acme"
+# token_env   = "RUSTBERG_PARTNER_TOKEN"
+
+# `owner` is authoritative for the whole mount, not a default. A mount is a
+# separate catalog whose namespace properties Rustberg does not control, so
+# reading ownership from inside it would let whoever can write there decide who
+# owns it here. Set it to the same tenant that owns the rest of the catalog
+# unless you mean the mount to be a different tenant's.
+#
+# `GET /v1/config` advertises the INTERSECTION of what every mount supports, so
+# one read-only mount removes every mutating endpoint from the advertised list.
+# Those operations still work on the mounts that support them — what the
+# intersection governs is only what is promised.
+#
+# Renames and multi-table transactions are refused across mounts: neither can be
+# made atomic between two independent catalogs.

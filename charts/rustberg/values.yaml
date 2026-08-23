@@ -17,9 +17,18 @@ fullnameOverride: ""
 # =============================================================================
 # Replica Configuration
 # =============================================================================
-replicaCount: 1
+# With the postgres catalog backend, replicas share one registry and this can be
+# raised freely. With redb it must stay at 1: redb holds an exclusive lock on the
+# catalog file, so a second pod fails to start with "Database already open".
+replicaCount: 2
 
-# Autoscaling configuration
+# RollingUpdate is safe on postgres. The template switches this to Recreate
+# automatically when the redb backend is selected, because a rolling update
+# would briefly run two pods and the second could not open the file.
+updateStrategy:
+  type: RollingUpdate
+
+# Autoscaling. Safe with the postgres backend; ignored with redb.
 autoscaling:
   enabled: false
   minReplicas: 1
@@ -34,7 +43,7 @@ rustberg:
   # Server configuration
   server:
     host: "0.0.0.0"
-    port: 8080
+    port: 8000
     # TLS configuration (optional)
     tls:
       enabled: false
@@ -42,10 +51,45 @@ rustberg:
       # certFile: /certs/tls.crt
       # keyFile: /certs/tls.key
 
-  # Storage backend configuration
+  # Storage.
+  #
+  # Two distinct locations. The *catalog* is a redb file on the PersistentVolume
+  # below and is never an object-store URL. The *warehouse* is where tables live
+  # and may be any supported scheme.
+  catalog:
+    # Which registry holds namespaces, tables and views.
+    #
+    #   postgres - shared database; any number of replicas (default here)
+    #   redb     - a file on the PersistentVolume; exactly one replica
+    #
+    # redb is the right choice for embedding and single-node installs, and the
+    # wrong one for a cluster: redb locks the file, so a second pod fails to
+    # start rather than sharing. If you are deploying to Kubernetes you almost
+    # certainly want postgres.
+    backend: "postgres"
+
+    # Used when backend is "redb": directory on the mounted volume.
+    path: "/data/catalog"
+
+    postgres:
+      # Where the catalog database is. Point this at a Secret holding the DSN:
+      #   postgres://user:password@host:5432/rustberg
+      #
+      # This chart deliberately bundles no database. A Postgres subchart would
+      # be a StatefulSet with no backups, no failover and no upgrade story —
+      # everything a real deployment needs from its database, missing. Use a
+      # managed instance (RDS, Cloud SQL, Azure Database) or an operator such as
+      # CloudNativePG, and give Rustberg its DSN.
+      existingSecret: ""
+      existingSecretKey: "dsn"
+
+      # Inline DSN. Evaluation only: it lands in the rendered manifest and in
+      # Helm's release storage in plaintext.
+      dsn: ""
+
   storage:
-    # Backend type: memory, local, s3, gcs, azure
-    type: "memory"
+    # Credentials to give the server for warehouse access: none, s3, gcs, azure
+    type: "none"
     
     # S3 configuration
     s3:
@@ -80,73 +124,58 @@ rustberg:
   warehouse:
     location: "file:///data/warehouse"
 
-  # Authentication configuration
-  auth:
-    # Enable authentication
-    enabled: false
-    
-    # API key authentication
-    apiKeys:
-      enabled: false
-      # Pre-configured API keys (use secrets in production)
-      keys: []
-      # - name: "admin"
-      #   key: "rk_xxx"
-      #   roles: ["admin"]
-    
-    # JWT/OIDC authentication
-    jwt:
-      enabled: false
-      issuer: ""
-      audience: ""
-      jwksUri: ""
-
-  # Authorization configuration
-  authorization:
-    # Enable Cedar authorization
-    enabled: false
-    # Cedar policies (inline)
-    policies: ""
-    # Load policies from ConfigMap
-    policiesConfigMap: ""
-
-  # Encryption configuration
-  encryption:
-    enabled: false
-    # KMS provider: env, aws-kms, vault, gcp-kms, azure-keyvault
-    kmsProvider: "env"
-    
-    # Environment key provider (development only)
-    envKey: ""
-    
-    # AWS KMS
-    awsKms:
-      keyId: ""
-      region: "us-east-1"
-    
-    # HashiCorp Vault
-    vault:
-      address: ""
-      token: ""
-      transitMount: "transit"
-      keyName: "rustberg"
-      existingSecret: ""
-      existingSecretTokenKey: "token"
-
-  # Additional environment variables
-  extraEnv: []
-  # - name: RUST_LOG
-  #   value: "info"
-
-  # Configuration file (rustberg.toml) - raw content
+  # Full Rustberg TOML config, mounted at /config/rustberg.toml and passed with
+  # --config. Leave empty to configure entirely through the values above.
   config: ""
 
-# =============================================================================
-# Service Configuration
-# =============================================================================
+  # Extra environment variables for the container. This is where API key
+  # secrets go: the config file names an environment variable, and the value
+  # comes from a Secret.
+  #
+  # extraEnv:
+  #   - name: RUSTBERG_KEY_SPARK
+  #     valueFrom:
+  #       secretKeyRef:
+  #         name: rustberg-api-keys
+  #         key: spark
+  extraEnv: []
+
+  # Authentication and authorization are configured through `config` above,
+  # not through separate chart values. An earlier
+  # version of this chart exposed `rustberg.auth.*` and
+  # `rustberg.authorization.*` keys that no template ever read, so setting them
+  # silently did nothing.
+  #
+  # config: |
+  #   [server.auth]
+  #   jwt_enabled = true
+  #   policy_file = "/config/catalog.cedar"
+  #
+  #   [server.auth.jwt]
+  #   issuer   = "https://auth.example.com"
+  #   audience = "rustberg"
+  #   jwks_url = "https://auth.example.com/.well-known/jwks.json"
+  #
+  # Credential vending is configured the same way. `storage.*` above gives the
+  # SERVER its warehouse access; `[credentials]` is what lets it mint scoped,
+  # short-lived credentials for CLIENTS. They are different things and either
+  # may be used without the other.
+  #
+  # With IRSA, the pod's service account assumes the vending role, so no secret
+  # is needed here:
+  #
+  # config: |
+  #   [credentials]
+  #   provider = "aws"
+  #
+  #   [credentials.aws]
+  #   region   = "us-east-1"
+  #   role_arn = "arn:aws:iam::123456789012:role/RustbergVending"
+  #   duration_seconds = 3600
+
 service:
   type: ClusterIP
-  port: 8080
+  port: 8000
   annotations: {}
 
 # =============================================================================
@@ -233,8 +262,14 @@ readinessProbe:
   failureThreshold: 3
 
 # =============================================================================
-# Persistence (for local storage backend)
+# Persistence
 # =============================================================================
+# The catalog is a file on this volume. Disabling persistence means the catalog
+# lives in the pod's writable layer and every table is lost when the pod
+# restarts, so it is enabled by default and you should have a specific reason to
+# turn it off.
+# Only needed for the redb backend, which keeps the catalog on disk. With
+# postgres the pods are stateless and this should stay disabled.
 persistence:
   enabled: false
   storageClass: ""
@@ -276,6 +311,9 @@ serviceMonitor:
 # Network Policies
 # =============================================================================
 networkPolicy:
+  # Port the catalog database listens on, opened for egress when the
+  # postgres backend is selected.
+  postgresPort: 5432
   enabled: false
   ingress:
     # Allow traffic from these namespaces
@@ -290,3 +328,4 @@ networkPolicy:
     #   podSelector:
     #     matchLabels:
     #       app: minio
+

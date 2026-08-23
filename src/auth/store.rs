@@ -7,11 +7,11 @@
 //!
 //! API keys are stored with:
 //! - A **key prefix** (first 8 chars of key material) for O(1) lookup
-//! - An **Argon2id hash** of the full key for verification
+//! - A **SHA-256 hash** of the full key for verification
 //!
 //! This design provides:
 //! - Fast lookup without full table scans
-//! - Strong protection against database breaches (Argon2id)
+//! - The plaintext key is never stored, so a dump of this state grants nothing
 //! - Resistance to timing attacks (constant-time verification)
 
 use async_trait::async_trait;
@@ -20,6 +20,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 /// Represents an API key with associated metadata.
 ///
@@ -33,10 +34,10 @@ pub struct ApiKey {
     pub name: String,
 
     /// First 8 characters of the key material (after `rb_` prefix).
-    /// Used for fast O(1) lookup before Argon2 verification.
+    /// Used for fast O(1) lookup before hash verification.
     pub key_prefix: String,
 
-    /// Argon2id hash of the full API key (PHC format).
+    /// Hash of the full API key; see [`hash_api_key`].
     /// Contains algorithm, parameters, salt, and hash.
     pub key_hash: String,
 
@@ -153,10 +154,13 @@ impl ApiKeyBuilder {
 
     /// Builds the API key and returns both the key object and the plaintext key.
     ///
-    /// The plaintext key should be shown to the user once and never stored.
-    /// Uses Argon2id for secure password hashing.
-    pub fn build(self) -> (ApiKey, String) {
-        let plaintext_key = generate_api_key();
+    /// The plaintext is returned in a [`Zeroizing`] wrapper: it is a live
+    /// credential, so it is wiped from memory when the caller drops it rather
+    /// than left in freed heap. Show it once; it cannot be recovered afterwards.
+    ///
+    /// See [`hash_api_key`] for the hashing choice.
+    pub fn build(self) -> (ApiKey, Zeroizing<String>) {
+        let plaintext_key = Zeroizing::new(generate_api_key());
         let key_prefix =
             extract_key_prefix(&plaintext_key).expect("Generated key should have valid prefix");
         let key_hash = hash_api_key(&plaintext_key);
@@ -211,60 +215,75 @@ fn generate_api_key() -> String {
     use rand::RngCore;
 
     let mut key_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key_bytes);
+    rand::rng().fill_bytes(&mut key_bytes);
 
     format!("rb_{}", base64_encode(&key_bytes))
 }
 
 /// Base64 URL-safe encoding without padding.
 fn base64_encode(bytes: &[u8]) -> String {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// Hashes an API key using Argon2id for secure storage.
+/// Hashes an API key for storage.
 ///
-/// Uses OWASP-recommended parameters for password hashing:
-/// - Memory: 19 MiB
-/// - Iterations: 2
-/// - Parallelism: 1
+/// # Why SHA-256 and not a password KDF
 ///
-/// Returns a PHC-format string that is self-describing and includes
-/// the salt, allowing verification without additional state.
+/// A password KDF (Argon2, bcrypt, scrypt) buys work factor against brute force,
+/// which matters when the secret is low-entropy — a human-chosen password has
+/// perhaps 30 bits, so an attacker holding the hash can enumerate the space and
+/// the only defence is making each guess expensive.
+///
+/// An API key here is 32 bytes from the OS CSPRNG: **256 bits of uniform
+/// entropy**. There is no space to enumerate. A KDF's work factor multiplies an
+/// already-infeasible search by a constant and changes nothing, while the same
+/// constant is paid by the server on *every authenticated request*.
+///
+/// Argon2id at OWASP password parameters (19 MiB, t=2) would cost tens of
+/// milliseconds and 19 MiB per request — on the hot path of every catalog call,
+/// including the dummy verification run for requests bearing no valid key. That
+/// is a memory-hard amplification primitive handed to unauthenticated callers:
+/// cheap to send, expensive to answer.
+///
+/// SHA-256 over a 256-bit random token is the same choice GitHub, Stripe and AWS
+/// make for bearer tokens, and it is what the threat model actually calls for.
+/// No salt: salting defeats precomputation across a shared, low-entropy input
+/// space, and there is no such space here.
 pub fn hash_api_key(key: &str) -> String {
-    use argon2::{
-        password_hash::{PasswordHasher, SaltString},
-        Algorithm, Argon2, Params, Version,
-    };
-    use rand::rngs::OsRng;
+    use sha2::{Digest, Sha256};
 
-    let params = Params::new(19 * 1024, 2, 1, None).expect("Invalid Argon2 parameters");
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let salt = SaltString::generate(&mut OsRng);
-
-    argon2
-        .hash_password(key.as_bytes(), &salt)
-        .expect("Argon2 hashing failed")
-        .to_string()
+    let digest = Sha256::digest(key.as_bytes());
+    format!("sha256:{}", hex_encode(&digest))
 }
 
-/// Verifies an API key against an Argon2id hash.
+/// Verifies an API key against a stored hash.
 ///
-/// Returns `true` if the key matches the hash, `false` otherwise.
-/// This operation is constant-time to prevent timing attacks.
+/// The comparison is constant-time, so a caller cannot learn how much of a
+/// guessed key was correct by timing the response.
 pub fn verify_api_key(key: &str, hash: &str) -> bool {
-    use argon2::{
-        password_hash::{PasswordHash, PasswordVerifier},
-        Algorithm, Argon2, Params, Version,
-    };
+    use subtle::ConstantTimeEq;
 
-    let params = Params::new(19 * 1024, 2, 1, None).expect("Invalid Argon2 parameters");
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let computed = hash_api_key(key);
 
-    match PasswordHash::new(hash) {
-        Ok(parsed_hash) => argon2.verify_password(key.as_bytes(), &parsed_hash).is_ok(),
-        Err(_) => false,
+    // Length is not secret — both sides are fixed-width hex of a fixed-width
+    // digest — but the bytes are, so compare them without early exit.
+    if computed.len() != hash.len() {
+        return false;
     }
+    computed.as_bytes().ct_eq(hash.as_bytes()).into()
+}
+
+/// Lowercase hex, no dependency on a hex crate for 32 bytes.
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// Storage trait for API keys.

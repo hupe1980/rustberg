@@ -21,10 +21,25 @@ class TestCatalogConfig:
         data = response.json()
         assert "defaults" in data or "overrides" in data or isinstance(data, dict)
 
-    def test_config_with_warehouse(self, rustberg_server: str):
-        """Test config endpoint with warehouse parameter."""
+    def test_config_with_an_unknown_warehouse_is_rejected(self, rustberg_server: str):
+        """A warehouse this server does not serve is named, not silently served.
+
+        Echoing the requested value back as an override would report acceptance
+        while every table was in fact created somewhere else.
+        """
         response = httpx.get(f"{rustberg_server}/v1/config", params={"warehouse": "test"})
-        
+
+        assert response.status_code == 400
+        assert "test" in response.text
+
+    def test_config_with_the_served_warehouse_is_accepted(self, rustberg_server: str):
+        """The value the server itself advertises must be accepted back."""
+        advertised = httpx.get(f"{rustberg_server}/v1/config").json()["overrides"]["warehouse"]
+
+        response = httpx.get(
+            f"{rustberg_server}/v1/config", params={"warehouse": advertised}
+        )
+
         assert response.status_code == 200
 
 

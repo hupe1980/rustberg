@@ -1,0 +1,34 @@
+{% extends "docs-base.html" %}
+
+{% block doc_class %} doc--index{% endblock doc_class %}
+
+{% block doc_main %}
+    <header class="doc__header">
+      <h1>{{ section.title }}</h1>
+      {%- if section.description %}
+      <p class="doc__lede">{{ section.description }}</p>
+      {%- endif %}
+    </header>
+
+    <div class="doc__body">
+      {{ section.content | safe }}
+    </div>
+
+    {%- for group in config.extra.nav %}
+    <section class="index-group">
+      <h2>{{ group.title }}</h2>
+      <div class="cards">
+        {%- for slug in group.pages %}
+          {%- for p in section.pages %}
+            {%- if p.slug == slug %}
+        <a class="card" href="{{ p.permalink }}">
+          <h3>{{ p.title }}</h3>
+          <p>{{ p.description }}</p>
+        </a>
+            {%- endif %}
+          {%- endfor %}
+        {%- endfor %}
+      </div>
+    </section>
+    {%- endfor %}
+{% endblock doc_main %}

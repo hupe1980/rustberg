@@ -30,10 +30,10 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Json;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
-use dashmap::DashMap;
+use moka::sync::Cache;
 use parking_lot::Mutex;
 use serde::Serialize;
 
@@ -316,25 +316,75 @@ impl AuthFailureEntry {
 // Rate Limiter
 // ============================================================================
 
+/// Largest number of distinct clients tracked at once.
+///
+/// Every map here is keyed by something the *client* controls — its address, or
+/// its tenant. An unbounded map is therefore a memory-exhaustion vector in the
+/// component whose job is preventing exhaustion: a single IPv6 /64 offers more
+/// source addresses than there are bytes of RAM, and NAT churn grows the map
+/// without any attacker at all.
+///
+/// 100k entries is roughly 10 MB and far more concurrent clients than a catalog
+/// sees. Past it, the least-recently-used entry is dropped.
+const MAX_TRACKED_CLIENTS: u64 = 100_000;
+
+/// How long an idle entry is kept.
+///
+/// A bucket refills continuously, so one untouched for this long is
+/// indistinguishable from a fresh one. Auth-failure entries are held longer by
+/// their own window, checked on read.
+const ENTRY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Thread-safe rate limiter with per-IP and per-tenant limiting.
+///
+/// # Bounded by construction
+///
+/// State is held in LRU caches with a capacity and an idle timeout, not in
+/// unbounded maps swept by a periodic task. That is a deliberate change: the
+/// sweep existed, was tested, and was **never scheduled**, so the maps grew for
+/// the life of the process. A bound that depends on somebody remembering to call
+/// a cleanup function is not a bound.
+///
+/// Eviction is safe in both directions. Dropping a bucket early gives that client
+/// a fresh allowance — bounded by the LRU order, so it costs an attacker more
+/// traffic than it saves. Dropping a *ban* early would be worse, so bans are
+/// checked against a deadline stored in the entry and the ban duration is well
+/// inside the idle timeout.
 pub struct RateLimiter {
     config: RateLimitConfig,
     /// Per-IP token buckets.
-    ip_limiters: DashMap<IpAddr, Mutex<TokenBucket>>,
+    ip_limiters: Cache<IpAddr, Arc<Mutex<TokenBucket>>>,
     /// Per-tenant token buckets.
-    tenant_limiters: DashMap<String, Mutex<TokenBucket>>,
+    tenant_limiters: Cache<String, Arc<Mutex<TokenBucket>>>,
     /// Auth failure tracker per IP.
-    auth_failures: DashMap<IpAddr, Mutex<AuthFailureEntry>>,
+    auth_failures: Cache<IpAddr, Arc<Mutex<AuthFailureEntry>>>,
 }
 
 impl RateLimiter {
     /// Creates a new rate limiter with the given configuration.
     pub fn new(config: RateLimitConfig) -> Self {
+        fn bounded<K, V>() -> Cache<K, V>
+        where
+            K: std::hash::Hash + Eq + Send + Sync + 'static,
+            V: Clone + Send + Sync + 'static,
+        {
+            Cache::builder()
+                .max_capacity(MAX_TRACKED_CLIENTS)
+                .time_to_idle(ENTRY_IDLE_TIMEOUT)
+                .build()
+        }
+
         Self {
             config,
-            ip_limiters: DashMap::new(),
-            tenant_limiters: DashMap::new(),
-            auth_failures: DashMap::new(),
+            ip_limiters: bounded(),
+            tenant_limiters: bounded(),
+            // Held for the auth-failure window rather than the shorter bucket
+            // idle timeout, so a slow brute-force cannot reset its own counter by
+            // simply pausing.
+            auth_failures: Cache::builder()
+                .max_capacity(MAX_TRACKED_CLIENTS)
+                .time_to_idle(Duration::from_secs(3600))
+                .build(),
         }
     }
 
@@ -376,8 +426,7 @@ impl RateLimiter {
 
         let entry = self
             .auth_failures
-            .entry(*ip)
-            .or_insert_with(|| Mutex::new(AuthFailureEntry::new()));
+            .get_with(*ip, || Arc::new(Mutex::new(AuthFailureEntry::new())));
 
         let mut entry = entry.lock();
 
@@ -408,7 +457,7 @@ impl RateLimiter {
         }
 
         // Remove failure tracking on successful auth
-        self.auth_failures.remove(ip);
+        self.auth_failures.invalidate(ip);
     }
 
     /// Checks the per-IP rate limit. Returns Ok if allowed, Err with retry info if limited.
@@ -428,11 +477,11 @@ impl RateLimiter {
             });
         }
 
-        let entry = self.ip_limiters.entry(*ip).or_insert_with(|| {
-            Mutex::new(TokenBucket::new(
+        let entry = self.ip_limiters.get_with(*ip, || {
+            Arc::new(Mutex::new(TokenBucket::new(
                 self.config.per_ip_burst,
                 self.config.per_ip_requests,
-            ))
+            )))
         });
 
         let mut bucket = entry.lock();
@@ -460,15 +509,12 @@ impl RateLimiter {
             return Ok(RateLimitInfo::unlimited());
         }
 
-        let entry = self
-            .tenant_limiters
-            .entry(tenant_id.to_string())
-            .or_insert_with(|| {
-                Mutex::new(TokenBucket::new(
-                    self.config.per_tenant_burst,
-                    self.config.per_tenant_requests,
-                ))
-            });
+        let entry = self.tenant_limiters.get_with(tenant_id.to_string(), || {
+            Arc::new(Mutex::new(TokenBucket::new(
+                self.config.per_tenant_burst,
+                self.config.per_tenant_requests,
+            )))
+        });
 
         let mut bucket = entry.lock();
 
@@ -531,40 +577,15 @@ impl RateLimiter {
         })
     }
 
-    /// Cleans up expired entries to prevent memory growth.
-    /// Call this periodically (e.g., every few minutes).
+    /// Number of clients currently tracked, for tests and diagnostics.
     ///
-    /// SEC-027: Now also cleans up stale IP and tenant rate limiter buckets
-    /// that haven't been accessed recently, preventing unbounded memory growth.
-    pub fn cleanup(&self) {
-        // Clean up old auth failure entries
-        self.auth_failures.retain(|_, entry| {
-            let entry = entry.lock();
-            // Keep if banned or if first failure was recent
-            entry.is_banned() || entry.first_failure.elapsed() < Duration::from_secs(3600)
-        });
-
-        // SEC-027: Clean up stale IP limiter buckets
-        // Remove buckets that haven't been refilled in over 5 minutes
-        // (meaning no requests from that IP in that time)
-        let stale_threshold = Duration::from_secs(300);
-        self.ip_limiters.retain(|_, bucket| {
-            let bucket = bucket.lock();
-            bucket.last_refill.elapsed() < stale_threshold
-        });
-
-        // SEC-027: Clean up stale tenant limiter buckets
-        self.tenant_limiters.retain(|_, bucket| {
-            let bucket = bucket.lock();
-            bucket.last_refill.elapsed() < stale_threshold
-        });
-
-        tracing::debug!(
-            ip_limiters = self.ip_limiters.len(),
-            tenant_limiters = self.tenant_limiters.len(),
-            auth_failures = self.auth_failures.len(),
-            "Rate limiter cleanup completed"
-        );
+    /// There is deliberately no `cleanup()`. One existed, was tested, and was
+    /// never called from anywhere in the server — so the maps it was meant to
+    /// bound grew for the life of the process. Eviction is now a property of the
+    /// data structure instead of an obligation on the caller.
+    pub fn tracked_clients(&self) -> u64 {
+        self.ip_limiters.run_pending_tasks();
+        self.ip_limiters.entry_count()
     }
 
     /// Returns the current configuration.
@@ -610,15 +631,15 @@ impl RateLimitInfo {
         vec![
             (
                 HeaderName::from_static("x-ratelimit-limit"),
-                HeaderValue::from_str(&self.limit.to_string()).unwrap(),
+                HeaderValue::from(self.limit),
             ),
             (
                 HeaderName::from_static("x-ratelimit-remaining"),
-                HeaderValue::from_str(&self.remaining.to_string()).unwrap(),
+                HeaderValue::from(self.remaining),
             ),
             (
                 HeaderName::from_static("x-ratelimit-reset"),
-                HeaderValue::from_str(&self.reset_secs.to_string()).unwrap(),
+                HeaderValue::from(self.reset_secs),
             ),
         ]
     }
@@ -660,15 +681,15 @@ impl RateLimitExceeded {
         vec![
             (
                 HeaderName::from_static("x-ratelimit-limit"),
-                HeaderValue::from_str(&self.limit.to_string()).unwrap(),
+                HeaderValue::from(self.limit),
             ),
             (
                 HeaderName::from_static("x-ratelimit-remaining"),
-                HeaderValue::from_str(&self.remaining.to_string()).unwrap(),
+                HeaderValue::from(self.remaining),
             ),
             (
                 HeaderName::from_static("retry-after"),
-                HeaderValue::from_str(&self.retry_after.to_string()).unwrap(),
+                HeaderValue::from(self.retry_after),
             ),
         ]
     }
@@ -929,39 +950,61 @@ mod tests {
         assert_eq!(config.auth_fail_limit, 5);
     }
 
+    /// Tracking state is keyed by the client's own address, so it must be
+    /// bounded by the data structure rather than by a sweep somebody has to
+    /// remember to schedule.
+    ///
+    /// The previous implementation used unbounded maps with a `cleanup()` that
+    /// was tested here and called from nowhere in the server, so a flood of
+    /// distinct source addresses grew memory for the life of the process — a
+    /// denial of service in the denial-of-service defence.
     #[test]
-    fn test_cleanup_removes_stale_entries() {
-        // SEC-027: Verify cleanup removes stale IP and tenant limiters
+    fn tracked_clients_are_bounded() {
         let config = RateLimitConfig::builder()
             .enabled(true)
             .per_ip_requests(1000)
-            .per_ip_burst(100)
-            .per_tenant_requests(1000)
-            .per_tenant_burst(100)
+            .per_ip_burst(1000)
             .build();
 
         let limiter = RateLimiter::new(config);
 
-        // Create some entries
-        let ip1 = "192.168.1.1".parse().unwrap();
-        let ip2 = "192.168.1.2".parse().unwrap();
-        limiter.check_ip_limit(&ip1).unwrap();
-        limiter.check_ip_limit(&ip2).unwrap();
-        limiter.check_tenant_limit("tenant1").unwrap();
-        limiter.check_tenant_limit("tenant2").unwrap();
+        // Far more distinct addresses than a real deployment sees, and trivial
+        // for one host to produce from an IPv6 range.
+        for i in 0..250_000u32 {
+            let ip: IpAddr = std::net::Ipv4Addr::from(i).into();
+            let _ = limiter.check_ip_limit(&ip);
+        }
 
-        // Verify entries exist
-        assert_eq!(limiter.ip_limiters.len(), 2);
-        assert_eq!(limiter.tenant_limiters.len(), 2);
+        let tracked = limiter.tracked_clients();
+        assert!(
+            tracked <= MAX_TRACKED_CLIENTS,
+            "tracked {tracked} clients, over the {MAX_TRACKED_CLIENTS} bound"
+        );
+    }
 
-        // Cleanup won't remove fresh entries
-        limiter.cleanup();
-        assert_eq!(limiter.ip_limiters.len(), 2);
-        assert_eq!(limiter.tenant_limiters.len(), 2);
+    /// Eviction must not drop an active limit while it is still doing work: a
+    /// client under the cap keeps its bucket across consecutive requests.
+    #[test]
+    fn an_active_client_keeps_its_bucket() {
+        let config = RateLimitConfig::builder()
+            .enabled(true)
+            .per_ip_requests(10)
+            .per_ip_burst(3)
+            .build();
 
-        // Note: A full test of stale eviction would require waiting 5 minutes,
-        // which isn't practical. The key verification is that cleanup() runs
-        // without error and retains fresh entries.
+        let limiter = RateLimiter::new(config);
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+
+        assert!(limiter.check_ip_limit(&ip).is_ok());
+        assert!(limiter.check_ip_limit(&ip).is_ok());
+        assert!(limiter.check_ip_limit(&ip).is_ok());
+
+        // The burst is spent; a fourth request must be refused rather than
+        // served from a freshly created bucket.
+        assert!(
+            limiter.check_ip_limit(&ip).is_err(),
+            "the bucket was recreated, so the limit did not apply"
+        );
     }
 
     #[test]

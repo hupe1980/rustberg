@@ -3,20 +3,19 @@
 //! This crate provides the core functionality for the Rustberg Iceberg catalog service.
 
 // Enforce no unsafe code across the entire crate
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 mod app;
 pub mod auth;
 pub mod catalog;
 pub mod config;
 pub mod credentials;
-pub mod crypto;
-mod error;
+pub mod error;
+pub mod location;
+pub mod management;
 pub mod observability;
-pub mod openapi;
+pub mod predicate;
 pub mod server;
-#[cfg(feature = "slatedb-storage")]
-pub mod storage;
 mod utils;
 
 pub use app::*;

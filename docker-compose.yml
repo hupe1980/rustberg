@@ -8,7 +8,8 @@
 # Development (no auth, for local testing only):
 #   docker-compose --profile dev up -d
 #
-# With MinIO storage:
+# With MinIO storage (brings up MinIO, creates the bucket, and starts a
+# catalog configured against it — see examples/minio.toml):
 #   docker-compose --profile storage up -d
 #
 # =============================================================================
@@ -27,10 +28,15 @@ services:
       RUSTBERG_HOST: "0.0.0.0"
       RUSTBERG_PORT: "8000"
       RUSTBERG_INSECURE_HTTP: "true"
+      # Production mode requires an explicit catalog location, so metadata is
+      # never written to a temp directory that disappears on restart. This points
+      # at the persistent volume mounted below.
+      RUSTBERG_CATALOG_URL: "file:///var/lib/rustberg/data"
       RUSTBERG_WAREHOUSE: "/var/lib/rustberg/warehouse"
-      # Authentication is enabled by default (no RUSTBERG_NO_AUTH)
-      RUSTBERG_CREATE_DEMO_KEY: "true"
-      RUSTBERG_MASTER_KEY: "${RUSTBERG_MASTER_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
+      # Authentication is enabled by default (no RUSTBERG_NO_AUTH). With no keys
+      # configured, Rustberg mints an admin key at startup and prints it:
+      #   docker compose logs rustberg | grep X-API-Key
+      # It is held in memory, so restarting the container mints a new one.
       RUST_LOG: "info"
     volumes:
       - rustberg-data:/var/lib/rustberg/data
@@ -59,6 +65,7 @@ services:
       RUSTBERG_PORT: "8000"
       RUSTBERG_INSECURE_HTTP: "true"
       RUSTBERG_NO_AUTH: "true"  # Explicitly disable auth for development
+      RUSTBERG_CATALOG_URL: "file:///var/lib/rustberg/data"
       RUSTBERG_WAREHOUSE: "/var/lib/rustberg/warehouse"
       RUST_LOG: "debug"
     volumes:
@@ -72,7 +79,7 @@ services:
       start_period: 5s
 
   # ---------------------------------------------------------------------------
-  # MinIO for S3-compatible object storage (optional)
+  # MinIO for S3-compatible object storage
   # ---------------------------------------------------------------------------
   minio:
     image: minio/minio:latest
@@ -93,11 +100,64 @@ services:
       timeout: 20s
       retries: 3
 
+  # Creates the warehouse bucket, then exits. Without it the first table write
+  # fails against a bucket that does not exist, which reads as a credential
+  # problem and is not one.
+  minio-init:
+    image: minio/mc:latest
+    profiles:
+      - storage
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "mc alias set local http://minio:9000 minioadmin minioadmin &&
+             mc mb --ignore-existing local/warehouse"
+
+  # ---------------------------------------------------------------------------
+  # Rustberg against MinIO
+  # ---------------------------------------------------------------------------
+  #
+  # The MinIO service on its own is not a working storage deployment: the
+  # catalog has to be told the endpoint. Virtual-host addressing needs DNS MinIO
+  # does not have, so path-style is required.
+  rustberg-storage:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles:
+      - storage
+    ports:
+      - "8000:8000"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      RUSTBERG_HOST: "0.0.0.0"
+      RUSTBERG_PORT: "8000"
+      RUSTBERG_INSECURE_HTTP: "true"
+      RUSTBERG_CATALOG_URL: "file:///var/lib/rustberg/data"
+      RUSTBERG_CONFIG: "/etc/rustberg/config.toml"
+      # The config file names these rather than holding them, so the same file
+      # is committable. A named variable that is unset is a startup failure.
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - ./examples/minio.toml:/etc/rustberg/config.toml:ro
+      - rustberg-storage-data:/var/lib/rustberg/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
 volumes:
   rustberg-data:
   rustberg-dev-data:
   rustberg-warehouse:
   rustberg-dev-warehouse:
+  rustberg-storage-data:
   minio-data:
 
 # =============================================================================
@@ -111,6 +171,7 @@ volumes:
 #
 # 3. Start with MinIO storage:
 #    docker-compose --profile storage up -d
+#    MinIO console: http://localhost:9001 (minioadmin/minioadmin)
 #
 # 4. Generate API key (production):
 #    docker-compose exec rustberg rustberg generate-key --name admin --roles admin
@@ -128,7 +189,7 @@ volumes:
 # Security Notes:
 # - Production mode (default) requires API key authentication
 # - Development mode (--profile dev) disables auth - NEVER use in production
-# - Set RUSTBERG_MASTER_KEY to a secure random value in production
+# - Configure [[server.auth.api_keys]] rather than relying on the minted key
 # - Consider enabling TLS for production deployments
 #
 # =============================================================================

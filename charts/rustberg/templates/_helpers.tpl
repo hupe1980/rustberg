@@ -136,3 +136,53 @@ az://{{ .Values.rustberg.storage.azure.container }}/warehouse
 file:///data/warehouse
 {{- end }}
 {{- end }}
+
+{{/*
+The DSN Secret the pod reads the catalog URL from.
+
+Precedence: an operator-supplied Secret, then the bundled subchart's Secret,
+then a Secret this chart renders from an inline DSN. A plaintext DSN in values
+is fine for evaluation and wrong for production, which is why it is last.
+*/}}
+{{- define "rustberg.postgresSecretName" -}}
+{{- if .Values.rustberg.catalog.postgres.existingSecret -}}
+{{- .Values.rustberg.catalog.postgres.existingSecret -}}
+{{- else -}}
+{{- include "rustberg.fullname" . }}-catalog-dsn
+{{- end -}}
+{{- end -}}
+
+{{- define "rustberg.postgresSecretKey" -}}
+{{- if .Values.rustberg.catalog.postgres.existingSecret -}}
+{{- .Values.rustberg.catalog.postgres.existingSecretKey -}}
+{{- else -}}
+dsn
+{{- end -}}
+{{- end -}}
+
+{{/*
+Fail early on configurations that cannot work, rather than letting the pod
+crash-loop with an error only visible in its logs.
+*/}}
+{{- define "rustberg.validateCatalog" -}}
+{{- $backend := .Values.rustberg.catalog.backend -}}
+{{- if not (has $backend (list "postgres" "redb")) -}}
+{{- fail (printf "rustberg.catalog.backend must be \"postgres\" or \"redb\", got %q" $backend) -}}
+{{- end -}}
+{{- if eq $backend "redb" -}}
+{{- if gt (int .Values.replicaCount) 1 -}}
+{{- fail "The redb catalog is a single file with an exclusive lock: a second replica cannot start. Set replicaCount to 1, or use rustberg.catalog.backend=postgres." -}}
+{{- end -}}
+{{- if not .Values.persistence.enabled -}}
+{{- fail "The redb catalog needs persistence.enabled=true, or the catalog is lost on every pod restart." -}}
+{{- end -}}
+{{- if .Values.autoscaling.enabled -}}
+{{- fail "Autoscaling adds replicas, which the redb catalog cannot support. Use rustberg.catalog.backend=postgres." -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $backend "postgres" -}}
+{{- if and (not .Values.rustberg.catalog.postgres.existingSecret) (not .Values.rustberg.catalog.postgres.dsn) -}}
+{{- fail "catalog.backend=postgres needs a database. Set rustberg.catalog.postgres.existingSecret to a Secret holding the DSN (recommended), or .dsn for evaluation. Use a managed Postgres or an operator such as CloudNativePG." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

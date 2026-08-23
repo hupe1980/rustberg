@@ -1,0 +1,231 @@
+{% extends "base.html" %}
+
+{% block body_class %}page-home{% endblock body_class %}
+
+{% block content %}
+<main id="content">
+
+<section class="hero">
+  <div class="hero__inner">
+    <p class="hero__eyebrow">Apache Iceberg REST Catalog · Rust · Apache-2.0</p>
+    <h1 class="hero__title">The policy layer for<br><span class="grad">Apache Iceberg</span></h1>
+    <p class="hero__lede">
+      One authenticated, policy-controlled Iceberg REST endpoint in front of every
+      catalog your organisation owns. Engines connect once, with one identity.
+      Rustberg authenticates the caller, authorizes every operation against Cedar
+      policy, routes to the catalog that holds the table, vends short-lived
+      storage credentials, and records the decision.
+    </p>
+
+    <div class="hero__actions">
+      <a class="btn btn--primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Get started</a>
+      <a class="btn" href="{{ config.extra.repo }}" rel="noopener">View source</a>
+    </div>
+
+    <div class="hero__terminal" role="group" aria-label="Quickstart">
+      <div class="terminal">
+        <div class="terminal__bar" aria-hidden="true"><span></span><span></span><span></span></div>
+<pre class="terminal__body"><code><span class="c">$</span> rustberg --dev --insecure-http
+
+<span class="dim">WARN</span> No API keys or OIDC configured — minted a temporary admin key.
+<span class="dim">WARN</span>     X-API-Key: rb_9oroTuw3xDT5x1_wovV5IUDgx628Wj6hJuCh9H1ZKwE
+<span class="dim">WARN</span>     curl -H 'X-API-Key: rb_9oro…' http://localhost:8000/v1/config</code></pre>
+      </div>
+      <p class="hero__note">
+        One command, one binary, no configuration file. Authentication stays on —
+        it mints a key and prints it rather than defaulting to open.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section class="strip" aria-label="At a glance">
+  <div class="strip__inner">
+    <div class="stat"><span class="stat__n">39&thinsp;µs</span><span class="stat__l">authorization, p99</span></div>
+    <div class="stat"><span class="stat__n">&lt;&thinsp;1&thinsp;ms</span><span class="stat__l">loadTable, p99</span></div>
+    <div class="stat"><span class="stat__n">~15&thinsp;MB</span><span class="stat__l">idle memory</span></div>
+    <div class="stat"><span class="stat__n">0</span><span class="stat__l">required services</span></div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <h2 class="section__title">Storing table pointers is solved. Governing them is not.</h2>
+    <p class="section__lede">
+      Every Iceberg catalog can tell an engine where a table's metadata lives. The
+      hard part is deciding <em>who</em> may read it, <em>who</em> may write it, and
+      who gets handed a credential — across catalogs an organisation did not choose
+      to have in the same place. That is what Rustberg is.
+    </p>
+
+    <div class="pillars">
+      <article class="pillar">
+        <h3>Policy is the product</h3>
+        <p>
+          Every operation is decided by <a href="https://www.cedarpolicy.com/" rel="noopener">Cedar</a>,
+          a formally verified policy engine that is a library rather than a service.
+          Resources form a hierarchy, so one policy covers a whole namespace subtree —
+          including tables that do not exist yet. Deny by default, including on
+          evaluation error.
+        </p>
+        <a class="pillar__link" href="{{ get_url(path='@/docs/authorization.md') }}">How authorization works →</a>
+      </article>
+
+      <article class="pillar">
+        <h3>Federation, under one identity</h3>
+        <p>
+          Mount several catalogs — your own redb or Postgres, or somebody else's
+          Iceberg REST catalog — under one endpoint, routed by top-level namespace.
+          The mount is invisible on the wire, so a cross-catalog join is ordinary SQL.
+          Capabilities are negotiated per mount and published as an intersection.
+        </p>
+        <a class="pillar__link" href="{{ get_url(path='@/docs/federation.md') }}">How federation works →</a>
+      </article>
+
+      <article class="pillar">
+        <h3>Credentials that only narrow</h3>
+        <p>
+          AWS STS session policies, GCS credential access boundaries, Azure
+          user-delegation SAS — each a real downscoping exchange, scoped to one
+          table prefix. A vended credential is the intersection of the caller's
+          policy and the mount's own ceiling, and never wider.
+        </p>
+        <a class="pillar__link" href="{{ get_url(path='@/docs/security.md') }}#credential-vending">How vending works →</a>
+      </article>
+
+      <article class="pillar">
+        <h3>An audit trail, not a log line</h3>
+        <p>
+          Every decision — permit and deny alike — names the policy that made it and
+          the version of the policy set it came from. An empty rule list on a denial
+          is itself the answer: nothing forbade the request and nothing permitted it.
+          When the sink fails, mutations fail with it.
+        </p>
+        <a class="pillar__link" href="{{ get_url(path='@/docs/security.md') }}#audit">What is recorded →</a>
+      </article>
+
+      <article class="pillar">
+        <h3>A binary, or a crate</h3>
+        <p>
+          The same operations are reachable in-process, through the same
+          authorization guard and against the same catalog — no router, no socket,
+          no second implementation to keep honest. The equivalence is tested as
+          equivalence.
+        </p>
+        <a class="pillar__link" href="{{ get_url(path='@/docs/library.md') }}">Use it as a library →</a>
+      </article>
+
+      <article class="pillar">
+        <h3>Nothing required underneath</h3>
+        <p>
+          A useful deployment is one binary and a filesystem. Add Postgres when you
+          want several replicas, object storage when your tables live there. Pure
+          Rust, no <code>unsafe</code>, no C dependencies in the default build, so
+          it cross-compiles statically.
+        </p>
+        <a class="pillar__link" href="{{ get_url(path='@/docs/storage.md') }}">Catalog and warehouse →</a>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section class="section section--alt">
+  <div class="wrap">
+    <h2 class="section__title">Written as policy, enforced on every request</h2>
+    <p class="section__lede">
+      Roles become Cedar groups; namespaces, tables and views form a tree. A grant
+      on a subtree reaches everything below it, and nothing above.
+    </p>
+
+<pre class="code-showcase"><code class="language-cedar">// Analysts read anything under one namespace subtree, and nothing else.
+permit(
+  principal in Rustberg::Group::"analysts",
+  action    in [Rustberg::Action::"Read", Rustberg::Action::"List"],
+  resource  in Rustberg::Namespace::"acme\u{1F}analytics"
+);
+
+// A pipeline writes to one namespace, outside business hours only.
+permit(
+  principal == Rustberg::User::"svc-etl",
+  action    in [Rustberg::Action::"Create", Rustberg::Action::"Update"],
+  resource  in Rustberg::Namespace::"acme\u{1F}analytics\u{1F}web"
+) when { context.utc_hour &lt; 6 || context.utc_hour &gt; 20 };
+
+// Nothing in production is reachable from outside the VPC.
+forbid(
+  principal, action,
+  resource in Rustberg::Tenant::"prod"
+) unless {
+  context has source_ip &amp;&amp; context.source_ip.isInRange(ip("10.0.0.0/8"))
+};</code></pre>
+
+    <p class="section__foot">
+      Policies are validated against the schema at load, so a typo is a startup
+      failure rather than a permit that silently never matches. Listings
+      <em>filter</em> rather than deny, so a caller never learns what it cannot see.
+    </p>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <h2 class="section__title">Works with the engines you already run</h2>
+    <div class="engines">
+      <div class="engine"><h3>PyIceberg</h3><p>Read and write</p></div>
+      <div class="engine"><h3>Apache Spark</h3><p>Read and write, including atomic <code>CTAS</code></p></div>
+      <div class="engine"><h3>Trino</h3><p>Read and write</p></div>
+      <div class="engine"><h3>DuckDB</h3><p>Read</p></div>
+    </div>
+    <p class="section__foot">
+      Conformance suites for PyIceberg, DuckDB and Trino run against the built
+      binary on every change.
+      <a href="{{ get_url(path='@/docs/clients.md') }}">Client configuration →</a>
+    </p>
+  </div>
+</section>
+
+<section class="section section--alt">
+  <div class="wrap">
+    <h2 class="section__title">Pick your shape</h2>
+    <div class="shapes">
+      <article class="shape">
+        <h3>Single binary</h3>
+        <p>One process, an embedded redb catalog, a local or object-store warehouse, no external services. The default, and the shape that stays effortless.</p>
+<pre><code class="language-bash">rustberg \
+  --catalog-url file:///var/lib/rustberg \
+  --warehouse   s3://acme/warehouse</code></pre>
+      </article>
+      <article class="shape">
+        <h3>Replicated</h3>
+        <p>Several stateless replicas over one Postgres catalog. Policies, keys and mount configuration live in the database, so every replica agrees.</p>
+<pre><code class="language-bash">rustberg \
+  --catalog-url postgres://rustberg@db/rustberg \
+  --warehouse   s3://acme/warehouse</code></pre>
+      </article>
+      <article class="shape">
+        <h3>Embedded</h3>
+        <p>A Rust service depending on the crate, with policy and vending in-process and no network hop.</p>
+<pre><code class="language-rust">let session = app.as_principal(
+    Principal::embedded("svc-etl", "acme")
+        .with_role("writer")
+        .build(),
+);
+let table = session.load_table(&amp;events).await?;</code></pre>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section class="cta">
+  <div class="wrap cta__inner">
+    <h2>Start with one command</h2>
+    <p>An ephemeral catalog, an admin key printed at startup, and the <code>curl</code> that uses it.</p>
+    <div class="hero__actions">
+      <a class="btn btn--primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Read the guide</a>
+      <a class="btn" href="{{ get_url(path='@/docs/_index.md') }}">Browse the docs</a>
+    </div>
+  </div>
+</section>
+
+</main>
+{% endblock content %}

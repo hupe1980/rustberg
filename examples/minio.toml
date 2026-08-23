@@ -1,0 +1,33 @@
+# Rustberg against MinIO, or any other S3-compatible object store.
+#
+# Used by `docker compose --profile storage up`. Two things are load-bearing and
+# neither has a sensible default:
+#
+#   - `s3.endpoint`, because the store is not AWS and nothing can infer where it
+#     is.
+#   - `s3.path-style-access`, because virtual-host addressing resolves the
+#     bucket as a DNS subdomain, which MinIO does not have.
+#
+# The credentials are named rather than written here, so this file holds no
+# secret and can be committed. A named variable that is unset or blank is a
+# startup failure rather than a silently absent property.
+
+[storage]
+catalog_url        = "file:///var/lib/rustberg/data"
+warehouse_location = "s3://warehouse/"
+
+[storage.properties]
+"s3.endpoint"          = "http://minio:9000"
+"s3.path-style-access" = "true"
+"s3.region"            = "us-east-1"
+"s3.access-key-id"     = "env:MINIO_ACCESS_KEY"
+"s3.secret-access-key" = "env:MINIO_SECRET_KEY"
+
+# Application logs on stderr; the audit trail below is a clean JSON Lines stream
+# on stdout.
+[logging]
+level = "info"
+
+[audit]
+sink        = "stdout"
+fail_closed = true

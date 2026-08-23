@@ -95,9 +95,17 @@ async fn start_server_http(
     );
     warn!("⚠️  Use --tls-cert and --tls-key for production deployments");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(handle_shutdown_signal())
-        .await?;
+    // `ConnectInfo` must be supplied here, or the peer address never reaches the
+    // request. Everything that identifies a caller by address depends on it:
+    // per-IP rate limiting, auth-failure banning, `context.source_ip` in a
+    // policy, and the client address in an audit record. Without it they do not
+    // error — they silently do nothing.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(handle_shutdown_signal())
+    .await?;
 
     info!("🛑 Server has shut down gracefully");
 
@@ -111,8 +119,8 @@ async fn start_server_tls(
     config: &ServerConfig,
     tls_config: &TlsConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use axum_server::tls_rustls::RustlsConfig;
     use axum_server::Handle;
+    use axum_server::tls_rustls::RustlsConfig;
 
     // Install the ring crypto provider for rustls 0.23+
     // This must be done before any TLS operations
@@ -142,7 +150,7 @@ async fn start_server_tls(
 
     axum_server::bind_rustls(addr, rustls_config)
         .handle(handle)
-        .serve(app.into_make_service())
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
 
     info!("🛑 Server has shut down gracefully");
@@ -154,7 +162,7 @@ async fn start_server_tls(
 async fn handle_shutdown_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let mut terminate =
             signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
@@ -187,13 +195,13 @@ async fn handle_shutdown_signal() {
 pub fn generate_self_signed_cert(
     common_name: &str,
 ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-    use rcgen::{generate_simple_self_signed, CertifiedKey};
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
 
     let subject_alt_names = vec![common_name.to_string(), "localhost".to_string()];
 
-    let CertifiedKey { cert, key_pair } = generate_simple_self_signed(subject_alt_names)?;
+    let CertifiedKey { cert, signing_key } = generate_simple_self_signed(subject_alt_names)?;
 
-    Ok((cert.pem(), key_pair.serialize_pem()))
+    Ok((cert.pem(), signing_key.serialize_pem()))
 }
 
 /// Writes a self-signed certificate and key to files.

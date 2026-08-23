@@ -4,9 +4,9 @@
 //! error responses, ensuring consistent error handling across the service.
 
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -24,7 +24,12 @@ pub struct ErrorModel {
     pub error_type: String,
     /// HTTP status code.
     pub code: u16,
-    /// Optional stack trace (only in debug mode).
+    /// Always empty, and serialised only for spec shape.
+    ///
+    /// The spec allows a stack trace here. Rustberg never sends one: a trace
+    /// names source paths and symbols, and this field goes to whoever made the
+    /// failing request — including one that failed *because* it was not
+    /// permitted.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stack: Vec<String>,
 }
@@ -109,6 +114,10 @@ pub enum AppError {
     #[error("Reference does not exist: {0}")]
     NoSuchReference(String),
 
+    /// Requested scan plan does not exist.
+    #[error("Plan does not exist: {0}")]
+    NoSuchPlan(String),
+
     // ========================================================================
     // 406 Not Acceptable / Unsupported Operation
     // ========================================================================
@@ -138,6 +147,13 @@ pub enum AppError {
     /// Namespace is not empty (cannot be deleted).
     #[error("Namespace not empty: {0}")]
     NamespaceNotEmpty(String),
+
+    // ========================================================================
+    // 429 Too Many Requests
+    // ========================================================================
+    /// The caller exceeded its rate limit.
+    #[error("Rate limit exceeded")]
+    RateLimited,
 
     // ========================================================================
     // 422 Unprocessable Entity errors
@@ -187,10 +203,12 @@ impl AppError {
             | AppError::NoSuchTable(_)
             | AppError::NoSuchView(_)
             | AppError::NoSuchSnapshot(_)
-            | AppError::NoSuchReference(_) => StatusCode::NOT_FOUND,
+            | AppError::NoSuchReference(_)
+            | AppError::NoSuchPlan(_) => StatusCode::NOT_FOUND,
 
-            // 406 Not Acceptable / Unsupported Operation
-            AppError::NotSupported(_) => StatusCode::NOT_ACCEPTABLE,
+            // 501 Not Implemented — the operation is understood but unsupported.
+            // (406 would claim a content-negotiation failure, which this is not.)
+            AppError::NotSupported(_) => StatusCode::NOT_IMPLEMENTED,
 
             // 409 Conflict
             AppError::NamespaceAlreadyExists(_)
@@ -198,6 +216,9 @@ impl AppError {
             | AppError::ViewAlreadyExists(_)
             | AppError::CommitConflict(_)
             | AppError::NamespaceNotEmpty(_) => StatusCode::CONFLICT,
+
+            // 429 Too Many Requests
+            AppError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
 
             // 422 Unprocessable Entity
             AppError::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -226,12 +247,14 @@ impl AppError {
             AppError::NoSuchView(_) => "NoSuchViewException",
             AppError::NoSuchSnapshot(_) => "NoSuchSnapshotException",
             AppError::NoSuchReference(_) => "NoSuchReferenceException",
+            AppError::NoSuchPlan(_) => "NoSuchPlanIdException",
             AppError::NotSupported(_) => "UnsupportedOperationException",
             AppError::NamespaceAlreadyExists(_) => "AlreadyExistsException",
             AppError::TableAlreadyExists(_) => "AlreadyExistsException",
             AppError::ViewAlreadyExists(_) => "AlreadyExistsException",
             AppError::CommitConflict(_) => "CommitFailedException",
             AppError::NamespaceNotEmpty(_) => "NamespaceNotEmptyException",
+            AppError::RateLimited => "TooManyRequestsException",
             AppError::UnprocessableEntity(_) => "UnprocessableEntityException",
             AppError::Internal(_) => "InternalServerError",
             AppError::StorageError(_) => "InternalServerError",
@@ -262,9 +285,7 @@ impl From<crate::auth::AuthError> for AppError {
             | AuthError::InvalidToken(_) => AppError::InvalidCredentials,
             AuthError::Forbidden(msg) => AppError::Forbidden(msg),
             AuthError::ResourceNotFound(msg) => AppError::NoSuchNamespace(msg),
-            AuthError::RateLimitExceeded => {
-                AppError::ServiceUnavailable("Rate limit exceeded".to_string())
-            }
+            AuthError::RateLimitExceeded => AppError::RateLimited,
             AuthError::StorageError(msg) => AppError::StorageError(msg),
             AuthError::External(msg) => {
                 AppError::ServiceUnavailable(format!("External service error: {}", msg))
@@ -283,101 +304,73 @@ impl From<iceberg::Error> for AppError {
         use iceberg::ErrorKind;
 
         match err.kind() {
+            // Matched on kind, never on message text: a status code that
+            // depends on wording changes when someone rewords an error.
+            ErrorKind::NamespaceNotFound => AppError::NoSuchNamespace(err.message().to_string()),
+            ErrorKind::TableNotFound => AppError::NoSuchTable(err.message().to_string()),
+            ErrorKind::NamespaceAlreadyExists => {
+                AppError::NamespaceAlreadyExists(err.message().to_string())
+            }
+            ErrorKind::TableAlreadyExists => {
+                AppError::TableAlreadyExists(err.message().to_string())
+            }
+            ErrorKind::CatalogCommitConflicts => {
+                AppError::CommitConflict(err.message().to_string())
+            }
+            // "System is not in a state required for the operation" — the
+            // catalog uses this for a namespace that still has children.
+            ErrorKind::PreconditionFailed => AppError::NamespaceNotEmpty(err.message().to_string()),
+            ErrorKind::FeatureUnsupported => AppError::NotSupported(err.message().to_string()),
             ErrorKind::DataInvalid => AppError::BadRequest(err.message().to_string()),
-            ErrorKind::FeatureUnsupported => {
-                AppError::UnprocessableEntity(err.message().to_string())
-            }
             ErrorKind::Unexpected => AppError::Internal(err.message().to_string()),
-            _ => {
-                // Try to detect specific error types from the message
-                let message = err.message().to_lowercase();
-
-                // Check for "not found" / "does not exist" / "no such" patterns
-                let is_not_found = message.contains("not found")
-                    || message.contains("does not exist")
-                    || message.contains("no such");
-
-                let is_already_exists = message.contains("already exists");
-
-                if is_not_found {
-                    if message.contains("namespace") {
-                        return AppError::NoSuchNamespace(err.message().to_string());
-                    } else if message.contains("table") {
-                        return AppError::NoSuchTable(err.message().to_string());
-                    } else if message.contains("view") {
-                        return AppError::NoSuchView(err.message().to_string());
-                    } else if message.contains("snapshot") {
-                        return AppError::NoSuchSnapshot(err.message().to_string());
-                    }
-                    // Generic not found - default to namespace for unknown entity types
-                    return AppError::NoSuchNamespace(err.message().to_string());
-                } else if is_already_exists {
-                    if message.contains("namespace") {
-                        return AppError::NamespaceAlreadyExists(err.message().to_string());
-                    } else if message.contains("table") {
-                        return AppError::TableAlreadyExists(err.message().to_string());
-                    }
-                    // Generic already exists - default to namespace
-                    return AppError::NamespaceAlreadyExists(err.message().to_string());
-                } else if message.contains("not empty") {
-                    return AppError::NamespaceNotEmpty(err.message().to_string());
-                }
-
-                AppError::Internal(format!("Iceberg error: {}", err.message()))
-            }
+            // ErrorKind is #[non_exhaustive]; a kind added upstream is an
+            // internal error rather than a guess at its meaning.
+            _ => AppError::Internal(format!("Iceberg error: {}", err.message())),
         }
     }
 }
 
 impl IntoResponse for AppError {
+    /// Renders the error as the spec's `IcebergErrorResponse`.
+    ///
+    /// # What the client is told, and what the operator is told
+    ///
+    /// A failure that is the *caller's* — a missing table, a conflict, a
+    /// forbidden action — is described in full: the caller supplied the input
+    /// and can act on the answer.
+    ///
+    /// A failure that is the *server's* is described generically, because the
+    /// detail is a database host, an object-store key, or a query. That detail
+    /// is **logged**, not discarded: a `500` a client cannot read must still be
+    /// one an operator can.
+    ///
+    /// Both halves are unconditional. Keying either on the build profile would
+    /// make the behaviour under test differ from the behaviour in production,
+    /// which is the one place it matters.
     fn into_response(self) -> Response {
         let status = self.status_code();
 
-        // Sanitize error messages for production
-        // Don't expose internal details to clients
+        // Sanitised on the wire in every build, and logged in every build.
         let safe_message = match &self {
-            // Internal errors: hide details in production
             AppError::Internal(msg) | AppError::StorageError(msg) => {
-                if cfg!(debug_assertions) {
-                    msg.clone()
-                } else {
-                    // Generic message for production to prevent information leakage
-                    "An internal error occurred. Please contact support if the problem persists."
-                        .to_string()
-                }
+                tracing::error!(error = %msg, kind = self.error_type(), "Request failed");
+                "An internal error occurred. Check the server log for the cause.".to_string()
             }
-            // Service errors: hide implementation details
             AppError::ServiceUnavailable(msg) => {
-                if cfg!(debug_assertions) {
-                    msg.clone()
-                } else {
-                    "Service temporarily unavailable. Please try again later.".to_string()
-                }
+                tracing::warn!(error = %msg, "Request refused: a dependency is unavailable");
+                "Service temporarily unavailable. Please try again later.".to_string()
             }
-            // Auth errors: don't reveal which credential failed
+            // Never says *which* part of the credential failed.
             AppError::InvalidCredentials => "Invalid credentials provided".to_string(),
-            // All other errors are safe to expose
+            // Everything else describes the caller's own request back to it.
             _ => self.to_string(),
-        };
-
-        // Only include stack traces in debug builds
-        let stack = if cfg!(debug_assertions) {
-            let backtrace = std::backtrace::Backtrace::capture();
-            backtrace
-                .to_string()
-                .lines()
-                .take(20) // Limit stack trace length
-                .map(|s| s.to_string())
-                .collect()
-        } else {
-            vec![]
         };
 
         let body = ErrorModel {
             message: safe_message,
             error_type: self.error_type().to_string(),
             code: status.as_u16(),
-            stack,
+            stack: Vec::new(),
         };
 
         // Wrap in IcebergErrorResponse per Iceberg REST Catalog spec

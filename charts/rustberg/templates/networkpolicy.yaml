@@ -28,10 +28,19 @@ spec:
           protocol: UDP
         - port: 53
           protocol: TCP
-    # Allow HTTPS (for KMS, OIDC, etc.)
+    # Allow HTTPS (OIDC, object storage, credential vending)
     - ports:
         - port: 443
           protocol: TCP
+    {{- if eq .Values.rustberg.catalog.backend "postgres" }}
+    # The catalog database. Without this the pod cannot reach its own catalog
+    # and every request fails, so it is opened whenever the postgres backend is
+    # selected. Narrow it with networkPolicy.egress.to if the database is at a
+    # known address.
+    - ports:
+        - port: {{ .Values.networkPolicy.postgresPort | default 5432 }}
+          protocol: TCP
+    {{- end }}
     {{- with .Values.networkPolicy.egress.to }}
     {{- range . }}
     - {{- toYaml . | nindent 6 }}

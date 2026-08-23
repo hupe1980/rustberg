@@ -6,46 +6,25 @@
 use std::collections::HashMap;
 
 use axum::{
-    extract::{Path, State},
-    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
+    extract::State,
+    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Json as AxumJson},
 };
 use iceberg::spec::{
     NestedFieldRef, Schema as IcebergSchema, ViewMetadata, ViewMetadataBuilder, ViewRepresentations,
 };
-use iceberg::{NamespaceIdent, ViewCreation, ViewUpdate};
+use iceberg::{NamespaceIdent, TableIdent, ViewCreation, ViewUpdate};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::extract::{Json, NamespacePath, ViewPath};
+use super::guard::{self, Target};
+use super::idempotency::{CachedResponse, IDEMPOTENCY_KEY_USED_HEADER, IdempotencyKey};
+use super::pagination::{PaginationQuery, collect_page};
+use super::validation::{validate_namespace, validate_properties, validate_table_name};
 use crate::app::AppState;
-use crate::auth::{Action, AuthenticatedPrincipal, AuthzContext, Resource};
-use crate::catalog::extract::NamespacePath;
-use crate::catalog::idempotency::{CachedResponse, IdempotencyKey, IDEMPOTENCY_KEY_USED_HEADER};
-use crate::catalog::pagination::PaginationQuery;
-use crate::catalog::validation::{validate_namespace, validate_properties, validate_table_name};
+use crate::auth::{Action, AuthenticatedPrincipal, RequestFacts};
 use crate::error::{AppError, Result};
-
-/// Reserved property key for storing namespace owner's tenant ID.
-const TENANT_ID_PROPERTY: &str = "_tenant_id";
-
-/// Helper to get the owner tenant for a namespace, returning an error if namespace doesn't exist.
-async fn get_namespace_owner(
-    state: &AppState,
-    namespace: &NamespaceIdent,
-    default_tenant: &str,
-) -> Result<String> {
-    match state.catalog.get_namespace(namespace).await {
-        Ok(ns) => Ok(ns
-            .properties()
-            .get(TENANT_ID_PROPERTY)
-            .cloned()
-            .unwrap_or_else(|| default_tenant.to_string())),
-        Err(_) => Err(AppError::NoSuchNamespace(format!(
-            "Namespace {} does not exist",
-            namespace
-        ))),
-    }
-}
 
 // ============================================================================
 // Request/Response Types
@@ -139,6 +118,90 @@ pub struct LoadViewResponse {
     pub metadata: ViewMetadata,
 }
 
+/// Request body for `register-view`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RegisterViewPayload {
+    /// View name to register under.
+    pub name: String,
+    /// Location of the existing view metadata file.
+    pub metadata_location: String,
+}
+
+/// `POST /v1/{prefix}/namespaces/{namespace}/register-view`
+///
+/// Adopts view metadata that already exists in storage, the mirror of
+/// `register` for tables. The metadata file is read, never rewritten, so the
+/// view's version history survives being moved between catalogs.
+pub async fn register_view(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    RequestFacts(request): RequestFacts,
+    namespace: NamespacePath,
+    Json(payload): Json<RegisterViewPayload>,
+) -> Result<AxumJson<LoadViewResponse>> {
+    validate_table_name(&payload.name)?;
+
+    let namespace_parts = namespace.clone().inner();
+    let namespace_ident = NamespaceIdent::from_vec(namespace_parts.clone())?;
+
+    // Confined to the warehouse before it is recorded, for the reason
+    // `registerTable` is: the location becomes something this catalog manages
+    // and hands out. Under federation the governing warehouse is the mount's,
+    // not the server's. See `crate::location`.
+    crate::location::ensure_within_warehouse(
+        &state.warehouse_for(&namespace_ident).await,
+        &payload.metadata_location,
+    )?;
+
+    guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &namespace_ident,
+        Target::View(&payload.name),
+        Action::Create,
+    )
+    .await?;
+
+    let view_ident = TableIdent::new(namespace_ident, payload.name.clone());
+    let (metadata_location, metadata) = state
+        .catalog
+        .register_view(&view_ident, payload.metadata_location.clone())
+        .await?;
+
+    // As with a registered table, the metadata file being inside the warehouse
+    // does not mean the view it describes is: the file can declare any
+    // `location` it likes. A rejection has to undo the pointer, which is all
+    // registration wrote.
+    if let Err(rejected) = crate::location::ensure_within_warehouse(
+        &state.warehouse_for(view_ident.namespace()).await,
+        metadata.location(),
+    ) {
+        if let Err(cleanup) = state.catalog.drop_view(&view_ident).await {
+            tracing::error!(
+                view = %view_ident,
+                error = %cleanup,
+                "Failed to unregister a view whose metadata pointed outside the warehouse"
+            );
+        }
+        tracing::warn!(
+            tenant_id = principal.tenant_id(),
+            view = %view_ident,
+            declared_location = %metadata.location(),
+            "Refused to register a view whose metadata declares a location outside the warehouse"
+        );
+        return Err(rejected);
+    }
+
+    tracing::info!(view = %view_ident, "Registered existing view");
+
+    Ok(AxumJson(LoadViewResponse {
+        metadata_location,
+        metadata,
+    }))
+}
+
 /// Request for renaming a view.
 #[derive(Debug, Deserialize)]
 pub struct RenameViewPayload {
@@ -152,10 +215,14 @@ pub struct RenameViewPayload {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CommitViewRequest {
-    /// Optional view identifier (for future multi-view commits).
+    /// Optional view identifier, which the spec lets the body repeat.
+    ///
+    /// It is *checked*, not honoured: the URL is authoritative, and a body that
+    /// names a different view is a client error. Accepting and ignoring it is
+    /// worse than either — a field that reads like it selects the view and does
+    /// not, in a path that authorizes.
     #[serde(default)]
-    #[allow(dead_code)] // Deserialized per Iceberg REST spec; reserved for multi-view commits
-    identifier: Option<ViewIdentifier>,
+    pub identifier: Option<ViewIdentifier>,
     /// Requirements that must be met for the commit to succeed.
     #[serde(default)]
     pub requirements: Vec<ViewRequirement>,
@@ -188,7 +255,7 @@ pub struct CommitViewResponse {
 /// Query parameters for listing views.
 #[derive(Debug, Default, Deserialize)]
 pub struct ListViewsQuery {
-    /// Pagination: token for next page.
+    /// Pagination: token for the next page.
     #[serde(rename = "pageToken")]
     pub page_token: Option<String>,
     /// Pagination: maximum items per page.
@@ -200,52 +267,73 @@ pub struct ListViewsQuery {
 // Handlers
 // ============================================================================
 
-/// Lists all views within a given namespace.
+/// Lists the views in a namespace that the caller may see.
+///
+/// Filtered per view, before the page is cut, for the reasons given on
+/// [`list_tables`](super::table::list_tables).
 ///
 /// GET /v1/namespaces/{namespace}/views
 pub async fn list_views(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    RequestFacts(request): RequestFacts,
     namespace: NamespacePath,
     axum::extract::Query(query): axum::extract::Query<ListViewsQuery>,
 ) -> Result<AxumJson<ListViewsResponse>> {
-    // Get namespace parts
-    let namespace_parts = namespace.clone().inner();
+    let authorized = guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &namespace,
+        Target::Namespace,
+        Action::List,
+    )
+    .await?;
 
-    // Get the namespace's owner tenant
-    let namespace_ident = NamespaceIdent::from_vec(namespace_parts.clone())?;
-    let owner_tenant = get_namespace_owner(&state, &namespace_ident, principal.tenant_id()).await?;
-
-    // Authorize the request against the actual owner
-    let resource = Resource::namespace(&owner_tenant, namespace_parts.clone());
-    let ctx = AuthzContext::new(principal, resource, Action::List);
-    state.authorizer.check(&ctx).await?;
-
-    // List views from storage
-    let view_names = state.view_storage.list_views(&namespace_parts).await?;
-
-    let mut identifiers: Vec<ViewIdentifier> = view_names
-        .into_iter()
-        .map(|name| ViewIdentifier {
-            namespace: namespace_parts.clone(),
-            name,
-        })
-        .collect();
-
-    // Sort for consistent pagination
-    identifiers.sort_by(|a, b| a.name.cmp(&b.name));
-
-    // Apply pagination
-    let pagination = PaginationQuery {
-        page_token: query.page_token,
-        page_size: query.page_size,
-    };
-
-    let paged = pagination.paginate(identifiers, |id| id.name.clone());
+    let page = collect_page(
+        PaginationQuery::new(query.page_token, query.page_size).to_request()?,
+        |page_request| {
+            let state = state.clone();
+            let namespace = namespace.0.clone();
+            async move {
+                state
+                    .catalog
+                    .list_views(&namespace, &page_request)
+                    .await
+                    .map_err(AppError::from)
+            }
+        },
+        |ident: iceberg::TableIdent| {
+            let state = state.clone();
+            let principal = principal.clone();
+            let facts = request.clone();
+            let owner = authorized.owner.clone();
+            async move {
+                let visible = guard::can_see(
+                    &state,
+                    &principal,
+                    &facts,
+                    &owner,
+                    ident.namespace(),
+                    Target::View(ident.name()),
+                )
+                .await;
+                (visible, ident)
+            }
+        },
+    )
+    .await?;
 
     Ok(AxumJson(ListViewsResponse {
-        next_page_token: paged.next_page_token,
-        identifiers: paged.items,
+        next_page_token: page.next_page_token,
+        identifiers: page
+            .items
+            .into_iter()
+            .map(|ident| ViewIdentifier {
+                namespace: ident.namespace().to_vec(),
+                name: ident.name().to_string(),
+            })
+            .collect(),
     }))
 }
 
@@ -255,9 +343,10 @@ pub async fn list_views(
 pub async fn create_view(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    RequestFacts(request): RequestFacts,
     namespace: NamespacePath,
     headers: HeaderMap,
-    AxumJson(payload): AxumJson<CreateViewPayload>,
+    Json(payload): Json<CreateViewPayload>,
 ) -> Result<axum::response::Response> {
     // Validate input
     validate_table_name(&payload.name)?; // Same validation rules apply
@@ -272,23 +361,32 @@ pub async fn create_view(
     let endpoint_path = format!("/v1/namespaces/{}/views", namespace_parts.join("/"));
 
     // Check for idempotency key
-    let idempotency_key = IdempotencyKey::from_headers(&headers, "POST", &endpoint_path);
+    let idempotency_key =
+        IdempotencyKey::from_headers(&headers, "POST", &endpoint_path, &principal);
 
-    // If idempotency key present, check cache first
-    if let Some(ref key) = idempotency_key {
-        if let Some(cached) = state.idempotency_cache.get(key) {
-            return Ok(cached.into_axum_response());
-        }
-    }
-
-    // Get the namespace's owner tenant
+    // Authorized against the *view* being created, not its namespace, so a
+    // view-scoped policy governs it exactly as a table-scoped policy governs
+    // `createTable`. Authorizing the namespace instead meant any principal who
+    // could create anything in the namespace could create a view a policy
+    // specifically forbade.
     let namespace_ident = NamespaceIdent::from_vec(namespace_parts.clone())?;
-    let owner_tenant = get_namespace_owner(&state, &namespace_ident, principal.tenant_id()).await?;
-
-    // Authorize the request against the actual owner
-    let resource = Resource::namespace(&owner_tenant, namespace_parts.clone());
-    let ctx = AuthzContext::new(principal, resource, Action::Create);
-    state.authorizer.check(&ctx).await?;
+    guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &namespace_ident,
+        Target::View(&payload.name),
+        Action::Create,
+    )
+    .await?;
+    // Consulted only after authorization: a cache hit answers without touching
+    // the catalog, so checking it first would serve a request that was never
+    // authorized — and would keep serving it after the grant was revoked.
+    if let Some(ref key) = idempotency_key
+        && let Some(cached) = state.idempotency_cache.get(key).await
+    {
+        return Ok(cached.into_axum_response());
+    }
 
     // Validate schema type
     if payload.schema.schema_type != "struct" {
@@ -332,17 +430,31 @@ pub async fn create_view(
     // Build the default namespace
     let default_namespace = NamespaceIdent::from_vec(payload.view_version.default_namespace)?;
 
-    // Generate view location
-    let view_location = payload.location.unwrap_or_else(|| {
-        format!(
+    // Generate view location. A client-supplied one is confined to the
+    // warehouse for the same reason a table's is — see `crate::location`.
+    let view_location = match payload.location {
+        Some(location) => {
+            crate::location::ensure_within_warehouse(
+                &state.warehouse_for(&namespace_ident).await,
+                &location,
+            )?;
+            location
+        }
+        // The warehouse governing *this namespace*, which under federation is the
+        // mount's rather than the server's. A table gets its default location
+        // from the catalog that will hold it and so never has this problem;
+        // views build theirs here, which is the chance to pick the wrong one —
+        // and then fail the confinement check that correctly used the right one.
+        None => format!(
             "{}/{}/{}",
-            state.warehouse_location,
+            state
+                .warehouse_for(&namespace_ident)
+                .await
+                .trim_end_matches('/'),
             namespace_parts.join("/"),
             payload.name
-        )
-    });
-
-    let metadata_location = format!("{}/metadata/v1.metadata.json", view_location);
+        ),
+    };
 
     // Build ViewCreation
     let view_creation = ViewCreation::builder()
@@ -361,14 +473,13 @@ pub async fn create_view(
     let view_metadata = build_result.metadata;
 
     // Store the view
-    state
-        .view_storage
-        .create_view(
-            &namespace_parts,
-            &payload.name,
-            metadata_location.clone(),
-            view_metadata.clone(),
-        )
+    let view_ident = TableIdent::new(namespace_ident.clone(), payload.name.clone());
+
+    // The catalog writes the metadata file and returns where it put it, so the
+    // location handed back always names a file that exists.
+    let (metadata_location, view_metadata) = state
+        .catalog
+        .create_view(&view_ident, view_metadata)
         .await?;
 
     tracing::info!(
@@ -391,14 +502,14 @@ pub async fn create_view(
     );
 
     // Cache if idempotency key was provided
-    if let Some(key) = idempotency_key {
-        if let Some(cached) = CachedResponse::from_json(StatusCode::OK, &response_body) {
-            state.idempotency_cache.set(key, cached);
-            response.headers_mut().insert(
-                IDEMPOTENCY_KEY_USED_HEADER,
-                axum::http::HeaderValue::from_static("true"),
-            );
-        }
+    if let Some(key) = idempotency_key
+        && let Some(cached) = CachedResponse::from_json(StatusCode::OK, &response_body)
+    {
+        state.idempotency_cache.set(key, cached).await;
+        response.headers_mut().insert(
+            IDEMPOTENCY_KEY_USED_HEADER,
+            axum::http::HeaderValue::from_static("true"),
+        );
     }
 
     Ok(response)
@@ -410,31 +521,26 @@ pub async fn create_view(
 pub async fn load_view(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
-    Path((namespace_str, view_name)): Path<(String, String)>,
+    RequestFacts(request): RequestFacts,
+    ViewPath(view_ident): ViewPath,
 ) -> Result<AxumJson<LoadViewResponse>> {
-    // Parse namespace path
-    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
+    // The extractor already decoded and validated both segments.
+    let view_name = view_ident.name().to_string();
 
-    validate_namespace(&namespace_parts)?;
-    validate_table_name(&view_name)?;
+    guard::authorize(
+        &state,
+        &principal,
+        &request,
+        view_ident.namespace(),
+        Target::View(&view_name),
+        Action::Read,
+    )
+    .await?;
 
-    // Get the namespace's owner tenant
-    let namespace_ident = NamespaceIdent::from_vec(namespace_parts.clone())?;
-    let owner_tenant = get_namespace_owner(&state, &namespace_ident, principal.tenant_id()).await?;
-
-    // Authorize the request
-    let resource = Resource::view(&owner_tenant, &namespace_parts, &view_name);
-    let ctx = AuthzContext::new(principal, resource, Action::Read);
-    state.authorizer.check(&ctx).await?;
-
-    // Load view from storage
-    let (metadata_location, metadata) = state
-        .view_storage
-        .load_view(&namespace_parts, &view_name)
-        .await?
-        .ok_or_else(|| {
-            AppError::NoSuchView(format!("{}.{}", namespace_parts.join("."), view_name))
-        })?;
+    // The error is kept rather than flattened to "no such view": a backend that
+    // is unreachable is not a view that is gone, and reporting the second sends
+    // an operator after the wrong thing.
+    let (metadata_location, metadata) = state.catalog.load_view(&view_ident).await?;
 
     Ok(AxumJson(LoadViewResponse {
         metadata_location,
@@ -448,29 +554,25 @@ pub async fn load_view(
 pub async fn view_exists(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
-    Path((namespace_str, view_name)): Path<(String, String)>,
+    RequestFacts(request): RequestFacts,
+    ViewPath(view_ident): ViewPath,
 ) -> Result<StatusCode> {
-    // Parse namespace path
-    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
+    // The extractor already decoded and validated both segments.
+    let namespace_parts = view_ident.namespace().to_vec();
+    let view_name = view_ident.name().to_string();
 
-    validate_namespace(&namespace_parts)?;
-    validate_table_name(&view_name)?;
-
-    // Get the namespace's owner tenant
-    let namespace_ident = NamespaceIdent::from_vec(namespace_parts.clone())?;
-    let owner_tenant = get_namespace_owner(&state, &namespace_ident, principal.tenant_id()).await?;
-
-    // Authorize the request
-    let resource = Resource::view(&owner_tenant, &namespace_parts, &view_name);
-    let ctx = AuthzContext::new(principal, resource, Action::Read);
-    state.authorizer.check(&ctx).await?;
+    guard::authorize(
+        &state,
+        &principal,
+        &request,
+        view_ident.namespace(),
+        Target::View(&view_name),
+        Action::Read,
+    )
+    .await?;
 
     // Check if view exists
-    if state
-        .view_storage
-        .view_exists(&namespace_parts, &view_name)
-        .await?
-    {
+    if state.catalog.view_exists(&view_ident).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NoSuchView(format!(
@@ -487,28 +589,25 @@ pub async fn view_exists(
 pub async fn drop_view(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
-    Path((namespace_str, view_name)): Path<(String, String)>,
+    RequestFacts(request): RequestFacts,
+    ViewPath(view_ident): ViewPath,
 ) -> Result<StatusCode> {
-    // Parse namespace path
-    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
+    // The extractor already decoded and validated both segments.
+    let namespace_parts = view_ident.namespace().to_vec();
+    let view_name = view_ident.name().to_string();
 
-    validate_namespace(&namespace_parts)?;
-    validate_table_name(&view_name)?;
-
-    // Get the namespace's owner tenant
-    let namespace_ident = NamespaceIdent::from_vec(namespace_parts.clone())?;
-    let owner_tenant = get_namespace_owner(&state, &namespace_ident, principal.tenant_id()).await?;
-
-    // Authorize the request
-    let resource = Resource::view(&owner_tenant, &namespace_parts, &view_name);
-    let ctx = AuthzContext::new(principal, resource, Action::Delete);
-    state.authorizer.check(&ctx).await?;
+    guard::authorize(
+        &state,
+        &principal,
+        &request,
+        view_ident.namespace(),
+        Target::View(&view_name),
+        Action::Delete,
+    )
+    .await?;
 
     // Drop the view
-    state
-        .view_storage
-        .drop_view(&namespace_parts, &view_name)
-        .await?;
+    state.catalog.drop_view(&view_ident).await?;
 
     tracing::info!(
         namespace = namespace_parts.join("."),
@@ -525,15 +624,14 @@ pub async fn drop_view(
 pub async fn commit_view(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
-    Path((namespace_str, view_name)): Path<(String, String)>,
+    RequestFacts(request): RequestFacts,
+    ViewPath(view_ident): ViewPath,
     headers: HeaderMap,
-    AxumJson(payload): AxumJson<CommitViewRequest>,
+    Json(payload): Json<CommitViewRequest>,
 ) -> Result<axum::response::Response> {
-    // Parse namespace path
-    let namespace_parts: Vec<String> = namespace_str.split('\u{1F}').map(str::to_string).collect();
-
-    validate_namespace(&namespace_parts)?;
-    validate_table_name(&view_name)?;
+    // The extractor already decoded and validated both segments.
+    let namespace_parts = view_ident.namespace().to_vec();
+    let view_name = view_ident.name().to_string();
 
     // Build the endpoint path for idempotency scoping
     let endpoint_path = format!(
@@ -543,32 +641,47 @@ pub async fn commit_view(
     );
 
     // Check for idempotency key
-    let idempotency_key = IdempotencyKey::from_headers(&headers, "POST", &endpoint_path);
+    let idempotency_key =
+        IdempotencyKey::from_headers(&headers, "POST", &endpoint_path, &principal);
 
-    // If idempotency key present, check cache first
-    if let Some(ref key) = idempotency_key {
-        if let Some(cached) = state.idempotency_cache.get(key) {
-            return Ok(cached.into_axum_response());
-        }
+    // One fact, one source. See `CommitViewRequest::identifier`.
+    if let Some(ref ident) = payload.identifier
+        && (ident.namespace != namespace_parts || ident.name != view_name)
+    {
+        return Err(AppError::BadRequest(format!(
+            "The identifier in the request body ({}.{}) does not name the view in the \
+                 URL ({}.{}). They must match.",
+            ident.namespace.join("."),
+            ident.name,
+            namespace_parts.join("."),
+            view_name
+        )));
     }
 
-    // Get the namespace's owner tenant
-    let namespace_ident = NamespaceIdent::from_vec(namespace_parts.clone())?;
-    let owner_tenant = get_namespace_owner(&state, &namespace_ident, principal.tenant_id()).await?;
+    guard::authorize(
+        &state,
+        &principal,
+        &request,
+        view_ident.namespace(),
+        Target::View(&view_name),
+        Action::Update,
+    )
+    .await?;
+    // Consulted only after authorization: a cache hit answers without touching
+    // the catalog, so checking it first would serve a request that was never
+    // authorized — and would keep serving it after the grant was revoked.
+    if let Some(ref key) = idempotency_key
+        && let Some(cached) = state.idempotency_cache.get(key).await
+    {
+        return Ok(cached.into_axum_response());
+    }
 
-    // Authorize the request
-    let resource = Resource::view(&owner_tenant, &namespace_parts, &view_name);
-    let ctx = AuthzContext::new(principal, resource, Action::Update);
-    state.authorizer.check(&ctx).await?;
-
-    // Load current view
-    let (current_metadata_location, current_metadata) = state
-        .view_storage
-        .load_view(&namespace_parts, &view_name)
-        .await?
-        .ok_or_else(|| {
-            AppError::NoSuchView(format!("{}.{}", namespace_parts.join("."), view_name))
-        })?;
+    // Loaded with the error kept. Collapsing every failure into "no such view"
+    // reports a backend outage as a missing view, which sends an operator after
+    // the wrong thing and can make a client recreate what is still there.
+    // `From<iceberg::Error>` already maps a genuine miss to `404`.
+    let (_current_metadata_location, current_metadata) =
+        state.catalog.load_view(&view_ident).await?;
 
     // Validate requirements
     for requirement in &payload.requirements {
@@ -598,18 +711,10 @@ pub async fn commit_view(
     let new_metadata = build_result.metadata;
 
     // Generate new metadata location
-    let new_metadata_location = generate_new_view_metadata_location(&current_metadata_location)?;
 
     // Update storage
-    state
-        .view_storage
-        .update_view(
-            &namespace_parts,
-            &view_name,
-            new_metadata_location.clone(),
-            new_metadata.clone(),
-        )
-        .await?;
+    let (new_metadata_location, new_metadata) =
+        state.catalog.update_view(&view_ident, new_metadata).await?;
 
     tracing::info!(
         namespace = namespace_parts.join("."),
@@ -630,14 +735,14 @@ pub async fn commit_view(
     );
 
     // Cache if idempotency key was provided
-    if let Some(key) = idempotency_key {
-        if let Some(cached) = CachedResponse::from_json(StatusCode::OK, &response_body) {
-            state.idempotency_cache.set(key, cached);
-            response.headers_mut().insert(
-                IDEMPOTENCY_KEY_USED_HEADER,
-                axum::http::HeaderValue::from_static("true"),
-            );
-        }
+    if let Some(key) = idempotency_key
+        && let Some(cached) = CachedResponse::from_json(StatusCode::OK, &response_body)
+    {
+        state.idempotency_cache.set(key, cached).await;
+        response.headers_mut().insert(
+            IDEMPOTENCY_KEY_USED_HEADER,
+            axum::http::HeaderValue::from_static("true"),
+        );
     }
 
     Ok(response)
@@ -677,7 +782,8 @@ fn apply_view_update(
 pub async fn rename_view(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
-    AxumJson(payload): AxumJson<RenameViewPayload>,
+    RequestFacts(request): RequestFacts,
+    Json(payload): Json<RenameViewPayload>,
 ) -> Result<StatusCode> {
     // Validate source
     validate_namespace(&payload.source.namespace)?;
@@ -687,43 +793,45 @@ pub async fn rename_view(
     validate_namespace(&payload.destination.namespace)?;
     validate_table_name(&payload.destination.name)?;
 
-    // Get source namespace owner
     let src_namespace_ident = NamespaceIdent::from_vec(payload.source.namespace.clone())?;
-    let src_owner =
-        get_namespace_owner(&state, &src_namespace_ident, principal.tenant_id()).await?;
-
-    // Get destination namespace owner
     let dest_namespace_ident = NamespaceIdent::from_vec(payload.destination.namespace.clone())?;
-    let dest_owner =
-        get_namespace_owner(&state, &dest_namespace_ident, principal.tenant_id()).await?;
 
-    // Prevent cross-tenant renames
-    if src_owner != dest_owner {
+    // `Update` on the source and `Create` on the destination, matching
+    // `renameTable`. Requiring `Delete` on the source instead would stop the
+    // documented `writer` role — create and update, deliberately not delete —
+    // from renaming a view while still allowing it to rename a table.
+    let src = guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &src_namespace_ident,
+        Target::View(&payload.source.name),
+        Action::Update,
+    )
+    .await?;
+
+    let dest = guard::authorize(
+        &state,
+        &principal,
+        &request,
+        &dest_namespace_ident,
+        Target::View(&payload.destination.name),
+        Action::Create,
+    )
+    .await?;
+
+    // A rename is not a mechanism for moving data between tenants.
+    if src.owner != dest.owner {
         return Err(AppError::Forbidden(
-            "Cannot rename view across tenants".to_string(),
+            "Cannot move views between namespaces owned by different tenants".to_string(),
         ));
     }
 
-    // Authorize delete on source
-    let src_resource = Resource::view(&src_owner, &payload.source.namespace, &payload.source.name);
-    let delete_ctx = AuthzContext::new(principal.clone(), src_resource, Action::Delete);
-    state.authorizer.check(&delete_ctx).await?;
-
-    // Authorize create on destination namespace
-    let dest_resource = Resource::namespace(&dest_owner, payload.destination.namespace.clone());
-    let create_ctx = AuthzContext::new(principal, dest_resource, Action::Create);
-    state.authorizer.check(&create_ctx).await?;
-
     // Perform the rename
-    state
-        .view_storage
-        .rename_view(
-            &payload.source.namespace,
-            &payload.source.name,
-            &payload.destination.namespace,
-            &payload.destination.name,
-        )
-        .await?;
+    let src_ident = TableIdent::new(src_namespace_ident, payload.source.name.clone());
+    let dest_ident = TableIdent::new(dest_namespace_ident, payload.destination.name.clone());
+
+    state.catalog.rename_view(&src_ident, &dest_ident).await?;
 
     tracing::info!(
         source = format!(
@@ -742,169 +850,6 @@ pub async fn rename_view(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Generates a new metadata location by incrementing the version number.
-fn generate_new_view_metadata_location(current_location: &str) -> Result<String> {
-    use std::path::Path;
-
-    let path = Path::new(current_location);
-    let parent = path.parent().map(|p| p.to_string_lossy().to_string());
-    let filename = path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .ok_or_else(|| AppError::Internal("Invalid metadata location".to_string()))?;
-
-    // Parse version from filename like "v1.metadata.json" -> "v2.metadata.json"
-    if let Some(version_str) = filename.strip_prefix('v').and_then(|s| s.split('.').next()) {
-        if let Ok(version) = version_str.parse::<i32>() {
-            let new_filename = format!("v{}.metadata.json", version + 1);
-            return Ok(format!(
-                "{}/{}",
-                parent.unwrap_or_else(|| ".".to_string()),
-                new_filename
-            ));
-        }
-    }
-
-    // Fallback: append timestamp
-    let timestamp = chrono::Utc::now().timestamp_millis();
-    Ok(format!(
-        "{}/v{}.metadata.json",
-        parent.unwrap_or_else(|| ".".to_string()),
-        timestamp
-    ))
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::catalog::{MemoryViewStore, ViewStore};
-
-    #[test]
-    fn test_view_identifier_serialization() {
-        let id = ViewIdentifier {
-            namespace: vec!["db".to_string(), "schema".to_string()],
-            name: "my_view".to_string(),
-        };
-
-        let json = serde_json::to_string(&id).unwrap();
-        assert!(json.contains("\"namespace\""));
-        assert!(json.contains("\"name\""));
-    }
-
-    #[tokio::test]
-    async fn test_view_storage_basic_operations() {
-        let storage = MemoryViewStore::new();
-        let namespace = vec!["test".to_string()];
-
-        // Initially empty
-        assert!(storage.list_views(&namespace).await.unwrap().is_empty());
-        assert!(!storage.view_exists(&namespace, "view1").await.unwrap());
-
-        // Create representations using serde (since ViewRepresentations has private constructor)
-        let representations: ViewRepresentations = serde_json::from_value(serde_json::json!([
-            {"type": "sql", "sql": "SELECT 1", "dialect": "spark"}
-        ]))
-        .unwrap();
-
-        // Create a mock ViewMetadata
-        let view_creation = ViewCreation::builder()
-            .name("view1".to_string())
-            .location("/test/view1".to_string())
-            .schema(
-                IcebergSchema::builder()
-                    .with_fields(vec![])
-                    .build()
-                    .unwrap(),
-            )
-            .default_namespace(NamespaceIdent::new("default".to_string()))
-            .representations(representations)
-            .build();
-
-        let build_result = ViewMetadataBuilder::from_view_creation(view_creation)
-            .unwrap()
-            .build()
-            .unwrap();
-        let metadata = build_result.metadata;
-
-        // Create view
-        storage
-            .create_view(
-                &namespace,
-                "view1",
-                "/test/metadata.json".to_string(),
-                metadata.clone(),
-            )
-            .await
-            .unwrap();
-
-        // Verify exists
-        assert!(storage.view_exists(&namespace, "view1").await.unwrap());
-        let views = storage.list_views(&namespace).await.unwrap();
-        assert_eq!(views, vec!["view1".to_string()]);
-
-        // Load view
-        let (loc, loaded) = storage
-            .load_view(&namespace, "view1")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(loc, "/test/metadata.json");
-        assert_eq!(loaded.uuid(), metadata.uuid());
-
-        // Cannot create duplicate
-        let result = storage
-            .create_view(
-                &namespace,
-                "view1",
-                "/other.json".to_string(),
-                metadata.clone(),
-            )
-            .await;
-        assert!(result.is_err());
-
-        // Drop view
-        storage.drop_view(&namespace, "view1").await.unwrap();
-        assert!(!storage.view_exists(&namespace, "view1").await.unwrap());
-
-        // Cannot drop non-existent
-        let result = storage.drop_view(&namespace, "view1").await;
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_generate_new_view_metadata_location() {
-        let loc =
-            generate_new_view_metadata_location("/warehouse/db/view/metadata/v1.metadata.json")
-                .unwrap();
-        assert!(loc.contains("v2.metadata.json"));
-
-        let loc2 =
-            generate_new_view_metadata_location("/warehouse/db/view/metadata/v99.metadata.json")
-                .unwrap();
-        assert!(loc2.contains("v100.metadata.json"));
-    }
-
-    #[test]
-    fn test_sql_representation_deserialization() {
-        let json = r#"{"sql": "SELECT * FROM t", "dialect": "spark"}"#;
-        let rep: SqlRepresentation = serde_json::from_str(json).unwrap();
-        assert_eq!(rep.sql, "SELECT * FROM t");
-        assert_eq!(rep.dialect, "spark");
-    }
-
-    #[test]
-    fn test_view_requirement_deserialization() {
-        let json =
-            r#"{"type": "assert-view-uuid", "uuid": "550e8400-e29b-41d4-a716-446655440000"}"#;
-        let req: ViewRequirement = serde_json::from_str(json).unwrap();
-        match req {
-            ViewRequirement::AssertViewUuid { uuid } => {
-                assert_eq!(uuid, "550e8400-e29b-41d4-a716-446655440000");
-            }
-        }
-    }
-}

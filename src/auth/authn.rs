@@ -5,22 +5,18 @@
 //!
 //! # Security
 //!
-//! API keys are hashed using Argon2id, which provides:
-//! - Memory-hard computation (resistant to GPU/ASIC attacks)
-//! - Side-channel resistance
-//! - Protection against database breaches
-//!
-//! The tradeoff is ~50-100ms verification time per request, but this is
-//! acceptable for API key auth which is typically cached or used sparingly.
+//! API keys are 256-bit random tokens hashed with SHA-256 and compared in
+//! constant time. See [`hash_api_key`](super::hash_api_key) for why a password
+//! KDF is the wrong tool for a high-entropy bearer token, and what it cost when
+//! one was used here.
 
 use async_trait::async_trait;
 use axum::http::HeaderMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::error::{AuthError, Result};
 use super::principal::{AuthMethod, Principal, PrincipalBuilder, PrincipalType};
-use super::store::{extract_key_prefix, verify_api_key, ApiKey, ApiKeyStore};
+use super::store::{ApiKey, ApiKeyStore, extract_key_prefix, verify_api_key};
 
 /// Header name for API key authentication.
 pub const API_KEY_HEADER: &str = "X-API-Key";
@@ -28,12 +24,12 @@ pub const API_KEY_HEADER: &str = "X-API-Key";
 /// Header name for bearer token authentication.
 pub const AUTHORIZATION_HEADER: &str = "Authorization";
 
-/// Pre-computed Argon2id hash used for timing attack mitigation.
-/// This is verified when no candidates are found to ensure constant-time behavior.
-/// The hash corresponds to the string "timing_attack_dummy_key_never_matches"
-/// with our standard Argon2id parameters (19 MiB, 2 iterations, 1 parallelism).
+/// A well-formed hash that no key can match, verified when no candidate key
+/// exists so that "unknown prefix" and "wrong secret" take the same path.
+///
+/// SHA-256 of a value never issued as a key.
 const DUMMY_HASH_FOR_TIMING: &str =
-    "$argon2id$v=19$m=19456,t=2,p=1$YTJiM2M0ZDVlNmY3ZzhoOQ$0X9ULfbvJjTfCNxvkXqWJ9Y7Pz8eS6fQrKhW4mN3dA0";
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Trait for authenticating incoming requests.
 ///
@@ -99,17 +95,12 @@ impl Authenticator for DenyAllAuthenticator {
 
 /// Authenticator that validates API keys from the X-API-Key header.
 ///
-/// API keys are validated against the provided ApiKeyStore. The key is
-/// hashed using Argon2id for secure storage and verification, providing
-/// protection against database breaches.
-/// Authenticator that validates API keys from the X-API-Key header.
+/// Validation is two steps:
+/// 1. Extract the key prefix for an O(1) lookup in the store
+/// 2. Compare the full key's hash against the stored hash, in constant time
 ///
-/// API keys are validated using a two-step process:
-/// 1. Extract the key prefix for O(1) lookup in the store
-/// 2. Verify the full key against the Argon2id hash
-///
-/// This provides both performance (fast prefix lookup) and security
-/// (Argon2id password hashing with unique salts per key).
+/// A key whose prefix matches nothing still runs a dummy verification, so
+/// "no such key" and "wrong key" are indistinguishable by timing.
 pub struct ApiKeyAuthenticator {
     store: Arc<dyn ApiKeyStore>,
 }
@@ -162,12 +153,41 @@ impl ApiKeyAuthenticator {
         Ok(())
     }
 
-    /// Extracts and validates the API key from request headers.
+    /// Extracts the API key from request headers.
+    ///
+    /// Two forms are accepted, in this order:
+    ///
+    /// 1. `X-API-Key: rb_…` — explicit, and what `curl` examples use.
+    /// 2. `Authorization: Bearer rb_…` — **what Iceberg clients actually send.**
+    ///
+    /// The second is not a convenience. PyIceberg, Spark and Trino all carry a
+    /// catalog credential in their `token` property and transmit it as
+    /// `Authorization: Bearer`; none of them offers a way to set an arbitrary
+    /// header. Accepting only `X-API-Key` therefore made API keys unusable from
+    /// every standard client — the documented Spark and PyIceberg examples all
+    /// returned `401`.
+    ///
+    /// Reading a bearer token here does not conflict with JWT authentication.
+    /// [`ChainAuthenticator`] tries the JWT authenticator first, and a value that
+    /// is not a well-formed token falls through to here. An API key is
+    /// unambiguous anyway: it carries the `rb_` prefix, which no JWT has, and
+    /// [`validate_key_format`](Self::validate_key_format) rejects anything else
+    /// before the value is used.
     fn extract_key(headers: &HeaderMap) -> Option<String> {
+        if let Some(key) = headers.get(API_KEY_HEADER).and_then(|v| v.to_str().ok()) {
+            return Some(key.to_string());
+        }
+
         headers
-            .get(API_KEY_HEADER)
+            .get(AUTHORIZATION_HEADER)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
+            .and_then(|value| {
+                // The scheme is case-insensitive per RFC 7235.
+                let (scheme, token) = value.split_once(' ')?;
+                scheme
+                    .eq_ignore_ascii_case("Bearer")
+                    .then(|| token.trim().to_string())
+            })
     }
 
     /// Creates a principal from a validated API key.
@@ -214,16 +234,16 @@ impl Authenticator for ApiKeyAuthenticator {
         // Look up candidate keys by prefix (may return multiple if prefix collides)
         let candidates = self.store.get_by_prefix(&key_prefix).await;
 
-        // SECURITY: Always run Argon2 verification to prevent timing attacks.
+        // SECURITY: Always run a verification to prevent timing attacks.
         // If no candidates exist, we run a dummy verification against a fake hash
         // to ensure constant-time behavior regardless of key existence.
         let api_key = if candidates.is_empty() {
-            // Run dummy Argon2 verification to prevent timing leak.
+            // Run a dummy verification so the timing matches a real miss.
             // The hash format is valid but will never match any real key.
             let _ = verify_api_key(&raw_key, DUMMY_HASH_FOR_TIMING);
             return Err(AuthError::ApiKeyNotFound);
         } else {
-            // Find the matching key using Argon2id verification
+            // Find the matching key by constant-time hash comparison
             // This is constant-time per key to prevent timing attacks
             candidates
                 .into_iter()
@@ -245,205 +265,6 @@ impl Authenticator for ApiKeyAuthenticator {
         let _ = self.store.record_usage(&api_key.id).await;
 
         Ok(Self::key_to_principal(&api_key))
-    }
-
-    fn auth_method(&self) -> AuthMethod {
-        AuthMethod::ApiKey
-    }
-}
-
-// ============================================================================
-// CachedApiKeyAuthenticator (MEDIUM-001)
-// ============================================================================
-
-/// Configuration for API key verification caching.
-#[derive(Debug, Clone)]
-pub struct ApiKeyCache {
-    /// Maximum number of cached verifications.
-    /// Default: 10,000
-    pub max_capacity: u64,
-
-    /// Time-to-live for cached verifications.
-    /// Default: 5 minutes
-    pub ttl: Duration,
-}
-
-impl Default for ApiKeyCache {
-    fn default() -> Self {
-        Self {
-            max_capacity: 10_000,
-            ttl: Duration::from_secs(300), // 5 minutes
-        }
-    }
-}
-
-impl ApiKeyCache {
-    /// Creates a new cache configuration with custom settings.
-    pub fn new(max_capacity: u64, ttl: Duration) -> Self {
-        Self { max_capacity, ttl }
-    }
-}
-
-/// Authenticator that caches API key verification results.
-///
-/// This wraps an `ApiKeyAuthenticator` and caches validated principals
-/// to avoid the cost of Argon2id verification on every request.
-///
-/// # Security
-///
-/// - Cache key is a SHA-256 hash of the raw API key (not the key itself)
-/// - TTL ensures verification is re-run periodically
-/// - Disabled/revoked keys will be re-verified after TTL expires
-/// - Expired keys are rejected immediately (expiration checked on cache hit)
-///
-/// # Performance
-///
-/// - Cache hit: <1ms (vs 50-100ms for Argon2id verification)
-/// - Memory: ~1KB per cached key
-/// - Default capacity: 10,000 keys (~10MB memory)
-pub struct CachedApiKeyAuthenticator {
-    inner: ApiKeyAuthenticator,
-    /// Cache: SHA-256(raw_key) -> (Principal, ApiKey for re-verification)
-    cache: moka::future::Cache<[u8; 32], CachedAuthResult>,
-    store: Arc<dyn ApiKeyStore>,
-}
-
-/// Cached authentication result with metadata for re-verification.
-#[derive(Clone)]
-struct CachedAuthResult {
-    principal: Principal,
-    /// Key ID for quick lookup on deletion events
-    key_id: String,
-    /// Cached enabled flag (re-checked on enabled flag changes)
-    enabled: bool,
-    /// Expiration timestamp from the API key
-    expires_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-impl CachedApiKeyAuthenticator {
-    /// Creates a new cached API key authenticator.
-    pub fn new(store: Arc<dyn ApiKeyStore>, config: ApiKeyCache) -> Self {
-        let cache = moka::future::Cache::builder()
-            .max_capacity(config.max_capacity)
-            .time_to_live(config.ttl)
-            .build();
-
-        Self {
-            inner: ApiKeyAuthenticator::new(store.clone()),
-            cache,
-            store,
-        }
-    }
-
-    /// Creates with default configuration (10k capacity, 5 min TTL).
-    pub fn with_defaults(store: Arc<dyn ApiKeyStore>) -> Self {
-        Self::new(store, ApiKeyCache::default())
-    }
-
-    /// Computes a cache key from the raw API key.
-    ///
-    /// Uses SHA-256 to avoid storing the raw key in memory.
-    fn cache_key(raw_key: &str) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(raw_key.as_bytes());
-        hasher.finalize().into()
-    }
-
-    /// Invalidates cache entries for a specific key ID.
-    ///
-    /// Call this when an API key is deleted, disabled, or rotated.
-    pub async fn invalidate_key(&self, _key_id: &str) {
-        // moka doesn't support value-based invalidation, but TTL handles this.
-        // For immediate invalidation, the cache would need to be cleared entirely
-        // or use a different structure. With 5-minute TTL, this is acceptable.
-        //
-        // For production systems needing immediate invalidation, consider:
-        // 1. Using a secondary index: key_id -> cache_key
-        // 2. Using cache entry metadata with invalidation timestamps
-        // 3. Reducing TTL to 1-2 minutes
-        tracing::debug!(
-            key_id = _key_id,
-            "API key cache invalidation requested (TTL-based)"
-        );
-    }
-
-    /// Clears all cached authentications.
-    pub fn clear_cache(&self) {
-        self.cache.invalidate_all();
-    }
-
-    /// Returns cache statistics.
-    pub fn cache_stats(&self) -> (u64, u64) {
-        (self.cache.entry_count(), self.cache.weighted_size())
-    }
-}
-
-#[async_trait]
-impl Authenticator for CachedApiKeyAuthenticator {
-    async fn authenticate(&self, headers: &HeaderMap) -> Result<Principal> {
-        // Extract the API key from the header
-        let raw_key =
-            ApiKeyAuthenticator::extract_key(headers).ok_or(AuthError::Unauthenticated)?;
-
-        if raw_key.is_empty() {
-            return Err(AuthError::InvalidCredentials("Empty API key".into()));
-        }
-
-        // Validate key format first (fast fail)
-        if let Err(reason) = ApiKeyAuthenticator::validate_key_format(&raw_key) {
-            return Err(AuthError::InvalidCredentials(reason.into()));
-        }
-
-        // Check cache first
-        let cache_key = Self::cache_key(&raw_key);
-        if let Some(cached) = self.cache.get(&cache_key).await {
-            // Re-check expiration (may have expired since caching)
-            if let Some(expires_at) = cached.expires_at {
-                if chrono::Utc::now() >= expires_at {
-                    self.cache.invalidate(&cache_key).await;
-                    return Err(AuthError::TokenExpired);
-                }
-            }
-
-            // Re-check enabled flag (fast lookup by key ID)
-            if !cached.enabled {
-                self.cache.invalidate(&cache_key).await;
-                return Err(AuthError::ApiKeyDisabled);
-            }
-
-            // Cache hit - return cached principal
-            tracing::trace!(key_id = %cached.key_id, "API key cache hit");
-            return Ok(cached.principal);
-        }
-
-        // Cache miss - delegate to inner authenticator
-        // This will run Argon2id verification
-        let principal = self.inner.authenticate(headers).await?;
-
-        // Look up the key metadata for caching (fast prefix-based lookup)
-        let key_prefix = extract_key_prefix(&raw_key)
-            .ok_or_else(|| AuthError::InvalidCredentials("Invalid key format".into()))?;
-        let candidates = self.store.get_by_prefix(&key_prefix).await;
-
-        // Find the matching key (already verified above, just need metadata)
-        if let Some(api_key) = candidates
-            .into_iter()
-            .find(|k| verify_api_key(&raw_key, &k.key_hash))
-        {
-            let cached_result = CachedAuthResult {
-                principal: principal.clone(),
-                key_id: api_key.id.to_string(),
-                enabled: api_key.enabled,
-                expires_at: api_key.expires_at,
-            };
-
-            // Cache the result
-            self.cache.insert(cache_key, cached_result).await;
-            tracing::trace!(key_id = %api_key.id, "API key cached after verification");
-        }
-
-        Ok(principal)
     }
 
     fn auth_method(&self) -> AuthMethod {
@@ -528,22 +349,51 @@ mod tests {
     }
 
     #[test]
-    fn test_api_key_hashing_argon2() {
+    fn test_api_key_hashing_is_deterministic() {
         use super::super::store::{hash_api_key, verify_api_key};
 
         let key = "rb_test-api-key-12345";
         let hash1 = hash_api_key(key);
         let hash2 = hash_api_key(key);
 
-        // Argon2 hashes are different each time (unique salt)
-        assert_ne!(hash1, hash2);
-
-        // But both should verify against the original key
+        // Unsalted, so the same key always yields the same hash. That is what
+        // lets a config-declared key be matched without storing per-key state.
+        assert_eq!(hash1, hash2);
         assert!(verify_api_key(key, &hash1));
-        assert!(verify_api_key(key, &hash2));
+        assert!(hash1.starts_with("sha256:"));
+    }
 
-        // Hash is in PHC format: $argon2id$v=19$m=...
-        assert!(hash1.starts_with("$argon2id$"));
+    /// The whole point of dropping Argon2: verification must be cheap enough to
+    /// sit on every request. A password KDF at OWASP parameters takes tens of
+    /// milliseconds and allocates 19 MiB; this must not.
+    #[test]
+    fn test_api_key_verification_is_fast() {
+        use super::super::store::{hash_api_key, verify_api_key};
+        use std::time::Instant;
+
+        let key = "rb_test-api-key-12345";
+        let hash = hash_api_key(key);
+
+        let start = Instant::now();
+        for _ in 0..1_000 {
+            assert!(verify_api_key(key, &hash));
+        }
+        let elapsed = start.elapsed();
+
+        // Generous by three orders of magnitude against Argon2, so this fails
+        // only if a password KDF reappears on the hot path — not on a slow CI box.
+        assert!(
+            elapsed.as_millis() < 500,
+            "1000 verifications took {elapsed:?}; a KDF is back on the request path"
+        );
+    }
+
+    /// A wrong key must not verify against the dummy hash either.
+    #[test]
+    fn test_dummy_hash_never_matches() {
+        use super::super::store::verify_api_key;
+
+        assert!(!verify_api_key("rb_anything-at-all", DUMMY_HASH_FOR_TIMING));
     }
 
     #[test]
@@ -569,10 +419,10 @@ mod tests {
         // Valid key format: rb_ + base64url characters
         assert!(ApiKeyAuthenticator::validate_key_format("rb_abcdefghij").is_ok());
         assert!(ApiKeyAuthenticator::validate_key_format("rb_ABC123xyz-_").is_ok());
-        assert!(ApiKeyAuthenticator::validate_key_format(
-            "rb_0123456789abcdefghijklmnopqrstuvwxyz"
-        )
-        .is_ok());
+        assert!(
+            ApiKeyAuthenticator::validate_key_format("rb_0123456789abcdefghijklmnopqrstuvwxyz")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -606,113 +456,80 @@ mod tests {
         // / (not base64url)
     }
 
-    // ========================================================================
-    // CachedApiKeyAuthenticator Tests
-    // ========================================================================
+    // ── Credential transport ──────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn test_cached_authenticator_cache_hit() {
-        use super::super::store::{ApiKeyBuilder, InMemoryApiKeyStore};
-
-        // Create store and add a key
-        let store = Arc::new(InMemoryApiKeyStore::new());
-        let (api_key, raw_key) = ApiKeyBuilder::new("test-key", "default").build();
-        store.store(api_key).await.unwrap();
-
-        // Create cached authenticator with short TTL for testing
-        let config = ApiKeyCache {
-            max_capacity: 100,
-            ttl: Duration::from_secs(60),
-        };
-        let auth = CachedApiKeyAuthenticator::new(store, config);
-
-        // First request - cache miss, Argon2 verification
-        let mut headers = HeaderMap::new();
-        headers.insert(API_KEY_HEADER, raw_key.parse().unwrap());
-
-        let result1 = auth.authenticate(&headers).await;
-        assert!(result1.is_ok());
-
-        // Wait for cache to sync (moka is eventually consistent)
-        auth.cache.run_pending_tasks().await;
-
-        // Verify cache is populated before second request
-        let (count_before, _) = auth.cache_stats();
-        assert_eq!(
-            count_before, 1,
-            "Cache should be populated after first request"
-        );
-
-        // Second request - cache hit, no Argon2
-        let result2 = auth.authenticate(&headers).await;
-        assert!(result2.is_ok());
-
-        // Verify cache stats
-        let (count, _) = auth.cache_stats();
-        assert_eq!(count, 1);
-    }
-
-    #[tokio::test]
-    async fn test_cached_authenticator_invalid_key() {
-        use super::super::store::InMemoryApiKeyStore;
-
-        let store = Arc::new(InMemoryApiKeyStore::new());
-        let auth = CachedApiKeyAuthenticator::with_defaults(store);
-
-        // Invalid key should not be cached
-        let mut headers = HeaderMap::new();
-        headers.insert(API_KEY_HEADER, "rb_invalid-key-12345".parse().unwrap());
-
-        let result = auth.authenticate(&headers).await;
-        assert!(result.is_err());
-
-        // Cache should be empty
-        let (count, _) = auth.cache_stats();
-        assert_eq!(count, 0);
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (name, value) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        h
     }
 
     #[test]
-    fn test_cache_key_deterministic() {
-        let key1 = CachedApiKeyAuthenticator::cache_key("rb_test-key-12345");
-        let key2 = CachedApiKeyAuthenticator::cache_key("rb_test-key-12345");
-        let key3 = CachedApiKeyAuthenticator::cache_key("rb_different-key-67890");
-
-        // Same input produces same output
-        assert_eq!(key1, key2);
-        // Different input produces different output
-        assert_ne!(key1, key3);
+    fn extracts_key_from_the_explicit_header() {
+        let h = headers(&[("x-api-key", "rb_abc123")]);
+        assert_eq!(
+            ApiKeyAuthenticator::extract_key(&h).as_deref(),
+            Some("rb_abc123")
+        );
     }
 
-    #[tokio::test]
-    async fn test_cached_authenticator_clear_cache() {
-        use super::super::store::{ApiKeyBuilder, InMemoryApiKeyStore};
+    /// PyIceberg, Spark and Trino all send their catalog credential as
+    /// `Authorization: Bearer` and offer no way to set a custom header. Reading
+    /// only `X-API-Key` made API keys unusable from every standard client.
+    #[test]
+    fn extracts_key_from_a_bearer_token() {
+        let h = headers(&[("authorization", "Bearer rb_abc123")]);
+        assert_eq!(
+            ApiKeyAuthenticator::extract_key(&h).as_deref(),
+            Some("rb_abc123")
+        );
+    }
 
-        let store = Arc::new(InMemoryApiKeyStore::new());
-        let (api_key, raw_key) = ApiKeyBuilder::new("test-key", "default").build();
-        store.store(api_key).await.unwrap();
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        // RFC 7235 makes the scheme case-insensitive, and clients vary.
+        for value in ["bearer rb_abc", "BEARER rb_abc", "BeArEr rb_abc"] {
+            let h = headers(&[("authorization", value)]);
+            assert_eq!(
+                ApiKeyAuthenticator::extract_key(&h).as_deref(),
+                Some("rb_abc"),
+                "failed for {value}"
+            );
+        }
+    }
 
-        let auth = CachedApiKeyAuthenticator::with_defaults(store);
+    /// The explicit header wins, so a client sending both gets predictable
+    /// behaviour rather than depending on header ordering.
+    #[test]
+    fn the_explicit_header_takes_precedence() {
+        let h = headers(&[
+            ("x-api-key", "rb_explicit"),
+            ("authorization", "Bearer rb_bearer"),
+        ]);
+        assert_eq!(
+            ApiKeyAuthenticator::extract_key(&h).as_deref(),
+            Some("rb_explicit")
+        );
+    }
 
-        // Authenticate to populate cache
-        let mut headers = HeaderMap::new();
-        headers.insert(API_KEY_HEADER, raw_key.parse().unwrap());
-        let _ = auth.authenticate(&headers).await;
+    #[test]
+    fn other_authorization_schemes_are_ignored() {
+        // Basic auth is not an API key, and must not be read as one.
+        let h = headers(&[("authorization", "Basic dXNlcjpwYXNz")]);
+        assert_eq!(ApiKeyAuthenticator::extract_key(&h), None);
 
-        // Wait for cache to sync (moka is eventually consistent)
-        auth.cache.run_pending_tasks().await;
+        // A bare value with no scheme is not a bearer token.
+        let h = headers(&[("authorization", "rb_abc123")]);
+        assert_eq!(ApiKeyAuthenticator::extract_key(&h), None);
+    }
 
-        // Verify cache populated
-        let (count, _) = auth.cache_stats();
-        assert_eq!(count, 1);
-
-        // Clear cache
-        auth.clear_cache();
-
-        // Wait for invalidation to complete
-        auth.cache.run_pending_tasks().await;
-
-        // Verify cache empty
-        let (count_after, _) = auth.cache_stats();
-        assert_eq!(count_after, 0);
+    #[test]
+    fn absent_credentials_extract_nothing() {
+        assert_eq!(ApiKeyAuthenticator::extract_key(&HeaderMap::new()), None);
     }
 }

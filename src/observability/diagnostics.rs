@@ -29,8 +29,6 @@ pub struct StartupDiagnostics {
     pub warehouse_location: Option<String>,
     /// Default tenant ID.
     pub default_tenant_id: String,
-    /// KMS provider.
-    pub kms_provider: Option<String>,
 }
 
 impl Default for StartupDiagnostics {
@@ -47,7 +45,6 @@ impl Default for StartupDiagnostics {
             storage_backend: "memory".to_string(),
             warehouse_location: None,
             default_tenant_id: "default".to_string(),
-            kms_provider: None,
         }
     }
 }
@@ -102,7 +99,6 @@ impl StartupDiagnostics {
             auth_mode = %auth_status,
             storage_backend = %self.storage_backend,
             warehouse = self.warehouse_location.as_deref().unwrap_or("(none)"),
-            kms_provider = self.kms_provider.as_deref().unwrap_or("none"),
             default_tenant = %self.default_tenant_id,
             started_at = now,
             "Server starting"
@@ -138,9 +134,6 @@ impl StartupDiagnostics {
             };
             println!("║  Warehouse:       {:<48}║", truncated);
         }
-        if let Some(ref kms) = self.kms_provider {
-            println!("║  KMS Provider:    {:<48}║", kms);
-        }
         println!("║  Default Tenant:  {:<48}║", self.default_tenant_id);
         println!("╠════════════════════════════════════════════════════════════════════╣");
         println!("║  Health:  GET /health                                              ║");
@@ -148,7 +141,6 @@ impl StartupDiagnostics {
         println!("║  Metrics: GET /metrics                                             ║");
         println!("║  API:     /v1/namespaces, /v1/{{namespace}}/tables                  ║");
         println!("║  Views:   /v1/{{namespace}}/views                                   ║");
-        println!("║  Search:  GET /v1/search                                           ║");
         println!("╠════════════════════════════════════════════════════════════════════╣");
         println!("║  Started at Unix timestamp: {:<38}║", now);
         println!("╚════════════════════════════════════════════════════════════════════╝");
@@ -213,12 +205,6 @@ impl StartupDiagnosticsBuilder {
         self
     }
 
-    /// Sets KMS provider.
-    pub fn kms_provider(mut self, provider: Option<String>) -> Self {
-        self.inner.kms_provider = provider;
-        self
-    }
-
     /// Builds the diagnostics.
     pub fn build(self) -> StartupDiagnostics {
         self.inner
@@ -248,7 +234,6 @@ mod tests {
             .storage_backend("file:///var/lib/rustberg")
             .warehouse_location(Some("s3://bucket/warehouse".to_string()))
             .default_tenant_id("my-tenant")
-            .kms_provider(Some("aws-kms".to_string()))
             .build();
 
         assert_eq!(diag.bind_address, "127.0.0.1");
@@ -261,7 +246,6 @@ mod tests {
             Some("s3://bucket/warehouse".to_string())
         );
         assert_eq!(diag.default_tenant_id, "my-tenant");
-        assert_eq!(diag.kms_provider, Some("aws-kms".to_string()));
     }
 
     #[test]

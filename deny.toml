@@ -8,19 +8,30 @@
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 
-# Ignore specific advisories (add with justification)
+# Advisories in transitive dependencies that this crate cannot resolve by
+# updating. Each names the crate, the path in, and why it is tolerable here —
+# an ignore with no reason is one nobody can re-evaluate later.
 ignore = [
-    # fxhash - unmaintained, transitive dep from sled
-    "RUSTSEC-2025-0057",
-    # instant - unmaintained, transitive dep from sled and azure_* crates
-    "RUSTSEC-2024-0384",
-    # paste - unmaintained, transitive dep from parquet, foyer-storage, azure_core
+    # quick-xml, via opendal's S3 and ADLS services. Both are denial-of-service
+    # bounds on parsing untrusted XML. Rustberg does not hand it any: the only
+    # XML it parses is a `DeleteObjects` body, read by a scanner of its own
+    # (`catalog::v1::sign`) that exists partly to avoid this dependency. What
+    # opendal parses is object-store responses from the store the operator
+    # configured.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    # rsa, via reqsign's Azure storage signer. A timing side channel in RSA
+    # decryption; reqsign uses it to sign requests with a key the operator
+    # configured, not to decrypt attacker-supplied ciphertext. Removed with
+    # `--no-default-features` builds that omit `storage-azure`.
+    "RUSTSEC-2023-0071",
+    # paste, a proc-macro crate, via `parquet` inside `iceberg`. Unmaintained
+    # rather than vulnerable, and it runs at compile time only.
     "RUSTSEC-2024-0436",
-    # rustls-pemfile - unmaintained, transitive dep from object_store, bollard
+    # rustls-pemfile (unmaintained) and tokio-tar (a tar-extraction flaw), both
+    # via `testcontainers`. Dev-dependencies: they reach the test suite pulling
+    # container images and never the server.
     "RUSTSEC-2025-0134",
-    # bincode - unmaintained, transitive dep from madsim (foyer/slatedb)
-    "RUSTSEC-2025-0141",
-    # tokio-tar - dev dependency only (testcontainers), no fix available
     "RUSTSEC-2025-0111",
 ]
 

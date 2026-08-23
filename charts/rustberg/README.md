@@ -1,69 +1,97 @@
 # Rustberg Helm Chart
 
-A Helm chart for deploying [Rustberg](https://github.com/hupe1980/rustberg) - a production-ready Apache Iceberg REST Catalog written in Rust.
-
-> ⚠️ **Important:** Rustberg currently supports **single-writer deployments only**. Set `replicaCount: 1` for write workloads. Multiple replicas can be used for read-heavy workloads with leader election (not yet implemented).
+A Helm chart for [Rustberg](https://github.com/hupe1980/rustberg) — an Apache
+Iceberg REST Catalog written in Rust.
 
 ## Prerequisites
 
 - Kubernetes 1.25+
 - Helm 3.8+
+- A PostgreSQL database (see below)
+
+## The catalog backend decides everything else
+
+Rustberg has two catalog backends, and which one you pick determines whether the
+deployment can have more than one pod.
+
+| `rustberg.catalog.backend` | Replicas | Needs |
+|---|---|---|
+| `postgres` *(default)* | any | A database |
+| `redb` | exactly 1 | A PersistentVolume |
+
+**redb** is one file with an exclusive lock. A second process does not contend —
+it fails to start with *Database already open*. That includes the extra pod a
+rolling update creates, which is why the chart forces `strategy: Recreate` when
+redb is selected. It is the right backend for embedding and single-node
+installs, and the wrong one for a cluster.
+
+**Postgres** is the default here for that reason. The pods hold no state, so
+replicas, rolling updates and autoscaling all work normally.
+
+The chart refuses configurations that cannot work — more than one replica on
+redb, redb without persistence, autoscaling on redb, postgres without a DSN —
+with an error naming the fix, rather than letting the pod crash-loop.
 
 ## Installation
 
 ```bash
-# Add the Helm repository (if published)
-helm repo add rustberg https://hupe1980.github.io/rustberg/charts
-helm repo update
+git clone https://github.com/hupe1980/rustberg
+cd rustberg
 
-# Install with default values
-helm install rustberg rustberg/rustberg
+kubectl create secret generic rustberg-catalog \
+  --from-literal=dsn="postgres://rustberg:secret@postgres:5432/rustberg"
 
-# Install with custom values
-helm install rustberg rustberg/rustberg -f values.yaml
+helm install rustberg charts/rustberg \
+  --set rustberg.catalog.postgres.existingSecret=rustberg-catalog \
+  --set rustberg.warehouse.location=s3://my-bucket/warehouse
 ```
+
+> **Note.** The chart is not published to a registry; install it from a clone.
+
+### Where the database comes from
+
+This chart bundles no database, on purpose. A Postgres subchart would be a
+StatefulSet without backups, failover, or an upgrade path — everything a real
+deployment needs from its database, missing. Use a managed instance (RDS, Cloud
+SQL, Azure Database) or an operator such as
+[CloudNativePG](https://cloudnative-pg.io/), and hand Rustberg the DSN.
+
+Rustberg creates its own tables on first start; there is no migration job.
 
 ## Configuration
 
-See [values.yaml](values.yaml) for the full list of configurable parameters.
+See [values.yaml](values.yaml) for every parameter.
 
-### Quick Examples
-
-#### Development Mode (Memory Storage)
+### Production with S3
 
 ```yaml
-rustberg:
-  storage:
-    type: memory
-```
-
-#### Production with S3
-
-```yaml
-# IMPORTANT: Use replicaCount: 1 until distributed coordination is implemented
-replicaCount: 1
+replicaCount: 3
 
 rustberg:
+  catalog:
+    backend: postgres
+    postgres:
+      existingSecret: rustberg-catalog   # key: dsn
+
+  warehouse:
+    location: s3://my-iceberg-bucket/warehouse
+
   storage:
-    type: s3
+    type: s3          # credentials the server uses to reach the warehouse
     s3:
-      bucket: my-iceberg-bucket
       region: us-east-1
       existingSecret: aws-credentials
 
-  auth:
-    enabled: true
-    jwt:
-      enabled: true
-      issuer: https://auth.example.com
-      audience: rustberg
+  # Authentication and policy come from the TOML config, not chart values.
+  config: |
+    [server.auth]
+    jwt_enabled = true
+    policy_file = "/config/catalog.cedar"
 
-  encryption:
-    enabled: true
-    kmsProvider: aws-kms
-    awsKms:
-      keyId: alias/rustberg-key
-      region: us-east-1
+    [server.auth.jwt]
+    issuer   = "https://auth.example.com"
+    audience = "rustberg"
+    jwks_url = "https://auth.example.com/.well-known/jwks.json"
 
 ingress:
   enabled: true
@@ -78,24 +106,31 @@ ingress:
       hosts:
         - iceberg.example.com
 
-# Disable autoscaling until multi-writer support is added
 autoscaling:
-  enabled: false
-  maxReplicas: 10
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 8
 
 podDisruptionBudget:
   enabled: true
   minAvailable: 2
 ```
 
-#### Production with GCS
+### Production with GCS
 
 ```yaml
 rustberg:
+  catalog:
+    backend: postgres
+    postgres:
+      existingSecret: rustberg-catalog
+
+  warehouse:
+    location: gs://my-iceberg-bucket/warehouse
+
   storage:
     type: gcs
     gcs:
-      bucket: my-iceberg-bucket
       projectId: my-project
       existingSecret: gcp-credentials
 
@@ -104,60 +139,38 @@ serviceAccount:
     iam.gke.io/gcp-service-account: rustberg@my-project.iam.gserviceaccount.com
 ```
 
-#### Production with Azure
+Prefer Workload Identity over a mounted service-account key.
+
+### Single node with the embedded catalog
 
 ```yaml
+replicaCount: 1
+
 rustberg:
-  storage:
-    type: azure
-    azure:
-      container: iceberg
-      accountName: myaccount
-      existingSecret: azure-storage-credentials
+  catalog:
+    backend: redb
+    path: /data/catalog
+  warehouse:
+    location: s3://my-bucket/warehouse
+
+persistence:
+  enabled: true       # required: the catalog is a file on this volume
+  size: 10Gi
 ```
 
-### Authentication
+### Authentication and policy
 
-```yaml
-rustberg:
-  auth:
-    enabled: true
-    
-    # API Key authentication
-    apiKeys:
-      enabled: true
-      keys:
-        - name: admin
-          key: rk_xxxxx
-          roles: [admin]
-    
-    # JWT/OIDC authentication
-    jwt:
-      enabled: true
-      issuer: https://accounts.google.com
-      audience: rustberg
-      jwksUri: https://www.googleapis.com/oauth2/v3/certs
-```
+Both are configured through `rustberg.config`, the full Rustberg TOML file,
+which the chart mounts at `/config/rustberg.toml`.
 
-### Encryption
+There are no `rustberg.auth.*` or `rustberg.authorization.*` values: a chart
+value no template reads is a setting that silently does nothing.
 
-```yaml
-rustberg:
-  encryption:
-    enabled: true
-    
-    # HashiCorp Vault
-    kmsProvider: vault
-    vault:
-      address: https://vault.example.com
-      transitMount: transit
-      keyName: rustberg
-      existingSecret: vault-token
-```
+API key secrets belong in environment variables, referenced from the config by
+name — see [authentication](https://hupe1980.github.io/rustberg/docs/authentication/).
+Add them with `rustberg.extraEnv`.
 
 ## Monitoring
-
-Enable Prometheus ServiceMonitor:
 
 ```yaml
 serviceMonitor:
@@ -165,7 +178,7 @@ serviceMonitor:
   interval: 30s
 ```
 
-## Network Policies
+## Network policies
 
 ```yaml
 networkPolicy:
@@ -177,17 +190,25 @@ networkPolicy:
             name: data-platform
 ```
 
+Remember to allow egress to the Postgres service and to object storage.
+
 ## Upgrading
 
 ```bash
-helm upgrade rustberg rustberg/rustberg -f values.yaml
+helm upgrade rustberg charts/rustberg -f values.yaml
 ```
+
+With the Postgres backend this is an ordinary rolling update. With redb it is a
+`Recreate`, so expect a few seconds of downtime.
 
 ## Uninstalling
 
 ```bash
 helm uninstall rustberg
 ```
+
+The catalog database is not touched. With redb, the PersistentVolumeClaim
+survives per your reclaim policy.
 
 ## License
 

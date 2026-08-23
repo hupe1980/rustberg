@@ -3,7 +3,7 @@
 //! Provides `/health` and `/ready` endpoints for container orchestration
 //! and load balancer health checks.
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -91,11 +91,29 @@ pub struct ReadinessComponents {
 }
 
 /// Status of an individual component.
+///
+/// # Why `message` carries a category and not the error
+///
+/// `/health` and `/ready` are the two routes outside the authentication layer,
+/// because a liveness probe cannot hold a credential. That makes everything they
+/// return readable by anyone who can open a socket, so what they say has to be
+/// safe to say to a stranger.
+///
+/// An earlier version put the backend's own error text here —
+/// `format!("Storage error: {e}")`. A `sqlx` connection failure names the host
+/// and the database; an object-store failure names the bucket and the key; the
+/// federated catalog's message names every unreachable *mount*. All of that is
+/// deployment topology, handed out unauthenticated, and it contradicted this
+/// server's own claim that the open endpoints reveal nothing about the catalog.
+///
+/// So the wire carries a fixed vocabulary — which component, and which of a
+/// handful of failure shapes — and the detail goes to the log, where it was
+/// already being written and where reading it requires access to the host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentStatus {
     /// Component status: "ready", "degraded", or "unavailable".
     pub status: String,
-    /// Optional status message.
+    /// A category from a fixed set, never a backend error string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -135,7 +153,7 @@ impl ReadinessStatus {
     /// - **Authorization**: Verifies the authorizer is operational
     /// - **Credentials**: Checks if credential provider is configured
     pub async fn check(state: &AppState) -> Self {
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
 
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -146,15 +164,24 @@ impl ReadinessStatus {
         let check_timeout = Duration::from_secs(5);
 
         // Check catalog connectivity by attempting to list root namespaces
-        let catalog = match timeout(check_timeout, state.catalog.list_namespaces(None)).await {
+        let catalog = match timeout(
+            check_timeout,
+            state
+                .catalog
+                .list_namespaces(None, &crate::catalog::PageRequest::first(1)),
+        )
+        .await
+        {
             Ok(Ok(_)) => ComponentStatus::ready(),
             Ok(Err(e)) => {
+                // The error goes to the log, where reading it needs access to
+                // the host. See `ComponentStatus`.
                 tracing::warn!(error = %e, "Catalog health check failed");
-                ComponentStatus::degraded(format!("Catalog error: {}", e))
+                ComponentStatus::degraded("catalog unreachable")
             }
             Err(_) => {
                 tracing::warn!("Catalog health check timed out");
-                ComponentStatus::degraded("Catalog response timeout")
+                ComponentStatus::degraded("catalog timeout")
             }
         };
 
@@ -162,21 +189,25 @@ impl ReadinessStatus {
         let storage = match timeout(check_timeout, state.catalog.storage_health_check()).await {
             Ok(Ok(status)) if status.healthy => {
                 let mut comp = ComponentStatus::ready();
+                // The backend *kind* and a round-trip time are operational
+                // facts with no topology in them: "s3", "postgres", "file".
+                // Neither names a bucket, a host, or a mount.
                 comp.message = Some(format!("{}:{}ms", status.backend_type, status.latency_ms));
                 comp
             }
-            Ok(Ok(status)) => ComponentStatus::degraded(
-                status
-                    .message
-                    .unwrap_or_else(|| format!("{} unhealthy", status.backend_type)),
-            ),
+            Ok(Ok(status)) => {
+                if let Some(detail) = status.message.as_deref() {
+                    tracing::warn!(backend = %status.backend_type, detail, "Storage unhealthy");
+                }
+                ComponentStatus::degraded(format!("{} unhealthy", status.backend_type))
+            }
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "Storage health check failed");
-                ComponentStatus::degraded(format!("Storage error: {}", e))
+                ComponentStatus::degraded("storage unreachable")
             }
             Err(_) => {
                 tracing::warn!("Storage health check timed out");
-                ComponentStatus::degraded("Storage response timeout")
+                ComponentStatus::degraded("storage timeout")
             }
         };
 
@@ -319,6 +350,30 @@ mod tests {
         assert!(status.timestamp > 0);
     }
 
+    /// `/ready` is outside the authentication layer, so every string it can emit
+    /// must be safe to hand a stranger. Pinned as a closed set: the failure mode
+    /// is somebody reinstating `format!("… {e}")`, which reads as helpful and
+    /// publishes the host, bucket or mount that failed.
+    #[test]
+    fn a_degraded_component_reports_a_category_and_never_an_error() {
+        const ALLOWED: &[&str] = &[
+            "catalog unreachable",
+            "catalog timeout",
+            "storage unreachable",
+            "storage timeout",
+        ];
+
+        for message in ALLOWED {
+            let status = ComponentStatus::degraded(*message);
+            assert_eq!(status.status, "degraded");
+            let reported = status.message.expect("a category is reported");
+            assert!(
+                !reported.contains("://") && !reported.contains('/') && !reported.contains('@'),
+                "a readiness message must carry no location: {reported}"
+            );
+        }
+    }
+
     #[test]
     fn test_health_status_unhealthy() {
         let status = HealthStatus::unhealthy("test error".to_string());
@@ -346,32 +401,32 @@ mod tests {
         use crate::auth::{
             AllowAllAuthenticator, AllowAllAuthorizer, RateLimitConfig, RateLimiter,
         };
-        use crate::catalog::{ExtendedCatalog, IdempotencyCache, ViewStorage};
+        use crate::catalog::{IdempotencyCache, RedbCatalog};
         use crate::credentials::NoopCredentialProvider;
-        use iceberg::memory::MemoryCatalogBuilder;
-        use iceberg::CatalogBuilder;
-        use std::collections::HashMap;
         use std::time::Duration;
 
-        let mut props = HashMap::new();
-        props.insert("warehouse".to_string(), "memory://test".to_string());
-
-        let catalog: iceberg::MemoryCatalog = MemoryCatalogBuilder::default()
-            .load("memory", props)
+        let dir = tempfile::tempdir().unwrap();
+        let warehouse = format!("file://{}", dir.path().join("wh").display());
+        let catalog = RedbCatalog::open(dir.path().join("catalog.redb"), &warehouse)
             .await
             .unwrap();
 
         let state = AppState {
             authenticator: Arc::new(AllowAllAuthenticator),
             authorizer: Arc::new(AllowAllAuthorizer),
-            catalog: Arc::new(ExtendedCatalog::new(catalog)),
+            catalog: Arc::new(catalog),
             credential_provider: Arc::new(NoopCredentialProvider),
+            request_signer: Arc::new(crate::credentials::NoopRequestSigner),
+            signing: crate::catalog::v1::sign::SigningEndpointConfig::default(),
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::default())),
             idempotency_cache: Arc::new(IdempotencyCache::new(Duration::from_secs(3600))),
-            view_storage: Arc::new(ViewStorage::new()),
             metrics: Arc::new(crate::observability::MetricsRegistry::new()),
-            warehouse_location: "memory://test".to_string(),
+            auditor: Arc::new(crate::auth::Auditor::disabled()),
+            default_warehouse: crate::app::DefaultWarehouse::new(warehouse.clone()),
             default_tenant_id: "default".to_string(),
+            oauth2_server_uri: None,
+            policy_admin: None,
+            capabilities: crate::catalog::Capabilities::full(),
         };
 
         let status = ReadinessStatus::check(&state).await;

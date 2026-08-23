@@ -1,0 +1,61 @@
+{% extends "docs-base.html" %}
+
+{% block doc_main %}
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="{{ get_url(path='@/_index.md') }}">Rustberg</a>
+      <span aria-hidden="true">/</span>
+      <a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a>
+      <span aria-hidden="true">/</span>
+      <span aria-current="page">{{ page.title }}</span>
+    </nav>
+
+    <header class="doc__header">
+      <h1>{{ page.title }}</h1>
+      {%- if page.description %}
+      <p class="doc__lede">{{ page.description }}</p>
+      {%- endif %}
+    </header>
+
+    <div class="doc__body">
+      {{ page.content | safe }}
+    </div>
+
+    <footer class="doc__footer">
+      <nav class="pager" aria-label="Page navigation">
+        {%- if page.lower %}
+        <a class="pager__prev" href="{{ page.lower.permalink }}">
+          <span>Previous</span><strong>{{ page.lower.title }}</strong>
+        </a>
+        {%- else %}<span></span>{%- endif %}
+        {%- if page.higher %}
+        <a class="pager__next" href="{{ page.higher.permalink }}">
+          <span>Next</span><strong>{{ page.higher.title }}</strong>
+        </a>
+        {%- endif %}
+      </nav>
+      <p class="doc__edit">
+        <a href="{{ config.extra.repo }}/edit/main/site/content/docs/{{ page.slug }}.md" rel="noopener">Improve this page on GitHub</a>
+      </p>
+    </footer>
+{% endblock doc_main %}
+
+{% block doc_aside %}
+  {%- if page.toc %}
+  <aside class="toc" aria-label="On this page">
+    <p class="toc__title">On this page</p>
+    <ul>
+      {%- for h in page.toc %}
+      <li><a href="#{{ h.id }}">{{ h.title }}</a>
+        {%- if h.children %}
+        <ul>
+          {%- for c in h.children %}
+          <li><a href="#{{ c.id }}">{{ c.title }}</a></li>
+          {%- endfor %}
+        </ul>
+        {%- endif %}
+      </li>
+      {%- endfor %}
+    </ul>
+  </aside>
+  {%- endif %}
+{% endblock doc_aside %}

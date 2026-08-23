@@ -68,13 +68,18 @@ test-ignored:
 test-trino:
     cargo test --test trino_integration_tests --all-features -- --ignored --nocapture
 
-# Run Vault KMS tests
-test-vault:
-    cargo test --test vault_kms_tests --all-features -- --ignored --nocapture
+# Run the Postgres catalog and two-replica suites (requires Docker)
+test-postgres:
+    cargo test --all-features --test postgres_catalog_tests --test clustered_tests -- --ignored
 
-# Run AWS KMS tests (requires LocalStack)
-test-aws-kms:
-    cargo test --test aws_kms_tests --all-features -- --ignored --nocapture
+# Run the performance gate the way CI does
+test-perf:
+    cargo test --release --all-features --test performance_tests -- --ignored --nocapture --test-threads=1
+
+# Run the client conformance suites against a freshly built binary
+test-clients:
+    cargo build --all-features
+    RUSTBERG_BINARY=target/debug/rustberg uv run pytest tests/python -v --tb=short
 
 # ============================================================================
 # Code Quality
@@ -100,6 +105,36 @@ fmt-check:
 check: fmt-check lint test test-doc
     @echo "✅ All checks passed!"
 
+# Check every optional feature on its own
+features:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Cargo features are additive and unify across a dependency graph, so a
+    # feature that compiles under --all-features can be broken alone: some other
+    # crate was switching on the thing it needed. --all-features and
+    # --no-default-features are the two ends of the range, and the middle is
+    # where that breaks.
+    cargo check --no-default-features
+    for feature in cli tls catalog-postgres storage-s3 storage-gcs storage-azure \
+                   aws-credentials gcp-credentials azure-credentials; do
+      echo "▶ $feature"
+      cargo check --quiet --no-default-features --features "$feature"
+    done
+    cargo check --quiet --all-features
+    echo "✅ Every feature builds alone"
+
+# Verify the crate still compiles on its declared minimum Rust version
+msrv:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    msrv=$(grep -E '^rust-version' Cargo.toml | cut -d'"' -f2)
+    if ! rustup run "$msrv" cargo --version >/dev/null 2>&1; then
+      echo "Install it first: rustup toolchain install $msrv"
+      exit 1
+    fi
+    rustup run "$msrv" cargo check --all-features
+    echo "✅ Builds on $msrv"
+
 # Security audit
 audit:
     cargo audit
@@ -120,38 +155,59 @@ deny:
 doc:
     cargo doc --all-features --no-deps --open
 
-# Serve docs site locally (requires Ruby 3.0+)
-docs-serve:
-    #!/usr/bin/env bash
-    set -eo pipefail
-    
-    # Try to use chruby if available
-    if [[ -f /opt/homebrew/opt/chruby/share/chruby/chruby.sh ]]; then
-        source /opt/homebrew/opt/chruby/share/chruby/chruby.sh
-        chruby ruby-3.4.1 2>/dev/null || chruby ruby-3 2>/dev/null || true
-    fi
-    
-    RUBY_VERSION=$(ruby -e 'puts RUBY_VERSION.split(".")[0..1].join(".")')
-    if [[ $(echo "$RUBY_VERSION < 3.0" | bc -l) -eq 1 ]]; then
-        echo "❌ Ruby 3.0+ required. Found: $(ruby -v)"
-        echo ""
-        echo "Install Ruby 3.0+ using one of:"
-        echo "  brew install ruby           # Homebrew (macOS)"
-        echo "  rbenv install 3.3.0         # rbenv"
-        echo "  asdf install ruby 3.3.0     # asdf"
-        echo ""
-        echo "After installing, ensure the new Ruby is in your PATH."
-        exit 1
-    fi
-    # Note: Sass deprecation warnings from Just the Docs theme are expected (upstream issue #1607)
-    cd docs && bundle install && bundle exec jekyll serve --config _config.yml,_config_local.yml
+# ============================================================================
+# Site
+# ============================================================================
 
-# Build docs site (requires Ruby 3.0+)
-docs-build:
+# Serve the site locally with live reload (requires zola)
+site:
+    cd site && zola serve
+
+# Build the site into site/public
+site-build:
+    cd site && zola build
+
+# Validate every internal and external link on the site
+site-check:
+    cd site && zola check
+
+# Re-vendor the syntax themes after changing them in site/config.toml
+site-syntax: site-build
     #!/usr/bin/env bash
     set -euo pipefail
-    # Note: Sass deprecation warnings from Just the Docs theme are expected (upstream issue #1607)
-    cd docs && bundle install && bundle exec jekyll build
+    # Zola's `class` highlighting stamps both theme class sets onto every token,
+    # so light and dark cannot be selected with two `<link media>` elements —
+    # that follows the OS preference and breaks the moment a reader uses the
+    # theme toggle. Wrapping each theme in a mixin lets one stylesheet scope
+    # them; see the header this writes into the generated file.
+    cd site
+    out=sass/_syntax.scss
+    cat > "$out" <<'NOTES'
+    // Syntax highlighting, vendored from Zola's generated theme stylesheets.
+    //
+    // Zola's `class` highlighting style stamps *both* class sets onto every token
+    // — `<span class="z-l-1 z-d-3">` — so the light and dark rules are always both
+    // present in the markup and cannot be selected between with a `<link media>`
+    // alone. That works for the OS preference and breaks the moment a reader uses
+    // the theme toggle.
+    //
+    // Wrapping each theme in a mixin lets `main.scss` include it under the right
+    // root selector, so a dark rule becomes `:root[data-theme="dark"] .z-d-1` and
+    // beats the light one on both specificity and order — in both directions.
+    //
+    // Generated. Run `just site-syntax` after changing the themes in config.toml.
+
+    NOTES
+    for theme in light dark; do
+      # The generated file opens with a three-line banner naming the theme.
+      echo "@mixin syntax-$theme {" >> "$out"
+      # Drop the three-line banner and any blank lines under it, then indent
+      # only the non-empty lines so nothing carries trailing whitespace.
+      sed -e '1,3d' "public/giallo-$theme.css" \
+        | sed -e '/./,$!d' -e 's/^./  &/' >> "$out"
+      printf '}\n\n' >> "$out"
+    done
+    echo "regenerated site/sass/_syntax.scss"
 
 # ============================================================================
 # Release
@@ -226,31 +282,15 @@ minio:
         minio/minio server /data --console-address ":9001"
     @echo "MinIO started: http://localhost:9001 (minioadmin/minioadmin)"
 
-# Start a local Vault for KMS testing
-vault:
-    docker run -d --name vault \
-        -p 8200:8200 \
-        -e VAULT_DEV_ROOT_TOKEN_ID=myroot \
-        hashicorp/vault
-    @echo "Vault started: http://localhost:8200 (token: myroot)"
-
-# Start LocalStack for AWS testing
-localstack:
-    docker run -d --name localstack \
-        -p 4566:4566 \
-        -e SERVICES=kms,sts,s3 \
-        localstack/localstack
-    @echo "LocalStack started: http://localhost:4566"
-
 # Stop all dev containers
 dev-stop:
-    docker stop minio vault localstack 2>/dev/null || true
-    docker rm minio vault localstack 2>/dev/null || true
+    docker stop minio 2>/dev/null || true
+    docker rm minio 2>/dev/null || true
 
 # Generate self-signed TLS certificate
 gen-cert:
     cargo run --all-features -- generate-cert \
-        --hostname localhost \
+        --common-name localhost \
         --output-dir ./certs
 
 # Show project statistics

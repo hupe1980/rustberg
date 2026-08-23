@@ -94,7 +94,10 @@ impl AwsStsCredentialProvider {
     /// use rustberg::credentials::aws::AwsStsConfig;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = AwsStsConfig::new("us-east-1", "arn:aws:iam::123456789012:role/IcebergAccess");
+    /// // The prefixes are the provider's whole scope: it signs for these and
+    /// // nothing else, and naming none means it signs for nothing.
+    /// let config = AwsStsConfig::new("us-east-1", "arn:aws:iam::123456789012:role/IcebergAccess")
+    ///     .with_allowed_prefix("s3://my-warehouse/");
     /// let provider = AwsStsCredentialProvider::new(config).await?;
     /// # Ok(())
     /// # }
@@ -115,17 +118,14 @@ impl AwsStsCredentialProvider {
         Self { config, sts_client }
     }
 
-    /// Checks if the given location starts with any allowed prefix.
-    fn is_location_allowed(&self, location: &str) -> bool {
-        if self.config.allowed_prefixes.is_empty() {
-            // No restrictions - allow any S3 location
-            return true;
-        }
-
-        self.config
-            .allowed_prefixes
-            .iter()
-            .any(|prefix| location.starts_with(prefix))
+    /// Whether `location` falls under one of the configured prefixes.
+    ///
+    /// Containment is segment-wise ([`crate::location::is_vendable`]), not a
+    /// string prefix test: `s3://bucket/wh-evil/t` merely *spells* like
+    /// `s3://bucket/wh` and must not be admitted by it. An empty prefix list
+    /// grants nothing — see there for why that direction and not the other.
+    fn is_location_allowed(config: &AwsStsConfig, location: &str) -> bool {
+        crate::location::is_vendable(&config.allowed_prefixes, location)
     }
 
     /// Extracts the S3 prefix from a table location.
@@ -137,6 +137,100 @@ impl AwsStsCredentialProvider {
             format!("{}/", location)
         }
     }
+
+    /// Splits an `s3://bucket/key/prefix` location into `(bucket, key_prefix)`.
+    fn split_location(location: &str) -> Option<(&str, &str)> {
+        let rest = location
+            .strip_prefix("s3://")
+            .or_else(|| location.strip_prefix("s3a://"))
+            .or_else(|| location.strip_prefix("s3n://"))?;
+        match rest.split_once('/') {
+            Some((bucket, key)) => Some((bucket, key.trim_end_matches('/'))),
+            // A bare bucket with no key prefix.
+            None => Some((rest, "")),
+        }
+    }
+
+    /// Builds an inline STS session policy scoped to one table's prefix.
+    ///
+    /// Without this, `AssumeRole` returns the role's *full* permissions: a
+    /// caller asking to read one table receives credentials for everything the
+    /// role can reach, and a read-only request is indistinguishable from a write
+    /// one. The session policy is the mechanism that makes vending
+    /// downgrade-only — the effective permission is the intersection of the role
+    /// and this document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the location is not an S3 URL, or if the resulting
+    /// policy exceeds the STS limit. AWS caps an inline session policy at 2048
+    /// characters of plaintext; a single-prefix policy is far below that, but a
+    /// pathological location could not be scoped safely and must fail rather
+    /// than fall back to an unscoped credential.
+    fn session_policy(
+        location: &str,
+        write_access: bool,
+    ) -> Result<String, StorageCredentialVendingError> {
+        const MAX_SESSION_POLICY: usize = 2048;
+
+        let (bucket, key_prefix) = Self::split_location(location).ok_or_else(|| {
+            StorageCredentialVendingError::AwsStsError(format!(
+                "Cannot scope credentials: '{location}' is not an S3 location"
+            ))
+        })?;
+
+        let object_arn = if key_prefix.is_empty() {
+            format!("arn:aws:s3:::{bucket}/*")
+        } else {
+            format!("arn:aws:s3:::{bucket}/{key_prefix}/*")
+        };
+        let list_prefix = if key_prefix.is_empty() {
+            "*".to_string()
+        } else {
+            format!("{key_prefix}/*")
+        };
+
+        let mut object_actions = vec!["s3:GetObject", "s3:GetObjectVersion"];
+        if write_access {
+            object_actions.extend_from_slice(&[
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:AbortMultipartUpload",
+            ]);
+        }
+
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "TableObjects",
+                    "Effect": "Allow",
+                    "Action": object_actions,
+                    "Resource": object_arn
+                },
+                {
+                    // Listing is bucket-scoped in S3, so it is constrained by an
+                    // explicit prefix condition instead of by the resource ARN.
+                    "Sid": "ListTablePrefix",
+                    "Effect": "Allow",
+                    "Action": "s3:ListBucket",
+                    "Resource": format!("arn:aws:s3:::{bucket}"),
+                    "Condition": { "StringLike": { "s3:prefix": [list_prefix] } }
+                }
+            ]
+        })
+        .to_string();
+
+        if policy.len() > MAX_SESSION_POLICY {
+            return Err(StorageCredentialVendingError::AwsStsError(format!(
+                "Scoped session policy for '{location}' is {} characters, over the STS limit of \
+                 {MAX_SESSION_POLICY}; refusing to vend an unscoped credential",
+                policy.len()
+            )));
+        }
+
+        Ok(policy)
+    }
 }
 
 #[async_trait]
@@ -146,19 +240,25 @@ impl StorageCredentialProvider for AwsStsCredentialProvider {
         request: &StorageCredentialRequest,
     ) -> Result<Vec<StorageCredential>, StorageCredentialVendingError> {
         // Check if this location is allowed
-        if !self.is_location_allowed(&request.table_location) {
+        if !Self::is_location_allowed(&self.config, &request.table_location) {
             return Ok(vec![]);
         }
 
         // Build the assume role request
         let session_name = request.session_name();
 
+        // Scope the credential to this table and this access level. The
+        // effective permission is the intersection of the role and this policy,
+        // so the result can only ever be narrower than what Rustberg holds.
+        let policy = Self::session_policy(&request.table_location, request.write_access)?;
+
         let mut assume_role = self
             .sts_client
             .assume_role()
             .role_arn(&self.config.role_arn)
             .role_session_name(&session_name)
-            .duration_seconds(self.config.duration_seconds);
+            .duration_seconds(self.config.duration_seconds)
+            .policy(policy);
 
         if let Some(ref external_id) = self.config.external_id {
             assume_role = assume_role.external_id(external_id);
@@ -196,7 +296,12 @@ impl StorageCredentialProvider for AwsStsCredentialProvider {
     }
 
     fn supports_location(&self, location: &str) -> bool {
-        location.starts_with("s3://") || location.starts_with("s3a://")
+        // Every alias `split_location` accepts. Listing fewer here meant a
+        // legitimate `s3n://` table was reported as unsupported rather than
+        // vended for, which reaches the client as a `200` with no credentials.
+        ["s3://", "s3a://", "s3n://"]
+            .iter()
+            .any(|scheme| location.starts_with(scheme))
     }
 }
 
@@ -393,26 +498,137 @@ mod tests {
         );
     }
 
+    /// A bucket prefix that merely *spells* like an allowed one is a different
+    /// prefix. A `starts_with` test admits it; containment must not.
     #[test]
-    fn test_supports_location() {
-        // Create a config - we only need to test supports_location
-        // which doesn't require a valid STS client
+    fn a_sibling_prefix_is_not_allowed() {
+        let config = AwsStsConfig::new("us-east-1", "arn:aws:iam::123:role/Test")
+            .with_allowed_prefix("s3://bucket/wh");
+        let allowed = |loc: &str| AwsStsCredentialProvider::is_location_allowed(&config, loc);
+
+        assert!(allowed("s3://bucket/wh/db/events"));
+        assert!(!allowed("s3://bucket/wh-evil/db/events"));
+        assert!(!allowed("s3://other-bucket/wh/db/events"));
+    }
+
+    /// Hadoop-style URLs name the same bucket, so a warehouse written `s3://`
+    /// must still admit a table addressed `s3a://`.
+    #[test]
+    fn hadoop_scheme_aliases_are_allowed() {
+        let config = AwsStsConfig::new("us-east-1", "arn:aws:iam::123:role/Test")
+            .with_allowed_prefix("s3://bucket/wh");
+        assert!(AwsStsCredentialProvider::is_location_allowed(
+            &config,
+            "s3a://bucket/wh/db/t"
+        ));
+    }
+
+    /// A provider told about no prefixes vends for nothing.
+    ///
+    /// The dangerous reading is the other one: a config built without naming a
+    /// scope would sign for any bucket the assumed role can reach, which is the
+    /// server's whole storage authority handed to whoever asked first.
+    #[test]
+    fn an_unscoped_config_allows_no_location() {
         let config = AwsStsConfig::new("us-east-1", "arn:aws:iam::123:role/Test");
+        assert!(config.allowed_prefixes.is_empty());
+        assert!(!AwsStsCredentialProvider::is_location_allowed(
+            &config,
+            "s3://any-bucket/anything"
+        ));
+    }
+    // ── Session policy scoping ──────────────────────────────────────────
 
-        // Test the config's helper for location checking
-        assert!(config.role_arn.contains("Test"));
+    fn policy(location: &str, write: bool) -> serde_json::Value {
+        let raw = AwsStsCredentialProvider::session_policy(location, write).expect("scopable");
+        serde_json::from_str(&raw).expect("valid JSON")
+    }
 
-        // Create allowed prefixes config
-        let config_with_prefixes = AwsStsConfig {
-            region: "us-east-1".to_string(),
-            role_arn: "arn:aws:iam::123:role/Test".to_string(),
-            external_id: None,
-            duration_seconds: 3600,
-            allowed_prefixes: vec!["s3://allowed-bucket/".to_string()],
-        };
+    #[test]
+    fn splits_s3_locations() {
+        assert_eq!(
+            AwsStsCredentialProvider::split_location("s3://bucket/wh/db/t"),
+            Some(("bucket", "wh/db/t"))
+        );
+        assert_eq!(
+            AwsStsCredentialProvider::split_location("s3://bucket/wh/db/t/"),
+            Some(("bucket", "wh/db/t"))
+        );
+        assert_eq!(
+            AwsStsCredentialProvider::split_location("s3://bucket"),
+            Some(("bucket", ""))
+        );
+        assert_eq!(AwsStsCredentialProvider::split_location("gs://b/x"), None);
+    }
 
-        // Verify the configuration is set correctly
-        assert_eq!(config_with_prefixes.allowed_prefixes.len(), 1);
-        assert!(config_with_prefixes.allowed_prefixes[0].starts_with("s3://"));
+    /// The credential must reach the requested table's prefix and nothing above it.
+    #[test]
+    fn policy_is_scoped_to_the_table_prefix() {
+        let p = policy("s3://bucket/wh/db/events", false);
+        let objects = &p["Statement"][0];
+
+        assert_eq!(objects["Resource"], "arn:aws:s3:::bucket/wh/db/events/*");
+        assert_eq!(
+            p["Statement"][1]["Condition"]["StringLike"]["s3:prefix"][0],
+            "wh/db/events/*"
+        );
+    }
+
+    /// A read-only request must not yield write permissions. Previously
+    /// `AssumeRole` was called with no policy at all, so `write_access` was
+    /// discarded and every caller received the role's full rights.
+    #[test]
+    fn read_only_request_grants_no_writes() {
+        let actions = policy("s3://bucket/wh/db/t", false)["Statement"][0]["Action"].clone();
+        let actions: Vec<String> = serde_json::from_value(actions).unwrap();
+
+        assert!(actions.contains(&"s3:GetObject".to_string()));
+        for forbidden in ["s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"] {
+            assert!(
+                !actions.contains(&forbidden.to_string()),
+                "read-only credential granted {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_request_grants_writes() {
+        let actions = policy("s3://bucket/wh/db/t", true)["Statement"][0]["Action"].clone();
+        let actions: Vec<String> = serde_json::from_value(actions).unwrap();
+
+        for expected in ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"] {
+            assert!(
+                actions.contains(&expected.to_string()),
+                "missing {expected}"
+            );
+        }
+    }
+
+    /// Two tables in the same bucket must not be reachable from one another's
+    /// credential.
+    #[test]
+    fn sibling_tables_are_not_reachable() {
+        let a = policy("s3://bucket/wh/db/a", true);
+        let b = policy("s3://bucket/wh/db/b", true);
+        assert_ne!(a["Statement"][0]["Resource"], b["Statement"][0]["Resource"]);
+        assert_eq!(
+            a["Statement"][0]["Resource"],
+            "arn:aws:s3:::bucket/wh/db/a/*"
+        );
+    }
+
+    /// A non-S3 location cannot be scoped, so it must fail rather than fall back
+    /// to an unscoped credential.
+    #[test]
+    fn unscopable_location_is_refused() {
+        assert!(AwsStsCredentialProvider::session_policy("gs://bucket/x", false).is_err());
+    }
+
+    /// STS caps an inline session policy at 2048 characters.
+    #[test]
+    fn policy_fits_the_sts_limit() {
+        let deep = format!("s3://bucket/{}", vec!["level"; 20].join("/"));
+        let raw = AwsStsCredentialProvider::session_policy(&deep, true).expect("scopable");
+        assert!(raw.len() <= 2048, "policy was {} characters", raw.len());
     }
 }

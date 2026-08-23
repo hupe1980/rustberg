@@ -33,3 +33,5 @@ __pycache__/
 *.pyc
 .pytest_cache/
 uv.lock
+# Zola build output
+site/public/

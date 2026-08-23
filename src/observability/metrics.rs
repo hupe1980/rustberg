@@ -10,13 +10,10 @@
 //! - `rustberg_catalog_operations_total` - Catalog operations by type and result
 //! - `rustberg_auth_attempts_total` - Authentication attempts by method and result
 //! - `rustberg_rate_limit_exceeded_total` - Rate limit exceeded events
-//! - `rustberg_kms_*` - KMS operations (when encryption is enabled)
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
-use std::sync::atomic::{AtomicU64, Ordering};
+use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use std::sync::Arc;
-
-use crate::crypto::KmsMetrics;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::app::AppState;
 
@@ -59,6 +56,10 @@ pub struct MetricsRegistry {
     pub catalog_list_tables: Counter,
     pub catalog_create_table: Counter,
     pub catalog_load_table: Counter,
+    /// Loads answered `304 Not Modified` because the client's `If-None-Match`
+    /// already named the current metadata version. The ratio of this to
+    /// `catalog_load_table` is how much conditional loading is actually saving.
+    pub catalog_load_table_not_modified: Counter,
     pub catalog_commit_table: Counter,
     pub catalog_delete_table: Counter,
     pub catalog_register_table: Counter,
@@ -70,9 +71,6 @@ pub struct MetricsRegistry {
     pub auth_api_key_failure: Counter,
     pub auth_jwt_success: Counter,
     pub auth_jwt_failure: Counter,
-
-    // KMS metrics (optional - only when encryption is enabled)
-    kms_metrics: Option<Arc<KmsMetrics>>,
 
     // Rate limiting
     pub rate_limit_exceeded: Counter,
@@ -93,20 +91,6 @@ impl MetricsRegistry {
         Self::default()
     }
 
-    /// Sets the KMS metrics reference for encryption monitoring.
-    ///
-    /// When set, the `/metrics` endpoint will include KMS operation counts.
-    pub fn with_kms_metrics(mut self, kms_metrics: Arc<KmsMetrics>) -> Self {
-        self.kms_metrics = Some(kms_metrics);
-        self
-    }
-
-    /// Sets KMS metrics after construction.
-    pub fn set_kms_metrics(&mut self, kms_metrics: Arc<KmsMetrics>) {
-        self.kms_metrics = Some(kms_metrics);
-    }
-
-    /// Returns Prometheus-formatted metrics text.
     pub fn render(&self) -> String {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -137,6 +121,7 @@ rustberg_catalog_operations_total{{operation="delete_namespace",result="success"
 rustberg_catalog_operations_total{{operation="list_tables",result="success"}} {list_tbl}
 rustberg_catalog_operations_total{{operation="create_table",result="success"}} {create_tbl}
 rustberg_catalog_operations_total{{operation="load_table",result="success"}} {load_tbl}
+rustberg_catalog_operations_total{{operation="load_table",result="not_modified"}} {load_tbl_304}
 rustberg_catalog_operations_total{{operation="commit_table",result="success"}} {commit_tbl}
 rustberg_catalog_operations_total{{operation="delete_table",result="success"}} {delete_tbl}
 rustberg_catalog_operations_total{{operation="register_table",result="success"}} {register_tbl}
@@ -163,7 +148,7 @@ rustberg_errors_total{{status="404"}} {err_404}
 rustberg_errors_total{{status="409"}} {err_409}
 rustberg_errors_total{{status="429"}} {err_429}
 rustberg_errors_total{{status="500"}} {err_500}
-{kms_metrics}"#,
+"#,
             version = env!("CARGO_PKG_VERSION"),
             timestamp = timestamp,
             get = self.requests_get.get(),
@@ -176,6 +161,7 @@ rustberg_errors_total{{status="500"}} {err_500}
             list_tbl = self.catalog_list_tables.get(),
             create_tbl = self.catalog_create_table.get(),
             load_tbl = self.catalog_load_table.get(),
+            load_tbl_304 = self.catalog_load_table_not_modified.get(),
             commit_tbl = self.catalog_commit_table.get(),
             delete_tbl = self.catalog_delete_table.get(),
             register_tbl = self.catalog_register_table.get(),
@@ -193,46 +179,6 @@ rustberg_errors_total{{status="500"}} {err_500}
             err_409 = self.errors_409.get(),
             err_429 = self.errors_429.get(),
             err_500 = self.errors_500.get(),
-            kms_metrics = self.render_kms_metrics(),
-        )
-    }
-
-    /// Renders KMS metrics section if KMS is configured.
-    fn render_kms_metrics(&self) -> String {
-        let Some(kms) = &self.kms_metrics else {
-            return String::new();
-        };
-
-        let snapshot = kms.snapshot();
-
-        format!(
-            r#"
-# HELP rustberg_kms_operations_total Total KMS operations by type
-# TYPE rustberg_kms_operations_total counter
-rustberg_kms_operations_total{{operation="generate_key"}} {generate}
-rustberg_kms_operations_total{{operation="decrypt_key"}} {decrypt}
-rustberg_kms_operations_total{{operation="encrypt_key"}} {encrypt}
-
-# HELP rustberg_kms_cache_total KMS cache hits and misses
-# TYPE rustberg_kms_cache_total counter
-rustberg_kms_cache_total{{result="hit"}} {hits}
-rustberg_kms_cache_total{{result="miss"}} {misses}
-
-# HELP rustberg_kms_errors_total Total KMS errors
-# TYPE rustberg_kms_errors_total counter
-rustberg_kms_errors_total {errors}
-
-# HELP rustberg_kms_retries_total Total KMS retries
-# TYPE rustberg_kms_retries_total counter
-rustberg_kms_retries_total {retries}
-"#,
-            generate = snapshot.generate_key_total,
-            decrypt = snapshot.decrypt_key_total,
-            encrypt = snapshot.encrypt_key_total,
-            hits = snapshot.cache_hits,
-            misses = snapshot.cache_misses,
-            errors = snapshot.errors_total,
-            retries = snapshot.retries_total,
         )
     }
 }
