@@ -19,53 +19,26 @@ env:
 
 jobs:
   # ===========================================================================
-  # Rust Security Audit
+  # Advisories, on a schedule
   # ===========================================================================
-  cargo-audit:
-    name: Cargo Audit
+  # The same tool and the same ignore list the pull-request gate uses
+  # (`deny.toml`), run daily. That is what this job is for: an advisory published
+  # today applies to a tree nobody has pushed to, so it has to be found by the
+  # clock rather than by a commit.
+  #
+  # One tool over the RustSec database, not two. A second one means a second
+  # ignore list to keep identical by hand, and the entry that gets forgotten is
+  # the one that matters.
+  advisories:
+    name: Advisories
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-
-      - name: Run security audit
-        run: cargo audit --deny warnings
-
-  # ===========================================================================
-  # Cargo Deny (License & Vulnerability Check)
-  # ===========================================================================
-  cargo-deny:
-    name: Cargo Deny
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
 
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          log-level: warn
-          command: check
           arguments: --all-features
-
-  # ===========================================================================
-  # MSRV (Minimum Supported Rust Version) Check
-  # ===========================================================================
-  msrv:
-    name: MSRV Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.94.0  # MSRV, matching rust-version in Cargo.toml
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build with MSRV
-        run: cargo build --all-features
+          command: check advisories
 
   # ===========================================================================
   # Secret Scanning

@@ -109,9 +109,26 @@ jobs:
         id: msrv
         run: |
           echo "version=$(grep '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.msrv.outputs.version }}
+      # Installed with rustup directly, so the version asked for is the version
+      # installed with nothing in between resolving it.
+      - name: Install the declared MSRV toolchain
+        run: |
+          rustup toolchain install "${{ steps.msrv.outputs.version }}" --profile minimal
+          rustup default "${{ steps.msrv.outputs.version }}"
+      # A job that checks a different compiler than `rust-version` promises
+      # proves nothing, and it fails in the quiet direction: a newer toolchain
+      # compiles what the declared floor cannot, so the gate passes and the
+      # declared MSRV is wrong for everyone who trusts it. Asserted rather than
+      # assumed — a preinstalled toolchain earlier in `PATH` is enough to do it.
+      - name: Confirm the toolchain is the declared MSRV
+        run: |
+          want='${{ steps.msrv.outputs.version }}'
+          have="$(rustc --version | cut -d' ' -f2)"
+          if [ "$have" != "$want" ]; then
+            echo "::error::Cargo.toml declares rustc $want but this job is running $have"
+            exit 1
+          fi
+          echo "checking against rustc $have"
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: msrv-${{ steps.msrv.outputs.version }}
@@ -380,14 +397,27 @@ jobs:
       # The chart refuses to render one that would not work — postgres with no
       # database, redb with more than one replica or without a volume — so
       # templating the bare defaults asserts nothing except that the guard fires.
-      - name: Template and validate each backend
+      #
+      # No `kubectl --dry-run` here. There is no cluster on a runner, and client
+      # dry-run still reaches for the API server's OpenAPI schema; the step that
+      # used to do it hid the failure behind `|| true`, which is a gate that
+      # checks nothing. `helm template` parses what it renders, so a template
+      # producing malformed YAML fails on its own, and the objects each backend
+      # is supposed to produce are asserted below.
+      - name: Template each backend
         run: |
           set -euo pipefail
           render() {
             name=$1; shift
             echo "── $name ──"
-            helm template rustberg charts/rustberg "$@" \
-              | kubectl apply --dry-run=client -f - > /dev/null
+            out=$(helm template rustberg charts/rustberg "$@")
+            for kind in Deployment Service ServiceAccount; do
+              if ! grep -q "^kind: $kind$" <<<"$out"; then
+                echo "::error::$name rendered no $kind"
+                exit 1
+              fi
+            done
+            echo "ok"
           }
           render postgres \
             --set rustberg.catalog.backend=postgres \

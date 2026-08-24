@@ -145,8 +145,9 @@ msrv:
     echo "✅ Builds on $msrv"
 
 # Security audit
+# Advisories, using the same tool and ignore list the CI gate uses.
 audit:
-    cargo audit
+    cargo deny --all-features check advisories
 
 # Check for outdated dependencies
 outdated:

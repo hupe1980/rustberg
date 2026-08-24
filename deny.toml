@@ -8,6 +8,14 @@
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 
+# Explicit rather than left at their defaults, because both default to a
+# *warning* and a warning does not fail `cargo deny check`. This file is the one
+# advisory gate — the daily scheduled scan and the per-PR run are the same tool
+# reading the same list — so anything it merely warns about is something nobody
+# will see.
+yanked = "deny"
+unmaintained = "all"
+
 # Advisories in transitive dependencies that this crate cannot resolve by
 # updating. Each names the crate, the path in, and why it is tolerable here —
 # an ignore with no reason is one nobody can re-evaluate later.
