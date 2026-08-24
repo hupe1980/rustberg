@@ -1005,7 +1005,7 @@ impl AppBuilder {
                     .join("catalog.redb")
             }
             Some(url) => {
-                let base = url.strip_prefix("file://").unwrap_or(url);
+                let base = crate::location::path_from_url(url);
                 if base.contains("://") {
                     return Err(crate::error::AppError::Internal(format!(
                         "Unsupported catalog URL '{url}'. The catalog is a local redb file \

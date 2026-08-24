@@ -1435,7 +1435,7 @@ mod tests {
 
         let mut checked = 0;
         for path in &files {
-            let Ok(doc) = std::fs::read_to_string(path) else {
+            let Ok(doc) = crate::utils::read_repo_text(path) else {
                 continue;
             };
             let name = path
@@ -1475,10 +1475,11 @@ mod tests {
     /// `class="language-cedar"` rather than by a fence, and the three characters
     /// Cedar's comparison operators need are HTML-escaped.
     fn validate_landing_page_policies() -> usize {
-        const TEMPLATE: &str = include_str!("../../site/templates/index.html");
+        let template =
+            crate::utils::normalize_newlines(include_str!("../../site/templates/index.html"));
 
         let mut checked = 0;
-        for block in TEMPLATE.split("<code class=\"language-cedar\">").skip(1) {
+        for block in template.split("<code class=\"language-cedar\">").skip(1) {
             let block = block
                 .split("</code>")
                 .next()
@@ -1506,8 +1507,10 @@ mod tests {
     /// do not exist.
     #[test]
     fn documented_schema_matches_the_real_one() {
-        let doc = include_str!("../../site/content/docs/authorization.md");
-        let documented = cedar_blocks(doc)
+        let doc = crate::utils::normalize_newlines(include_str!(
+            "../../site/content/docs/authorization.md"
+        ));
+        let documented = cedar_blocks(&doc)
             .into_iter()
             .find(|b| b.contains("entity Namespace"))
             .expect("the authorization page must print the schema");

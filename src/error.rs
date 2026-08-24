@@ -810,7 +810,7 @@ mod tests {
         let body: String = ["src/error.rs", "src/auth/error.rs"]
             .iter()
             .map(|file| {
-                let source = std::fs::read_to_string(root.join(file))
+                let source = crate::utils::read_repo_text(root.join(file))
                     .unwrap_or_else(|e| panic!("read {file}: {e}"));
                 let start = source
                     .find("pub fn error_type(&self)")
@@ -843,8 +843,8 @@ mod tests {
             "the scan found almost nothing: {emitted:?}"
         );
 
-        let doc =
-            std::fs::read_to_string(root.join("site/content/docs/api.md")).expect("read api.md");
+        let doc = crate::utils::read_repo_text(root.join("site/content/docs/api.md"))
+            .expect("read api.md");
         let table = {
             let start = doc
                 .find("| Code | Type | Description |")

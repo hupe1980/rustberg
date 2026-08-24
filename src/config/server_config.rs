@@ -1448,8 +1448,9 @@ key_env = "RUSTBERG_KEY_CI"
     /// the list already has, so checking them proves nothing new.
     #[test]
     fn ci_checks_every_optional_feature_on_its_own() {
-        let manifest = include_str!("../../Cargo.toml");
-        let workflow = include_str!("../../.github/workflows/ci.yml");
+        let manifest = crate::utils::normalize_newlines(include_str!("../../Cargo.toml"));
+        let workflow =
+            crate::utils::normalize_newlines(include_str!("../../.github/workflows/ci.yml"));
 
         let declared: Vec<&str> = manifest
             .lines()
@@ -1521,7 +1522,8 @@ key_env = "RUSTBERG_KEY_CI"
 
         let mut sources: Vec<(String, String)> = vec![(
             "config.example.toml".to_string(),
-            std::fs::read_to_string(root.join("config.example.toml")).expect("read example config"),
+            crate::utils::read_repo_text(root.join("config.example.toml"))
+                .expect("read example config"),
         )];
 
         // The whole documentation tree, discovered rather than listed: a page
@@ -1543,7 +1545,7 @@ key_env = "RUSTBERG_KEY_CI"
         files.sort();
 
         for path in files {
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            let Ok(text) = crate::utils::read_repo_text(&path) else {
                 continue;
             };
             let label = path

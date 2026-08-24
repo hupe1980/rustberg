@@ -379,7 +379,7 @@ impl RedbCatalog {
             return Ok(location.to_string());
         }
 
-        let path = location.strip_prefix("file://").unwrap_or(location);
+        let path = crate::location::path_from_url(location);
         let absolute = if Path::new(path).is_absolute() {
             std::path::PathBuf::from(path)
         } else {

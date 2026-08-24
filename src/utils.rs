@@ -11,6 +11,8 @@ pub fn temp_path() -> String {
 
     // On Windows a bare `C:\...` path has its drive letter read as a URL scheme
     // by the storage layer, so hand back a file:// URL there.
+    // `location::path_from_url` is the inverse, and knows that the leading slash
+    // this adds is not part of the path.
     #[cfg(windows)]
     {
         format!("file:///{}", path.display().to_string().replace('\\', "/"))
@@ -20,6 +22,32 @@ pub fn temp_path() -> String {
     {
         path.display().to_string()
     }
+}
+
+/// Line endings as the documentation gates read them.
+///
+/// Every gate that checks the documentation against the code scans text for
+/// structure — a blank line ending a table, the closing brace of a `match`, a
+/// fenced block. Git checks out with CRLF on Windows by default, so a scanner
+/// looking for `"\n\n"` finds nothing and the gate fails on one platform while
+/// passing on the others. The gates are about the *content*, so line endings are
+/// normalised on the way in rather than pinned in the working tree, and the
+/// checks hold however the file arrived.
+///
+/// Needed for `include_str!` as much as for a read: it embeds the bytes on disk
+/// at compile time, so a CRLF checkout compiles CRLF into the binary.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
+/// Reads a file this repository ships, with line endings normalised.
+///
+/// See [`normalize_newlines`].
+#[cfg(test)]
+pub(crate) fn read_repo_text(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    std::fs::read_to_string(path).map(|text| normalize_newlines(&text))
 }
 
 #[cfg(test)]

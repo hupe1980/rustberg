@@ -203,6 +203,60 @@ pub fn is_prefix_within(root: &str, candidate: &str) -> bool {
 /// Failing closed costs a misconfigured deployment its credential vending,
 /// which is visible and recoverable. Failing open costs it the blast radius of
 /// the server's own storage role, silently.
+/// The local path a `file://` location names.
+///
+/// # Why this is not `strip_prefix("file://")`
+///
+/// On Unix it is: `file:///var/lib/rustberg` strips to `/var/lib/rustberg` and
+/// that is the path. On Windows the same URL is written `file:///C:/data`, and
+/// stripping leaves `/C:/data` — which is not a Windows path. It has a root but
+/// no drive prefix, so `Path::is_absolute` is false and joining it onto the
+/// current directory yields `C:\…\C:\data`, a colon where none may be. The
+/// operating system answers `ERROR_INVALID_NAME`, and the failure surfaces
+/// wherever the path is first used rather than where it was built.
+///
+/// So a leading slash is dropped when a drive letter follows it. Both callers
+/// that turn a configured URL into a path go through here — the warehouse the
+/// registry creates, and the catalog file the server opens — because two copies
+/// of this would be one edit away from disagreeing about where a deployment
+/// keeps its data.
+///
+/// Nothing is percent-decoded. These URLs are written by an operator or by this
+/// crate's own default-warehouse helper, neither of which encodes, and decoding
+/// would change the meaning of a path that legitimately contains `%`.
+#[must_use]
+pub fn path_from_url(location: &str) -> &str {
+    without_url_prefix(location, cfg!(windows))
+}
+
+/// The rule [`path_from_url`] applies, with the platform as an argument so both
+/// halves are testable from either.
+fn without_url_prefix(location: &str, windows: bool) -> &str {
+    let rest = location.strip_prefix("file://").unwrap_or(location);
+
+    if windows
+        && let Some(after) = rest.strip_prefix('/')
+        && starts_with_drive_letter(after)
+    {
+        return after;
+    }
+
+    rest
+}
+
+/// Whether `path` opens with a Windows drive specification — `C:`, `C:/`, `C:\`.
+///
+/// Checked rather than assumed, so `/etc/…` on a Unix path is left alone and a
+/// directory genuinely named `C:` is only mishandled on the platform where it
+/// cannot exist.
+fn starts_with_drive_letter(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || bytes[2] == b'/' || bytes[2] == b'\\')
+}
+
 pub fn is_vendable(allowed_prefixes: &[String], location: &str) -> bool {
     allowed_prefixes
         .iter()
@@ -574,6 +628,48 @@ fn join_segments(warehouse: &str, namespace: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `file://` URL becomes a usable path on both platforms.
+    ///
+    /// The Windows half is where this earns its keep: `file:///C:/data` strips
+    /// to `/C:/data`, which has a root but no drive prefix, so `is_absolute` is
+    /// false and joining it onto the current directory produces a path with a
+    /// colon where none may be. The operating system answers
+    /// `ERROR_INVALID_NAME` somewhere far from where the path was built.
+    #[test]
+    fn a_file_url_becomes_a_path_on_either_platform() {
+        // Unix, and Windows written the way a URL writes it.
+        assert_eq!(
+            without_url_prefix("file:///var/lib/rustberg", false),
+            "/var/lib/rustberg"
+        );
+        assert_eq!(without_url_prefix("file:///C:/data", true), "C:/data");
+        assert_eq!(without_url_prefix("file:///C:\\data", true), "C:\\data");
+        assert_eq!(without_url_prefix("file:///C:", true), "C:");
+
+        // Two slashes, no third: already a path.
+        assert_eq!(without_url_prefix("file://C:/data", true), "C:/data");
+
+        // No scheme at all passes through.
+        assert_eq!(
+            without_url_prefix("/var/lib/rustberg", false),
+            "/var/lib/rustberg"
+        );
+        assert_eq!(without_url_prefix("C:/data", true), "C:/data");
+    }
+
+    /// The drive-letter rule applies on Windows only, so a Unix path that
+    /// happens to look like one is left alone.
+    #[test]
+    fn a_unix_path_is_never_read_as_a_drive() {
+        assert_eq!(without_url_prefix("file:///C:/data", false), "/C:/data");
+        assert_eq!(
+            without_url_prefix("file:///etc/rustberg", true),
+            "/etc/rustberg"
+        );
+        // A single letter and no colon is a directory, not a drive.
+        assert_eq!(without_url_prefix("file:///c/data", true), "/c/data");
+    }
 
     #[test]
     fn a_location_inside_the_warehouse_is_accepted() {
