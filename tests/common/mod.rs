@@ -512,6 +512,68 @@ pub async fn a_view_round_trips(catalog: &dyn CatalogStore, warehouse: &str) {
     );
 }
 
+/// A view commit that lost its race is refused, not applied.
+///
+/// A view commit is a read-modify-write that spans the `CatalogStore` boundary:
+/// the handler loads the metadata, applies the client's updates and hands back a
+/// finished document. So the store cannot re-derive what the updates were based
+/// on — it has to be *told*, and it has to compare against that rather than
+/// against a read of its own. A backend that re-reads instead confirms a
+/// concurrent commit rather than detecting it, and the second writer silently
+/// overwrites the first. Invariant 2 says that cannot happen.
+///
+/// Two commits are built from the same load here, which is exactly the shape two
+/// replicas produce. The first must win and the second must be told.
+pub async fn a_second_view_commit_from_one_read_is_refused(
+    catalog: &dyn CatalogStore,
+    warehouse: &str,
+) {
+    let ns = given_namespace(catalog, &["view_cas"]).await;
+    let view = given_view(catalog, warehouse, &ns, "summary").await;
+
+    let (read_location, metadata) = catalog.load_view(&view).await.expect("load");
+
+    // Two independent edits, both derived from the same read.
+    let first = metadata
+        .clone()
+        .into_builder()
+        .set_properties(HashMap::from([("edit".to_string(), "first".to_string())]))
+        .expect("set first")
+        .build()
+        .expect("build first")
+        .metadata;
+    let second = metadata
+        .into_builder()
+        .set_properties(HashMap::from([("edit".to_string(), "second".to_string())]))
+        .expect("set second")
+        .build()
+        .expect("build second")
+        .metadata;
+
+    catalog
+        .update_view(&view, &read_location, first)
+        .await
+        .expect("the first commit from a fresh read must land");
+
+    let err = catalog
+        .update_view(&view, &read_location, second)
+        .await
+        .expect_err("a second commit from the same read has lost its race and must be refused");
+
+    assert_eq!(
+        err.kind(),
+        iceberg::ErrorKind::CatalogCommitConflicts,
+        "a lost race is a conflict the client retries, not any other failure: {err}"
+    );
+
+    let (_, live) = catalog.load_view(&view).await.expect("reload");
+    assert_eq!(
+        live.properties().get("edit").map(String::as_str),
+        Some("first"),
+        "the winner's edit must survive; the loser must not have overwritten it"
+    );
+}
+
 /// Loading a view that was never created is a miss.
 pub async fn load_missing_view_is_not_found(catalog: &dyn CatalogStore) {
     let ns = given_namespace(catalog, &["missing_view_ns"]).await;
@@ -585,13 +647,58 @@ pub async fn drop_namespace_with_views_is_precondition_failed(
     );
 }
 
-/// A view and a table may share a name without colliding: they are different
-/// kinds, addressed through different endpoints.
-pub async fn a_view_and_a_table_may_share_a_name(catalog: &dyn CatalogStore, warehouse: &str) {
+/// One namespace holds one thing per name, whichever kind it is.
+///
+/// # Why this is not merely an interoperability rule
+///
+/// The spec says it on four endpoints — `createTable`, `createView`,
+/// `renameTable` and `renameView` each answer `409` for *"the identifier already
+/// exists as a table or view"* — and a catalog that allowed the collision would
+/// hand every engine an ambiguous `SELECT * FROM db.events`.
+///
+/// Here it is worse than ambiguous. Both kinds are laid out at
+/// `<warehouse>/<namespace>/<name>`, so a collision puts two different metadata
+/// documents in one directory and a purge of the table deletes the view's files
+/// along with its own. Two callers each see a resource that works, right up
+/// until one of them drops theirs.
+///
+/// Asserted in the shared suite because the two backends reach it differently —
+/// redb by a check inside a serialised write transaction, Postgres by a shared
+/// primary key across both relations — and a conformance claim that held for one
+/// of them would be worth nothing.
+pub async fn a_view_and_a_table_cannot_share_a_name(catalog: &dyn CatalogStore, warehouse: &str) {
     let ns = given_namespace(catalog, &["shared_name_ns"]).await;
-    given_table(catalog, &ns, "events").await;
-    given_view(catalog, warehouse, &ns, "events").await;
 
+    // A view cannot take a table's name.
+    given_table(catalog, &ns, "events").await;
+    assert_kind(
+        catalog
+            .create_view(
+                &TableIdent::new(ns.clone(), "events".into()),
+                simple_view_metadata(&ns, "events", &view_location(warehouse, &ns, "events")),
+            )
+            .await,
+        ErrorKind::TableAlreadyExists,
+        "creating a view named after an existing table",
+    );
+
+    // And a table cannot take a view's.
+    given_view(catalog, warehouse, &ns, "summary").await;
+    assert_kind(
+        catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("summary".into())
+                    .schema(simple_schema())
+                    .build(),
+            )
+            .await,
+        ErrorKind::TableAlreadyExists,
+        "creating a table named after an existing view",
+    );
+
+    // Neither attempt disturbed what was already there.
     assert!(
         catalog
             .table_exists(&TableIdent::new(ns.clone(), "events".into()))
@@ -600,7 +707,65 @@ pub async fn a_view_and_a_table_may_share_a_name(catalog: &dyn CatalogStore, war
     );
     assert!(
         catalog
-            .view_exists(&TableIdent::new(ns, "events".into()))
+            .view_exists(&TableIdent::new(ns.clone(), "summary".into()))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !catalog
+            .view_exists(&TableIdent::new(ns.clone(), "events".into()))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !catalog
+            .table_exists(&TableIdent::new(ns, "summary".into()))
+            .await
+            .unwrap()
+    );
+}
+
+/// A rename may not land on a name the *other* kind already holds either.
+pub async fn a_rename_cannot_land_on_the_other_kinds_name(
+    catalog: &dyn CatalogStore,
+    warehouse: &str,
+) {
+    let ns = given_namespace(catalog, &["rename_collision_ns"]).await;
+    given_table(catalog, &ns, "t").await;
+    given_view(catalog, warehouse, &ns, "v").await;
+
+    assert_kind(
+        catalog
+            .rename_table(
+                &TableIdent::new(ns.clone(), "t".into()),
+                &TableIdent::new(ns.clone(), "v".into()),
+            )
+            .await,
+        ErrorKind::TableAlreadyExists,
+        "renaming a table onto a view's name",
+    );
+
+    assert_kind(
+        catalog
+            .rename_view(
+                &TableIdent::new(ns.clone(), "v".into()),
+                &TableIdent::new(ns.clone(), "t".into()),
+            )
+            .await,
+        ErrorKind::TableAlreadyExists,
+        "renaming a view onto a table's name",
+    );
+
+    // Both are still where they were.
+    assert!(
+        catalog
+            .table_exists(&TableIdent::new(ns.clone(), "t".into()))
+            .await
+            .unwrap()
+    );
+    assert!(
+        catalog
+            .view_exists(&TableIdent::new(ns, "v".into()))
             .await
             .unwrap()
     );
@@ -1107,10 +1272,12 @@ where
 
     check_in_warehouse!(
         a_view_round_trips,
+        a_second_view_commit_from_one_read_is_refused,
         duplicate_view_is_already_exists,
         rename_view_onto_existing_is_already_exists,
         drop_namespace_with_views_is_precondition_failed,
-        a_view_and_a_table_may_share_a_name,
+        a_view_and_a_table_cannot_share_a_name,
+        a_rename_cannot_land_on_the_other_kinds_name,
         a_lost_commit_leaves_no_metadata_file,
         registering_metadata_that_points_outside_the_warehouse_is_refused,
     );

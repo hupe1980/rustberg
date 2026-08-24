@@ -27,24 +27,86 @@
 //! asked for the full one while echoing that tag, a location-only tag would
 //! match and it would be told "not modified" — leaving it with the pruned copy
 //! and no way to discover the difference. Different content, different tag.
+//!
+//! # Delegation decides whether there is a tag at all
+//!
+//! `loadTable` does not always return only metadata. When the client asks for
+//! `X-Iceberg-Access-Delegation`, the same response carries storage access, and
+//! that changes the question this module answers.
+//!
+//! **Vended credentials make the response uncacheable.** A credential is minted
+//! per request and expires; a `304` carries no body, so a client that echoed a
+//! tag and asked for credentials in the same breath would be told "unchanged"
+//! and handed nothing to read the table with. There is no tag that fixes this,
+//! because the correct answer is that this representation has no stable
+//! identity — so [`etag_for`] returns `None` and the load is unconditional.
+//!
+//! **Remote signing is stable, and therefore folded in.** The signer block is
+//! derived from the table's identity, not from a secret, so it caches — but a
+//! response carrying it is a *different document* from one that does not, and a
+//! shared tag would let a client that switched on signing be told its unsigned
+//! copy was still current. Same hazard as the snapshot scope, same fix.
+//!
+//! It is folded in on the strength of what the client *asked for*, not what the
+//! response turned out to contain. A deployment that does not offer signing
+//! returns the same bytes either way, so the two tags name identical documents
+//! — which costs one extra full load in a case nobody hits, and buys a rule that
+//! does not silently start colliding the day signing is configured.
+//!
+//! **And so is the restriction, because it decides the same block.** A table
+//! carrying a `@row_filter` or a `@column_mask` is refused delegation, so the
+//! signer block is dropped from its response — the very block the paragraph
+//! above folds in. Two callers asking for signing on one table therefore
+//! receive two different documents whenever policy restricts one of them and
+//! not the other, and without this input they would receive one tag.
+//!
+//! `Cache-Control: private` keeps a shared proxy out of it, so this is not a
+//! poisoning the server can be talked into. What it is, is the rule stated twice
+//! above — *different content, different tag* — with the third input that
+//! changes the content. The case it costs is a client multiplexing identities
+//! against one cache, and that is not an exotic one: a query engine's
+//! coordinator is exactly that.
+//!
+//! Like delegation, it is the *restriction* that is folded in and not the
+//! restriction's contents. A filter that changes while still being a filter
+//! leaves the document the same shape, and anything that changed the table
+//! itself has already changed the metadata location.
 
 use axum::http::HeaderMap;
 use sha2::{Digest, Sha256};
 
+use super::delegation::AccessDelegation;
 use super::snapshots::SnapshotScope;
 
 /// Request header carrying the version a client already holds.
 pub const IF_NONE_MATCH: &str = "if-none-match";
 
-/// Builds the entity tag for one metadata version at one snapshot scope.
+/// Builds the entity tag for one `loadTable` representation, or `None` when it
+/// has no stable identity.
 ///
 /// The result is a *strong* validator in quoted form, per RFC 9110: the bytes
 /// are byte-for-byte identical whenever the tag matches, which is exactly the
 /// guarantee the metadata location provides.
-pub fn etag_for(metadata_location: Option<&str>, scope: SnapshotScope) -> Option<String> {
+///
+/// `None` means "do not cache and do not answer `304`" — see the module docs
+/// for the two ways that happens.
+pub fn etag_for(
+    metadata_location: Option<&str>,
+    scope: SnapshotScope,
+    delegation: AccessDelegation,
+    restricted: bool,
+) -> Option<String> {
     // A table with no recorded metadata location has no version to name, so it
     // gets no tag rather than a fabricated one. Staged tables are the case.
     let location = metadata_location?;
+
+    // A response that carries a freshly minted, expiring credential is not a
+    // representation of the table; it is an event. Naming it with a validator
+    // would let the next conditional load answer `304` and withhold the one
+    // thing the client asked for.
+    if delegation.vended_credentials {
+        return None;
+    }
 
     let mut hasher = Sha256::new();
     hasher.update(location.as_bytes());
@@ -52,6 +114,23 @@ pub fn etag_for(metadata_location: Option<&str>, scope: SnapshotScope) -> Option
     // concatenate into the same byte string.
     hasher.update([0u8]);
     hasher.update(scope.as_str().as_bytes());
+    hasher.update([0u8]);
+    hasher.update(if delegation.remote_signing {
+        b"remote-signing".as_slice()
+    } else {
+        b"plain".as_slice()
+    });
+    hasher.update([0u8]);
+    // The restriction decides the same block the line above does: a table under
+    // a row filter or a column mask is refused delegation, so its response drops
+    // the signer configuration. Two callers asking for signing on one table
+    // therefore hold two different documents whenever policy restricts one of
+    // them, and without this they would hold one tag.
+    hasher.update(if restricted {
+        b"restricted".as_slice()
+    } else {
+        b"unrestricted".as_slice()
+    });
 
     let digest = hasher.finalize();
     // 128 bits of a SHA-256 digest. A collision is what would matter here — a
@@ -67,14 +146,17 @@ pub fn etag_for(metadata_location: Option<&str>, scope: SnapshotScope) -> Option
     Some(format!("\"{hex}\""))
 }
 
-/// Whether the request is conditional at all.
+/// Whether a conditional load is worth attempting: the client sent a validator,
+/// *and* the representation it would be validating has a stable identity.
 ///
-/// Worth asking separately from [`matches()`], because computing an entity tag
-/// costs a catalog lookup. For a federated mount that lookup is a *remote*
-/// call, so computing a tag no client asked about would double the cost of
-/// every ordinary load.
-pub fn is_conditional(headers: &HeaderMap) -> bool {
-    headers.contains_key(IF_NONE_MATCH)
+/// Both halves save a lookup rather than deciding correctness — [`etag_for`] is
+/// the authority on both questions and answers `None` when either fails. This
+/// exists because computing a tag costs a catalog lookup, and on a federated
+/// mount that lookup is a *remote* call: doing it for a header nobody sent, or
+/// for a response that can never be revalidated, would double the cost of an
+/// ordinary load to reach a branch that cannot be taken.
+pub fn is_revalidatable(headers: &HeaderMap, delegation: AccessDelegation) -> bool {
+    headers.contains_key(IF_NONE_MATCH) && !delegation.vended_credentials
 }
 
 /// Whether `headers` claims a version matching `etag`.
@@ -104,7 +186,8 @@ mod tests {
     use super::*;
 
     fn tag(location: &str, scope: SnapshotScope) -> String {
-        etag_for(Some(location), scope).expect("a located table has a tag")
+        etag_for(Some(location), scope, AccessDelegation::default(), false)
+            .expect("a located table has a tag")
     }
 
     fn if_none_match(value: &str) -> HeaderMap {
@@ -156,7 +239,70 @@ mod tests {
 
     #[test]
     fn a_table_with_no_location_has_no_tag() {
-        assert!(etag_for(None, SnapshotScope::All).is_none());
+        assert!(etag_for(None, SnapshotScope::All, AccessDelegation::default(), false).is_none());
+    }
+
+    /// The bug this exists to prevent: a client that echoes a tag *and* asks for
+    /// credentials would be told "not modified" and handed a body-less `304`,
+    /// leaving it with no credential to read the table with.
+    #[test]
+    fn a_credentialed_response_has_no_validator() {
+        let delegation = AccessDelegation {
+            vended_credentials: true,
+            remote_signing: false,
+        };
+        assert!(
+            etag_for(
+                Some("s3://b/t/1.json"),
+                SnapshotScope::All,
+                delegation,
+                false
+            )
+            .is_none()
+        );
+        assert!(!is_revalidatable(&if_none_match("\"x\""), delegation));
+    }
+
+    /// A signed load and a plain load are two different documents for the same
+    /// metadata version, so they must not share a validator.
+    #[test]
+    fn remote_signing_changes_the_validator() {
+        let signing = AccessDelegation {
+            vended_credentials: false,
+            remote_signing: true,
+        };
+        let plain = etag_for(
+            Some("s3://b/t/1.json"),
+            SnapshotScope::All,
+            AccessDelegation::default(),
+            false,
+        );
+        let signed = etag_for(Some("s3://b/t/1.json"), SnapshotScope::All, signing, false);
+        assert!(plain.is_some() && signed.is_some());
+        assert_ne!(plain, signed);
+        assert!(is_revalidatable(&if_none_match("\"x\""), signing));
+    }
+
+    /// A restricted caller is refused delegation, so its response drops the
+    /// signer block a permitted one receives — two documents, and before this
+    /// they shared a validator.
+    #[test]
+    fn a_restricted_caller_does_not_share_a_tag_with_an_unrestricted_one() {
+        let signing = AccessDelegation {
+            vended_credentials: false,
+            remote_signing: true,
+        };
+        let location = Some("s3://b/t/1.json");
+
+        let unrestricted = etag_for(location, SnapshotScope::All, signing, false);
+        let restricted = etag_for(location, SnapshotScope::All, signing, true);
+
+        assert!(unrestricted.is_some() && restricted.is_some());
+        assert_ne!(
+            unrestricted, restricted,
+            "the signer block is in one response and not the other, so the two must not \
+             share a validator"
+        );
     }
 
     #[test]
@@ -194,15 +340,19 @@ mod tests {
 
     #[test]
     fn a_request_without_the_header_is_not_conditional() {
-        assert!(!is_conditional(&HeaderMap::new()));
-        assert!(is_conditional(&if_none_match("\"anything\"")));
+        let none = AccessDelegation::default();
+        assert!(!is_revalidatable(&HeaderMap::new(), none));
+        assert!(is_revalidatable(&if_none_match("\"anything\""), none));
     }
 
     /// Even an unparseable value means the client is asking conditionally; it
     /// simply will not match.
     #[test]
     fn a_malformed_header_is_still_a_conditional_request() {
-        assert!(is_conditional(&if_none_match("garbage")));
+        assert!(is_revalidatable(
+            &if_none_match("garbage"),
+            AccessDelegation::default()
+        ));
     }
 
     #[test]

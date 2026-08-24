@@ -19,12 +19,12 @@ use uuid::Uuid;
 
 use super::extract::{Json, NamespacePath, ViewPath};
 use super::guard::{self, Target};
-use super::idempotency::{CachedResponse, IDEMPOTENCY_KEY_USED_HEADER, IdempotencyKey};
+use super::idempotency::{CachedResponse, IdempotencyKey};
 use super::pagination::{PaginationQuery, collect_page};
-use super::validation::{validate_namespace, validate_properties, validate_table_name};
 use crate::app::AppState;
 use crate::auth::{Action, AuthenticatedPrincipal, RequestFacts};
 use crate::error::{AppError, Result};
+use crate::names::{validate_namespace, validate_properties, validate_table_name};
 
 // ============================================================================
 // Request/Response Types
@@ -145,14 +145,15 @@ pub async fn register_view(
     let namespace_parts = namespace.clone().inner();
     let namespace_ident = NamespaceIdent::from_vec(namespace_parts.clone())?;
 
-    // Confined to the warehouse before it is recorded, for the reason
-    // `registerTable` is: the location becomes something this catalog manages
-    // and hands out. Under federation the governing warehouse is the mount's,
-    // not the server's. See `crate::location`.
-    crate::location::ensure_within_warehouse(
-        &state.warehouse_for(&namespace_ident).await,
-        &payload.metadata_location,
-    )?;
+    // Confined before it is recorded, for the reason `registerTable` is: the
+    // location becomes something this catalog manages and hands out. The bound
+    // is this view's own prefix, and under federation the warehouse it is built
+    // from is the mount's rather than the server's. See
+    // `crate::location::LocationScope`.
+    state
+        .location_bound(&namespace_ident, &payload.name)
+        .await
+        .ensure(&payload.metadata_location)?;
 
     guard::authorize(
         &state,
@@ -174,10 +175,11 @@ pub async fn register_view(
     // does not mean the view it describes is: the file can declare any
     // `location` it likes. A rejection has to undo the pointer, which is all
     // registration wrote.
-    if let Err(rejected) = crate::location::ensure_within_warehouse(
-        &state.warehouse_for(view_ident.namespace()).await,
-        metadata.location(),
-    ) {
+    if let Err(rejected) = state
+        .location_bound(view_ident.namespace(), view_ident.name())
+        .await
+        .ensure(metadata.location())
+    {
         if let Err(cleanup) = state.catalog.drop_view(&view_ident).await {
             tracing::error!(
                 view = %view_ident,
@@ -390,8 +392,8 @@ pub async fn create_view(
 
     // Validate schema type
     if payload.schema.schema_type != "struct" {
-        return Err(AppError::InvalidSchema(
-            "Schema type must be 'struct'".to_string(),
+        return Err(AppError::BadRequest(
+            "A view schema must have \"type\": \"struct\" at its root.".to_string(),
         ));
     }
 
@@ -418,41 +420,40 @@ pub async fn create_view(
 
     let representations: ViewRepresentations =
         serde_json::from_value(serde_json::Value::Array(representations_json)).map_err(|e| {
-            AppError::ValidationError(format!("Invalid view representations: {}", e))
+            AppError::BadRequest(format!("View representations could not be read: {e}"))
         })?;
 
     if representations.is_empty() {
-        return Err(AppError::ValidationError(
-            "View must have at least one SQL representation".to_string(),
+        return Err(AppError::BadRequest(
+            "A view must carry at least one SQL representation.".to_string(),
         ));
     }
 
     // Build the default namespace
     let default_namespace = NamespaceIdent::from_vec(payload.view_version.default_namespace)?;
 
-    // Generate view location. A client-supplied one is confined to the
-    // warehouse for the same reason a table's is — see `crate::location`.
+    // Generate view location. A client-supplied one is confined for the same
+    // reason a table's is — see `crate::location::LocationScope`.
+    //
+    // The warehouse is the one governing *this namespace*, which under
+    // federation is the mount's rather than the server's. A table gets its
+    // default location from the catalog that will hold it and so never has this
+    // problem; views build theirs here, which is the chance to pick the wrong
+    // one — and then fail the confinement check that correctly used the right
+    // one. `canonical_prefix` is the same function the check reads, so the
+    // default this builds is one the check accepts by construction.
     let view_location = match payload.location {
         Some(location) => {
-            crate::location::ensure_within_warehouse(
-                &state.warehouse_for(&namespace_ident).await,
-                &location,
-            )?;
+            state
+                .location_bound(&namespace_ident, &payload.name)
+                .await
+                .ensure(&location)?;
             location
         }
-        // The warehouse governing *this namespace*, which under federation is the
-        // mount's rather than the server's. A table gets its default location
-        // from the catalog that will hold it and so never has this problem;
-        // views build theirs here, which is the chance to pick the wrong one —
-        // and then fail the confinement check that correctly used the right one.
-        None => format!(
-            "{}/{}/{}",
-            state
-                .warehouse_for(&namespace_ident)
-                .await
-                .trim_end_matches('/'),
-            namespace_parts.join("/"),
-            payload.name
+        None => crate::location::canonical_prefix(
+            &state.warehouse_for(&namespace_ident).await,
+            &namespace_parts,
+            &payload.name,
         ),
     };
 
@@ -506,10 +507,6 @@ pub async fn create_view(
         && let Some(cached) = CachedResponse::from_json(StatusCode::OK, &response_body)
     {
         state.idempotency_cache.set(key, cached).await;
-        response.headers_mut().insert(
-            IDEMPOTENCY_KEY_USED_HEADER,
-            axum::http::HeaderValue::from_static("true"),
-        );
     }
 
     Ok(response)
@@ -606,6 +603,11 @@ pub async fn drop_view(
     )
     .await?;
 
+    // Read after authorizing, so an unauthorized caller learns nothing about
+    // whether the view exists or how it is configured.
+    let (_, metadata) = state.catalog.load_view(&view_ident).await?;
+    super::ownership::reject_if_protected(metadata.properties(), &format!("View '{view_ident}'"))?;
+
     // Drop the view
     state.catalog.drop_view(&view_ident).await?;
 
@@ -680,15 +682,31 @@ pub async fn commit_view(
     // reports a backend outage as a missing view, which sends an operator after
     // the wrong thing and can make a client recreate what is still there.
     // `From<iceberg::Error>` already maps a genuine miss to `404`.
-    let (_current_metadata_location, current_metadata) =
+    // The location is the compare-and-swap witness, not a spare value: the
+    // updates below are applied to the document it names, so the pointer must
+    // still be it when the swap happens or this commit silently overwrites one
+    // that landed in between. See `CatalogStore::update_view`.
+    let (current_metadata_location, current_metadata) =
         state.catalog.load_view(&view_ident).await?;
+
+    // A view commit can move the view, the same way a table commit can move a
+    // table, and it gets the same answer. Checked here rather than in the
+    // backend because this is where the *current* location is in hand — a view
+    // commit applies its updates in the handler and hands the store finished
+    // metadata, which is the mirror image of a table commit. Same rule, same
+    // place: wherever the current metadata already is. See
+    // `crate::location::LocationBound::ensure_view_commit`.
+    state
+        .location_bound(view_ident.namespace(), view_ident.name())
+        .await
+        .ensure_view_commit(current_metadata.location(), &payload.updates)?;
 
     // Validate requirements
     for requirement in &payload.requirements {
         match requirement {
             ViewRequirement::AssertViewUuid { uuid } => {
                 let expected_uuid = Uuid::parse_str(uuid)
-                    .map_err(|_| AppError::ValidationError(format!("Invalid UUID: {}", uuid)))?;
+                    .map_err(|_| AppError::BadRequest(format!("'{uuid}' is not a UUID.")))?;
                 if current_metadata.uuid() != expected_uuid {
                     return Err(AppError::CommitConflict(format!(
                         "View UUID mismatch: expected {}, found {}",
@@ -713,8 +731,10 @@ pub async fn commit_view(
     // Generate new metadata location
 
     // Update storage
-    let (new_metadata_location, new_metadata) =
-        state.catalog.update_view(&view_ident, new_metadata).await?;
+    let (new_metadata_location, new_metadata) = state
+        .catalog
+        .update_view(&view_ident, &current_metadata_location, new_metadata)
+        .await?;
 
     tracing::info!(
         namespace = namespace_parts.join("."),
@@ -739,10 +759,6 @@ pub async fn commit_view(
         && let Some(cached) = CachedResponse::from_json(StatusCode::OK, &response_body)
     {
         state.idempotency_cache.set(key, cached).await;
-        response.headers_mut().insert(
-            IDEMPOTENCY_KEY_USED_HEADER,
-            axum::http::HeaderValue::from_static("true"),
-        );
     }
 
     Ok(response)

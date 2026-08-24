@@ -9,13 +9,15 @@ use std::collections::HashMap;
 
 use super::extract::{Json, NamespacePath};
 use super::guard::{self, Target};
-use super::idempotency::{CachedResponse, IDEMPOTENCY_KEY_USED_HEADER, IdempotencyKey};
-use super::ownership::{owner_of, preserve_reserved, reject_reserved, set_owner, strip_reserved};
+use super::idempotency::{CachedResponse, IdempotencyKey};
+use super::ownership::{
+    owner_of, preserve_reserved, reject_if_protected, reject_reserved, set_owner, strip_reserved,
+};
 use super::pagination::{PaginationQuery, collect_page};
-use super::validation::{validate_namespace, validate_properties};
 use crate::app::AppState;
 use crate::auth::{Action, AuthenticatedPrincipal, RequestFacts, Resource};
 use crate::error::{AppError, Result};
+use crate::names::{validate_namespace, validate_properties};
 
 #[derive(Deserialize)]
 pub struct ListNamespaceQuery {
@@ -88,13 +90,6 @@ pub async fn list_namespaces(
     RequestFacts(request): RequestFacts,
     Query(query): Query<ListNamespaceQuery>,
 ) -> Result<AxumJson<ListNamespaceResponse>> {
-    // Permission to enumerate one's own catalog. Each namespace found is then
-    // authorized on its own merits below.
-    guard::authorize_catalog(&state, &principal, &request, Action::List).await?;
-
-    // Record metric
-    state.metrics.catalog_list_namespaces.inc();
-
     // `parent` is a multi-level namespace encoded with the unit separator, the
     // same as in a path segment. Treating the whole value as one level made
     // `?parent=a\u{1F}b` search for a namespace literally named "a\u{1F}b".
@@ -102,11 +97,48 @@ pub async fn list_namespaces(
         .parent
         .as_deref()
         .map(|parent| {
-            let parts: Vec<String> = parent.split('\u{1F}').map(str::to_string).collect();
+            let parts: Vec<String> = parent
+                .split(crate::names::PART_SEPARATOR)
+                .map(str::to_string)
+                .collect();
             validate_namespace(&parts)?;
             NamespaceIdent::from_vec(parts).map_err(AppError::from)
         })
         .transpose()?;
+
+    match maybe_parent.as_ref() {
+        // `?parent=X` names a resource, so it is authorized like one — the same
+        // guard `listTables` puts in front of its namespace, and for the same
+        // reason.
+        //
+        // Without it this parameter is the enumeration oracle every path-based
+        // handler closes, reached through a query string: the backend answers
+        // `NoSuchNamespace` for a parent that does not exist and an empty page
+        // for one that exists and belongs to somebody else. The page reveals
+        // nothing — every child is filtered below — but the *status code*
+        // separates "not there" from "not yours", and a caller can walk a whole
+        // foreign tree with it one guess at a time.
+        Some(parent) => {
+            guard::authorize(
+                &state,
+                &principal,
+                &request,
+                parent,
+                Target::Namespace,
+                Action::List,
+            )
+            .await?;
+        }
+        // The root, where there is nothing to name. The decision is "may you
+        // enumerate your own catalog", and each namespace found is authorized on
+        // its own merits below.
+        None => {
+            guard::authorize_catalog(&state, &principal, &request, Action::List).await?;
+        }
+    }
+
+    // Record metric
+    state.metrics.catalog_list_namespaces.inc();
 
     let page = collect_page(
         PaginationQuery::new(query.page_token, query.page_size).to_request()?,
@@ -155,12 +187,28 @@ pub async fn list_namespaces(
     }))
 }
 
-/// Creates a namespace, stamped with the creating tenant as its owner.
+/// Creates a namespace, stamped with the tenant that owns the subtree it joins.
 ///
-/// Authorized against the caller's own tenant, which is correct here and only
-/// here: the namespace does not exist yet, so there is no recorded owner to
-/// authorize against, and the caller is asking to create it *in its own tenant*.
-/// Every later request on it authorizes against the owner written now.
+/// # Ownership is inherited, never asserted
+///
+/// A **root** namespace has no parent to inherit from, so it is authorized
+/// against the caller's own tenant and stamped with it. That is correct here
+/// and only here: nothing exists yet, and the caller is asking to create a tree
+/// of its own.
+///
+/// A **nested** namespace is a different request. It joins a tree that already
+/// has an owner, and authorizing it against the *caller's* tenant would let a
+/// principal in tenant `b` plant `finance.secret` inside tenant `a`'s
+/// `finance` — invisible to `a`, undeletable by `a` (the parent is no longer
+/// empty), and with no error naming why. So the parent is resolved through the
+/// ordinary guard, the decision is made against the owner recorded *there*, and
+/// the child inherits it.
+///
+/// Inheritance is also what keeps the Cedar hierarchy honest. Ancestors are
+/// derived by truncating the entity id, and the id begins with the owning
+/// tenant — so a child owned by `b` under a parent owned by `a` would sit under
+/// `Namespace::"b\u{1F}finance"`, which is not a namespace that exists. One
+/// owner per subtree makes the derived chain the real one.
 pub async fn create_namespace(
     State(state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
@@ -184,15 +232,36 @@ pub async fn create_namespace(
     let idempotency_key =
         IdempotencyKey::from_headers(&headers, "POST", "/v1/namespaces", &principal);
 
-    let tenant_id = principal.tenant_id().to_string();
-    guard::authorize_new(
-        &state,
-        &principal,
-        &request,
-        Resource::namespace(&tenant_id, payload.namespace.clone()),
-        Action::Create,
-    )
-    .await?;
+    // Whose tree is this? A root namespace starts one; a nested namespace joins
+    // the one its parent already belongs to. See the doc comment above for why
+    // the difference is a security boundary rather than a formality.
+    let tenant_id = match payload.namespace.split_last() {
+        Some((_, [])) | None => {
+            let tenant_id = principal.tenant_id().to_string();
+            guard::authorize_new(
+                &state,
+                &principal,
+                &request,
+                Resource::namespace(&tenant_id, payload.namespace.clone()),
+                Action::Create,
+            )
+            .await?;
+            tenant_id
+        }
+        Some((_, parent)) => {
+            let parent = NamespaceIdent::from_vec(parent.to_vec())?;
+            guard::authorize(
+                &state,
+                &principal,
+                &request,
+                &parent,
+                Target::Namespace,
+                Action::Create,
+            )
+            .await?
+            .owner
+        }
+    };
     // Consulted only after authorization: a cache hit answers without touching
     // the catalog, so checking it first would serve a request that was never
     // authorized — and would keep serving it after the grant was revoked.
@@ -238,10 +307,6 @@ pub async fn create_namespace(
         && let Some(cached) = CachedResponse::from_json(StatusCode::OK, &response_body)
     {
         state.idempotency_cache.set(key, cached).await;
-        response.headers_mut().insert(
-            IDEMPOTENCY_KEY_USED_HEADER,
-            axum::http::HeaderValue::from_static("true"),
-        );
     }
 
     Ok(response)
@@ -309,6 +374,12 @@ pub async fn delete_namespace(
         Action::Delete,
     )
     .await?;
+
+    let existing = state.catalog.get_namespace(&namespace).await?;
+    reject_if_protected(
+        existing.properties(),
+        &format!("Namespace '{}'", namespace.join(".")),
+    )?;
 
     // Record metric
     state.metrics.catalog_delete_namespace.inc();

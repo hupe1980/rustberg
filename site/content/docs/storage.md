@@ -47,9 +47,9 @@ cargo build --release --features catalog-postgres
 ```
 
 > Object-store URLs (`s3://`, `gs://`, `az://`) are **not** valid for
-> `catalog_url` and are rejected at startup. Earlier versions of Rustberg kept
-> catalog state on object storage; that design is gone. Point `catalog_url` at a
-> disk or a database, and `warehouse_location` at the bucket.
+> `catalog_url` and are rejected at startup: a catalog needs compare-and-swap,
+> which an object store does not offer. Point `catalog_url` at a disk or a
+> database, and `warehouse_location` at the bucket.
 
 ### Which backend
 
@@ -86,9 +86,30 @@ Or, keeping the password out of the config file:
 export RUSTBERG_CATALOG_URL="postgres://rustberg:secret@postgres.internal/rustberg"
 ```
 
-Rustberg creates its three tables (`rustberg_namespaces`, `rustberg_tables`,
-`rustberg_views`) on first start, with `IF NOT EXISTS` so that every replica can
+Rustberg creates its tables on first start — `rustberg_namespaces`,
+`rustberg_object_names`, `rustberg_tables`, `rustberg_views`,
+`rustberg_staged_tables`, `rustberg_policy_revisions`, `rustberg_idempotency`
+and `rustberg_schema_version` — with `IF NOT EXISTS` so that every replica can
 run the same startup path. There is no migration step and no separate init job.
+
+`rustberg_object_names` is the shared primary key that makes a name unique
+across tables *and* views ([one name, one thing](@/docs/api.md#one-name-one-thing));
+the two relations cascade from it, and the namespace foreign key reaches them
+through it.
+
+`rustberg_schema_version` holds one row naming the schema this database was
+created with. Rustberg **refuses to start** against a database stamped with a
+different one, naming both versions and the build that wrote it.
+
+That check exists because `IF NOT EXISTS` is exactly what makes a schema change
+invisible: a relation added later is created empty and the rows that belong in it
+are not there, a column added later is simply absent. Nothing about that looks
+like a schema problem — it looks like a catalog that has lost its tables. Being
+told at startup is the difference.
+
+There are no migrations and there will not be while Rustberg is pre-release. The
+answer is to point `catalog.url` at a fresh database, or drop the `rustberg_*`
+relations in this one and start again.
 
 The database needs no special configuration — the default isolation level is
 sufficient, because correctness rests on conditional `UPDATE`s rather than on
@@ -105,8 +126,14 @@ bundled database.
 └── catalog.redb        # the entire catalog: one file
 ```
 
-One file is the whole point: backup is a file copy, and there is no cluster to
-operate.
+One file is the whole point: backup is a file copy of a stopped server (see
+[below](#backup-and-restore)), and there is no cluster to operate.
+
+The file carries the same schema stamp the Postgres backend does, and Rustberg
+refuses to open one written by a build with a different schema. It matters more
+here rather than less: the file outlives the binary that wrote it, sitting in a
+volume somebody mounts into the next image. Same answer — point `catalog.url` at
+a new file, or move this one aside.
 
 ### Permissions
 
@@ -138,6 +165,38 @@ deploy makes a smaller binary:
 ```bash
 cargo build --release --no-default-features --features cli,tls,storage-s3
 ```
+
+### The layout inside it
+
+Rustberg puts a resource's files at `<warehouse>/<namespace levels>/<name>`:
+
+```text
+s3://bucket/warehouse/
+├── analytics/                     namespace  analytics
+│   ├── events/                    table      analytics.events
+│   │   ├── data/
+│   │   └── metadata/
+│   └── web/                       namespace  analytics.web
+│       └── sessions/              table      analytics.web.sessions
+└── finance/
+    └── payroll/
+```
+
+That is a bound as well as a convention: a **client-supplied** location must sit
+inside the prefix the resource's own name puts it in, because storage access is
+scoped to that location. See
+[configuration](@/docs/configuration.md#where-a-client-may-put-a-table-s-files)
+for the setting and
+[security](@/docs/security.md#the-storage-boundary-is-the-policy-boundary) for
+why.
+
+Underneath its own prefix a table lays itself out however its writer likes, so
+`.../events/data/dt=2024-01-01/` needs nothing configured.
+
+Views use the same layout, so a namespace holds **one thing per name** — a table
+and a view called `events` would share a directory. Both `createTable` and
+`createView` answer `409` when either kind holds the name
+([one name, one thing](@/docs/api.md#one-name-one-thing)).
 
 ### Reaching the warehouse
 
@@ -324,20 +383,52 @@ is the right trade. For a cluster it is not, which is what Postgres is for.
 
 ## Backup and restore
 
-The backup subcommands operate on the catalog directory:
+**There is no backup subcommand, deliberately.** Both backends already have a
+backup tool that is better than one Rustberg could ship, and the one that was
+here was worse than either: it archived a directory while the server held it
+open, which for redb means capturing a file mid-commit, and it did nothing at all
+for a Postgres deployment — the backend the production guide recommends.
+
+### redb
+
+The catalog is one file. Copying it *while the server is stopped* is the backup:
 
 ```bash
-# Back up (gzip by default)
-rustberg backup --data-dir /var/lib/rustberg/data --output /backups/catalog.tar.gz
-
-# Restore
-rustberg restore --input /backups/catalog.tar.gz --data-dir /var/lib/rustberg/data
+systemctl stop rustberg
+cp /var/lib/rustberg/data/catalog.redb /backups/catalog-$(date +%F).redb
+systemctl start rustberg
 ```
 
-Stop the server before restoring. Backups cover the catalog only — the warehouse
-is backed up by your object store's own versioning and replication, and the two
-must be restored to consistent points or tables will point at metadata files that
-no longer exist.
+Restoring is the same copy in reverse, with the server stopped.
+
+Stopping is not fussiness. redb holds an exclusive lock on the file and commits
+atomically, so a copy taken during a commit is a copy of a half-written file —
+and a redb catalog is exactly the kind of thing that reads back fine until the
+one page you need is the torn one. The deployment is single-writer anyway, so
+the window is a restart.
+
+If stopping is not acceptable, take a **filesystem or volume snapshot** (LVM,
+ZFS, or an EBS/PD snapshot). Those are atomic at the block layer, which is the
+property the copy above is missing.
+
+### Postgres
+
+`pg_dump`, or whatever your managed service already does. No downtime, and it
+covers the policy revisions and idempotency receipts that live there alongside
+the catalog:
+
+```bash
+pg_dump --format=custom "$RUSTBERG_CATALOG_URL" > /backups/rustberg-$(date +%F).dump
+```
+
+### The warehouse is separate, and that is the part that needs care
+
+Neither of the above touches table data or metadata files; those are backed up by
+the object store's own versioning and replication. The two have to be restored to
+**consistent points**, or the catalog points at metadata files that no longer
+exist. Restoring a catalog that is *older* than the warehouse is the safe
+direction — it loses recent commits but every pointer still resolves. The other
+way round leaves tables that cannot be loaded at all.
 
 ---
 

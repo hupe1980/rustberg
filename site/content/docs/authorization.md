@@ -10,8 +10,9 @@ Cedar is a policy engine rather than a permission table: a decision comes from
 evaluating policies against a **principal**, an **action** and a **resource**,
 with the resource's position in a hierarchy available to the policy.
 
-- **Default deny** — absence of a `permit` is a denial, including on evaluation
-  error.
+- **Default deny** — absence of a `permit` is a denial, and so is a policy that
+  cannot be evaluated. See [When a policy cannot be
+  evaluated](#when-a-policy-cannot-be-evaluated).
 - **Path-scoped** — one policy covers a whole namespace subtree, including
   tables that do not exist yet.
 - **Validated at startup** — a policy that does not typecheck against the schema
@@ -153,11 +154,13 @@ forbid(
 };
 ```
 
-> **The address is only as trustworthy as your proxy configuration.** Rustberg
-> uses the connected socket address unless `trust_proxy_headers` is enabled, in
-> which case `X-Forwarded-For` is believed. Enable it only behind a proxy that
-> overwrites that header, or a caller can spoof its way past an address-scoped
-> policy.
+> **The address is only as trustworthy as your proxy configuration.** By default
+> Rustberg uses the connected socket address and ignores `X-Forwarded-For`
+> entirely. Behind a load balancer, list its subnet in
+> `[server] trusted_proxies`; the forwarding chain is then walked from the right
+> until it leaves that infrastructure, so a client cannot prepend an address of
+> its own choosing and walk past this policy. See
+> [Trusted proxies](@/docs/authentication.md#trusted-proxies).
 
 ---
 
@@ -286,6 +289,37 @@ the same answer a policy that does not typecheck gets, and for the same reason: 
 restriction that silently does not apply is worse than one that refuses to
 install.
 
+Startup checks everything that can be checked **without a table**: the JSON, the
+shape, and that every operator and every term is one this catalog can bind. An
+operator outside the grammar above — a misspelled `"type": "equals"` — and a term
+wrapped in a `transform` or naming a field by id are both refused there, because
+neither can ever bind against any table and a filter that cannot bind is a
+restriction that would not apply.
+
+What startup cannot check is the two questions that are about a *table*: whether
+a column exists, and whether a literal fits it. One policy covers tables that do
+not exist yet. Those are checked when the filter meets a table, and **a policy
+filter that cannot be bound to that table is a `403` naming the term** — a column
+the table does not have, a literal that does not fit one, or a `not-nan` on a
+column that is not a float.
+
+That is the opposite of what happens to a filter a *client* sends, where an
+unbindable term is widened away and the plan is simply a superset. The
+asymmetry is the point. A superset is safe for a request — the engine applies
+its own predicate, so extra files cost time and not correctness — and it is a
+*weaker restriction* for a policy. `@row_filter("region = 'EU'")` widening to
+"everything" is the filter silently ceasing to exist at the moment it was
+supposed to bite.
+
+### Writing a column mask
+
+`@column_mask` is a comma-separated list of column names, each a full dotted path
+for a nested column (`user.ssn`). Whitespace around an entry is trimmed and an
+empty entry is dropped, so a trailing comma is not a column named `""`. A column
+name that itself contains a comma cannot be masked — Iceberg permits one, this
+annotation cannot express it, and the honest answer is to say so rather than to
+invent an escaping rule no Cedar tool would render.
+
 ### How they compose
 
 A caller receives the **union of what the matching permits allow**, so the two
@@ -317,8 +351,42 @@ so twice:
 
 | When | What it reports | Precision |
 |---|---|---|
-| Policy load | Every unannotated permit, when the set also has annotated ones | Over-reports — it does not check whether they can ever meet |
+| Policy load | Every permit missing an annotation, **asked once per annotation kind**, when the set also carries that kind | Over-reports — it does not check whether they can ever meet |
 | A request | Which permits voided which restriction, `@row_filter` and `@column_mask` alike | Exact — no false positives |
+
+> **"Unannotated" is per restriction, not per permit.** This is the shape most
+> deployments hit first, and it is invisible if you look at permits rather than
+> at restrictions.
+
+Both permits below are annotated, so neither looks broad — but each is
+unannotated for the **other's** kind:
+
+```cedar
+@row_filter("{\"type\":\"eq\",\"term\":\"region\",\"value\":\"EU\"}")
+permit(principal in Rustberg::Group::"analysts",
+       action == Rustberg::Action::"Read",
+       resource in Rustberg::Tenant::"acme");
+
+@column_mask("ssn")
+permit(principal in Rustberg::Group::"analysts",
+       action == Rustberg::Action::"Read",
+       resource in Rustberg::Tenant::"acme");
+```
+
+That is how anyone writes *"EU rows, and hide `ssn`"*. The first permit grants
+every column, the second grants every row, and permits grant: the analyst sees
+every row and every column. Rustberg names both at load, and again on the first
+request that demonstrates it.
+
+Write it as **one permit carrying both annotations** instead:
+
+```cedar
+@row_filter("{\"type\":\"eq\",\"term\":\"region\",\"value\":\"EU\"}")
+@column_mask("ssn")
+permit(principal in Rustberg::Group::"analysts",
+       action == Rustberg::Action::"Read",
+       resource in Rustberg::Tenant::"acme");
+```
 
 The load-time check is deliberately crude. Deciding whether two Cedar policies can
 ever match the same request is undecidable in general, and an approximate warning
@@ -370,6 +438,7 @@ calling the filter enforced, and declining, Rustberg declines:
 | `loadTable` on an annotated table | `200`, metadata returned, **no** `storage-credentials` and no signer configuration |
 | `GET .../credentials` on an annotated table | `403`, naming the restriction |
 | `POST .../sign` on an annotated table | `403`, naming the restriction |
+| `POST .../plan`, `@column_mask` over a **partition** column | `403`, naming the column |
 | Any of these, on an unannotated table | Access granted normally |
 
 The refusal names masked columns but never quotes a filter expression — a filter
@@ -380,7 +449,28 @@ refused would leak the policy's contents.
 [`planTableScan`](@/docs/api.md#scan-planning) conjoins it with the client's own
 filter: a restricted caller is told about fewer files, and the `residual-filter`
 on each task carries both halves. `stats-fields` naming a masked column is
-refused, because column bounds are the column's minimum and maximum values.
+refused, because column bounds are the column's minimum and maximum values — and
+that refusal is matched on the resolved column without regard to case, so
+`case-sensitive: false` is not a way around it.
+
+A mask names a column by its **full dotted path**, and every check compares that
+path: `@column_mask("user.ssn")` withholds `user.ssn` and leaves an unrelated
+top-level `ssn` alone. Comparing the leaf would get both wrong in opposite
+directions, and the dangerous one is the nested column going on publishing its
+bounds while the policy file reads as though it were masked.
+
+**One mask a plan cannot carry, and there the plan is refused.** A mask over a
+column the table is **partitioned** on leaks twice, and neither leak can be
+gated: every file carries its `partition` tuple, and Iceberg writes partition
+values into the object key, so `…/region=EU/00000-0-….parquet` names the value
+again in the `file-path` the plan exists to hand over. `planTableScan` answers
+`403` naming the column — an answer that cannot carry the restriction is withheld
+rather than served with the restriction quietly missing.
+
+Every transform counts, not only identity: a tuple naming bucket 7 of 16 still
+narrows the value. So does every partition spec the table has had, since a
+snapshot holds files written under specs it has evolved away from. A mask over
+any other column plans normally.
 
 So an engine that plans through Rustberg reads only permitted rows. An engine
 carrying its own storage credentials reads the table unfiltered, and nothing here
@@ -393,24 +483,32 @@ This is the most important practical guidance on this page, and it decides
 whether a filter can *ever* become real enforcement.
 
 A catalog enforces a row filter by not handing over files. That works exactly
-when the filter's columns are **partition columns**: if `tenant_id` is a
-partition field, another tenant's rows live in different files, and withholding
-those files is enforcement that holds against any engine — hostile or not.
+when the filter's columns are partitioned with an **identity** transform: if
+`tenant_id` is an identity partition field, another tenant's rows live in
+different files, and withholding those files is enforcement that holds against
+any engine — hostile or not.
 
-When the filter references a non-partition column, permitted and forbidden rows
-share Parquet row groups. No file-level decision can separate them, and the best
-any catalog can do is deliver the file and a residual predicate. Enforcement is
-then **cooperative**: it holds only because the engine chose to apply it. AWS
-Lake Formation is explicit about the same limit.
+Otherwise permitted and forbidden rows share Parquet row groups. No file-level
+decision can separate them, and the best any catalog can do is deliver the file
+and a residual predicate. Enforcement is then **cooperative**: it holds only
+because the engine chose to apply it. AWS Lake Formation is explicit about the
+same limit.
+
+**A transform is not a boundary.** `days(ts)` puts a whole day in one file,
+`bucket(16, id)` puts a sixteenth of all ids in one, `truncate(4, region)` puts
+`EU` and `EUROPE` in one. A filter of `ts = '2024-01-01T05:00'` against
+`days(ts)` selects a file whose other rows are forbidden — so pruning helps and
+enforcement does not follow. Only identity makes the partition value and the
+column value the same thing.
 
 Both look identical in the policy file, so Rustberg tells you which you have:
 
 ```text
-WARN Row filter references non-partition columns, so it cannot be enforced by
-     withholding files. A scan plan applies it and returns it as the residual,
-     so a cooperating engine honours it — but an engine using its own storage
-     credentials reads the table unfiltered. Partition on the security boundary
-     to make this enforcement architectural.
+WARN Row filter references columns this table does not partition on by identity,
+     so it cannot be enforced by withholding files — a transformed partition puts
+     permitted and forbidden rows in the same file. A scan plan applies the filter
+     and returns it as the residual, so a cooperating engine honours it, but an
+     engine using its own storage credentials reads the table unfiltered.
      table=analytics.events columns=["email"] policy_set_version=9f2c41ab7d0e5163
 ```
 
@@ -422,12 +520,43 @@ again, since you have changed the thing the warning is about.
 
 | Filter | Table partitioned on | Enforceable by withholding files? |
 |---|---|---|
-| `tenant_id == "acme"` | `tenant_id` | **Yes** — architectural |
-| `region == "EU"` | `days(ts)` | No — warned |
-| anything | nothing | No — warned |
+| `tenant_id == "acme"` | `identity(tenant_id)` | **Yes** — architectural |
+| `region == "EU"` | `identity(region)`, field named `reg` | **Yes** — the *source column* is compared, not the field's name |
+| `ts == "2024-01-01T05:00"` | `days(ts)` | No — warned; the day's other rows are in the same file |
+| `id == 42` | `bucket(16, id)` | No — warned; a sixteenth of all ids share the file |
+| anything | nothing, or another column | No — warned |
 
-A partition spec of `days(ts)` **is** aligned with a filter on `ts`: the warning
-compares the partition's *source column*, not the partition field's name.
+The rule is deliberately conservative: a range filter whose bounds fall exactly
+on a transform's boundaries — `ts >= '2024-01-01' AND ts < '2024-01-02'` against
+`days(ts)` — *is* enforceable and is warned about anyway. Proving that needs a
+predicate model over transforms the Iceberg expression types do not carry, and
+the error is worth making in this direction: an over-warning costs you a
+sentence, an under-warning costs you a boundary you believed you had.
+
+---
+
+## Protecting a resource from deletion
+
+`rustberg.protected = "true"` on a table, view or namespace refuses `dropTable`,
+`dropView`, `dropNamespace` and a purge with `409` until it is cleared. See
+[the API reference](@/docs/api.md#drop-table).
+
+It is an ordinary property, so whoever can set it can clear it: it stops the
+accident, not the adversary. The rule that stops an adversary is a `forbid`,
+which the holder of the property cannot edit:
+
+```cedar
+forbid(
+  principal,
+  action == Rustberg::Action::"Delete",
+  resource in Rustberg::Namespace::"acme\u{1F}prod"
+) unless {
+  principal in Rustberg::Group::"platform-admin"
+};
+```
+
+The two compose: the property catches the mistake before it reaches the
+authorizer, and the policy catches it when someone means it.
 
 ---
 
@@ -511,13 +640,19 @@ nobody asked: an operator checking a pod wants to know what *that pod* does, and
 a replica that had stopped converging would look identical to one that had.
 
 ```bash
-# Which replicas have converged?
+# Which replicas have converged? The image is distroless — no shell and no curl
+# to `kubectl exec` — so ask each pod from outside, by its own address.
 for pod in $(kubectl get pods -l app=rustberg -o name); do
-  kubectl exec "$pod" -- curl -sf -H "Authorization: Bearer $ADMIN_KEY" \
-    localhost:8000/management/v1/policies \
+  ip=$(kubectl get "$pod" -o jsonpath='{.status.podIP}')
+  curl -sf -H "Authorization: Bearer $ADMIN_KEY" \
+    "http://$ip:8000/management/v1/policies" \
     | jq -c '{pod: "'"$pod"'", enforcing: .sequence, latest: .latest_sequence}'
 done
 ```
+
+Run that from inside the cluster — a debug pod, or a shell with `kubectl
+port-forward` per pod. Asking the *Service* would answer for whichever replica
+the load balancer picked, which is the one thing this question is not about.
 
 ### Sequence and version
 
@@ -563,6 +698,34 @@ itself. The endpoints answer `501` when either is missing:
 
 ---
 
+## When a policy cannot be evaluated
+
+Validation at startup catches a policy that cannot be *typed*. It does not catch
+one that types fine and raises when a request reaches it — `Long` arithmetic that
+overflows is the plainest case, and it typechecks because `Long + Long` is a
+`Long`.
+
+Cedar's rule for such a policy is that it contributes nothing to the decision.
+Taken literally that fails **open**: a `forbid` that raises is not applied, and a
+request somebody wrote a rule to stop is allowed by whatever `permit` still
+stands.
+
+So Rustberg reads the evaluation diagnostics, and any policy that failed to
+evaluate denies the request. It is an ordinary denial, so the caller sees `404`
+or `403` by the [visibility rule](#visibility-and-error-codes) like any other —
+the cause is in the policy set, not in what the caller may see, and the server
+log is where it is named:
+
+```
+ERROR A policy failed to evaluate. Cedar skips such a policy, so a forbid that
+      errors would not have been applied; denying instead.
+      errors=["while evaluating policy `policy1`: integer overflow"]
+```
+
+The fix is always an edit to the named policy.
+
+---
+
 ## Visibility and error codes
 
 `Read` determines whether a caller can *see* a resource, and that drives two
@@ -597,6 +760,14 @@ So `404` always means *you cannot see this*, which is equally true whether or no
 it exists. `403` only ever tells a caller something it already knew, which keeps
 ordinary permission errors diagnosable.
 
+**A resource named in a query string is still a resource.** `GET
+/v1/namespaces?parent=X` reads as a filter rather than as naming something, and
+it is the one request that reaches the backend without a resource in the path. It
+goes through the same guard a path does: without it, a parent that does not exist
+answers `404` while a parent belonging to another tenant answers `200` with an
+empty list — the page reveals nothing and the status code reveals everything, one
+guess at a time.
+
 **When debugging, `404` may mean "no `Read` grant".** If a table you know exists
 reports `404`, check for a missing `Read` permit before checking for a typo in the
 name.
@@ -625,7 +796,7 @@ with `\u{1F}`, not `.`. A policy naming `Namespace::"acme.analytics"` matches a
 namespace literally called `acme.analytics`, not the nested one.
 
 **An address-conditioned policy never matches.** Guard with `context has
-source_ip`, and check `trust_proxy_headers` if Rustberg runs behind a proxy —
+source_ip`, and set `[server] trusted_proxies` if Rustberg runs behind a proxy —
 without it the address is the proxy's, not the client's.
 
 **No credentials come back for one table.** Check whether a matching permit
@@ -636,6 +807,10 @@ credentialed. See [What an annotation actually does](#what-an-annotation-actuall
 action or attribute the schema does not define. This is deliberate: such a policy
 would otherwise never match, silently granting nothing (for a `permit`) or
 restricting nothing (for a `forbid`).
+
+**Every request to one resource is denied, and the log names a policy that
+"failed to evaluate".** See below — the policy typechecks but raises at run time,
+and the request is denied rather than decided without it.
 
 ---
 

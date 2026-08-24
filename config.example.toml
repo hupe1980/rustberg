@@ -14,6 +14,38 @@ host = "0.0.0.0"
 # Port to listen on
 port = 8000
 
+# Address ranges that are forwarding infrastructure rather than callers.
+#
+# Empty (the default) means no proxy is trusted: the caller's address is the TCP
+# peer and X-Forwarded-For is not read at all. That is the only correct setting
+# for a server that might be reachable directly.
+#
+# Behind a load balancer, name the subnet it runs in. The forwarding chain is
+# then walked from the *right* — X-Forwarded-For is appended to at each hop, so
+# reading it left to right believes whatever the client wrote. One setting, not
+# three: this same answer is the rate-limit bucket, `context.source_ip` in a
+# Cedar policy, and the address on an audit record.
+#
+# trusted_proxies = ["10.0.0.0/8"]
+
+# Seconds to keep serving after SIGTERM, before draining in-flight requests.
+#
+# Zero — the default — drains immediately, which is right wherever nothing routes
+# to this process but whoever started it.
+#
+# Behind a load balancer it is not. Taking an instance out of rotation and
+# signalling it happen at the same time, and the removal takes time to reach
+# whatever is still routing; a server that stops accepting the instant it is
+# signalled refuses what arrives in that window. In Kubernetes that is a handful
+# of connection errors on every rolling update.
+#
+# Done in-process rather than with a `preStop` hook that sleeps, because the
+# container image is distroless and has no shell to run one in. Applies to
+# SIGTERM only, never to Ctrl+C. Keep it comfortably below the orchestrator's own
+# grace period; the Helm chart sets both.
+#
+# shutdown_delay_seconds = 5
+
 # Authentication configuration
 [server.auth]
 # API key authentication
@@ -31,6 +63,41 @@ api_key_enabled = true
 # tenant  = "acme"
 # roles   = ["writer"]
 # key_env = "RUSTBERG_KEY_CI"
+
+# OIDC / JWT authentication. The primary path for human and workload identity,
+# and the one to use where you need revocation without a restart: token lifetime
+# then belongs to your identity provider.
+# jwt_enabled = true
+
+# [server.auth.jwt]
+# Naming the provider is enough. Rustberg reads
+# `{issuer}/.well-known/openid-configuration` to find the signing keys, and
+# checks that the document names this same issuer before trusting anything in
+# it. Discovery happens at the first token, so a provider that is unreachable at
+# boot does not stop the server starting.
+# issuer = "https://auth.example.com"
+#
+# A token is accepted when its `aud` matches any entry. More than one is
+# ordinary: an identity provider registers one client per application, so Spark,
+# Trino and a notebook are three audiences reaching one catalog. The list must
+# not be empty — an empty audience means "check nothing", which accepts every
+# token this issuer ever minted, for any service.
+# audiences = ["rustberg"]
+#
+# Set to skip discovery, for a provider with a non-standard document layout.
+# jwks_url = "https://auth.example.com/.well-known/jwks.json"
+#
+# Claims identity is read from. Both accept a dotted path into a nested object,
+# and the longest literal key wins, so a namespaced claim whose own name
+# contains dots resolves as itself. Nothing is synthesised: an absent roles
+# claim is no groups, because a default role is an assertion the identity
+# provider never made.
+# tenant_claim = "tenant_id"
+# roles_claim  = "realm_access.roles"
+#
+# Where clients should get a token. Advertised as `oauth2-server-uri` in
+# /v1/config, so a client configured with only a catalog URI can find it.
+# oauth2_server_uri = "https://auth.example.com/oauth/token"
 
 # Cedar policy file. When unset, the built-in default policies apply.
 # When set, the file REPLACES them; the defaults are not merged in.
@@ -77,6 +144,19 @@ catalog_url = "file:///var/lib/rustberg/data"
 # Accepts file://, s3://, gs:// and abfss:// depending on enabled features.
 # warehouse_location = "s3://my-bucket/warehouse"
 
+# --- Where a client may put a table's files ----------------------------------
+# How far inside the warehouse a client-supplied location may point. A security
+# boundary, not a layout preference.
+#
+#   "table"     (default) Under <warehouse>/<namespace>/<name>, the layout this
+#               catalog assigns anyway.
+#   "warehouse" Anywhere in the warehouse, for adopting a lake whose files are
+#               not where a name would put them. A caller permitted to write ONE
+#               table can then point it at any prefix in the warehouse and be
+#               handed a correctly-scoped credential for it.
+#
+# location_scope = "table"
+
 # --- Object storage ----------------------------------------------------------
 # How to reach the warehouse, by Iceberg property name. These configure the
 # FileIO every catalog in this process reads and writes metadata through.
@@ -117,12 +197,36 @@ catalog_url = "file:///var/lib/rustberg/data"
 [rate_limit]
 # Enable rate limiting (recommended for production)
 enabled = true
-# Maximum requests per second (per IP address)
+
+# Maximum requests per second, per client. The per-tenant allowance is ten times
+# this, because a tenant is many clients — a Spark cluster is fifty addresses and
+# one identity.
+#
+# "Per client" means per IPv4 address, and per IPv6 **/64**. A /64 is the
+# smallest allocation anyone receives, so it is the smallest unit that
+# corresponds to one customer; keying by full IPv6 address would hand an
+# attacker a fresh allowance for every one of 2^64 addresses, which is not a
+# limit at all.
+#
+# Which address a request came from is decided once, by `[server]
+# trusted_proxies` — not here. The rate-limit bucket, `context.source_ip` in a
+# Cedar policy, and the audit record all read that one answer.
 requests_per_second = 100
+
 # Burst size for rate limiter
 burst_size = 200
 
-# Authentication failure tracking
+# Authentication failure tracking.
+#
+# A "failure" is a credential that was *presented and rejected* — a wrong API
+# key, a JWT with a bad signature, an expired one, a malformed one. Verifying a
+# signature is the most expensive thing an unauthenticated caller can ask this
+# server to do, which is what this bounds.
+#
+# A request carrying no credential at all does **not** count: that is an
+# unconfigured client, and counting it would let a stray health checker lock out
+# everyone behind its address. Nor does a failure that is this server's own —
+# an unreachable identity provider is not the caller's to pay for.
 track_auth_failures = true
 # Maximum authentication failures before lockout
 max_auth_failures = 5
@@ -133,7 +237,7 @@ lockout_duration_seconds = 300
 # Logging Configuration
 # =============================================================================
 # Application logs go to **stderr**, so stdout stays a clean stream of audit
-# records (see [audit] below) and `rustberg serve | jq` works.
+# records (see [audit] below) and `rustberg | jq` works.
 [logging]
 # Verbosity. Either a bare level — "trace", "debug", "info", "warn", "error" —
 # or a full RUST_LOG filter such as "rustberg=debug,tower_http=info,warn".
@@ -161,8 +265,11 @@ sink = "stdout"
 # Required when sink = "file". A path that cannot be opened is a startup failure.
 # path = "/var/log/rustberg/audit.jsonl"
 
-# Refuse a mutating request whose record could not be written. Reads always
-# continue; the loss is counted.
+# Refuse a *permitted* mutation whose record could not be written, and with it a
+# granted write credential or a minted write signature: each is a change nothing
+# recorded. A denied mutation still answers with the denial — it changed nothing,
+# so there is no unrecorded change to refuse. Reads, authentication and rate
+# limiting always continue; the loss is counted either way.
 fail_closed = true
 
 # =============================================================================

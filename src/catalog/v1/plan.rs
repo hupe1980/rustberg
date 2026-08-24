@@ -43,8 +43,11 @@ use std::collections::{HashMap, HashSet};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use futures::TryStreamExt;
-use iceberg::spec::{DataContentType, DataFile, Datum, ManifestStatus, Schema, Struct, Type};
+use futures::{StreamExt, TryStreamExt};
+use iceberg::spec::{
+    DataContentType, DataFile, Datum, ManifestStatus, Schema, Struct, StructType, TableMetadata,
+    Type,
+};
 use iceberg::table::Table;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -54,7 +57,7 @@ use super::guard::{self, Target};
 use crate::app::AppState;
 use crate::auth::{Action, AuthenticatedPrincipal, Obligations, RequestFacts};
 use crate::error::{AppError, Result};
-use crate::predicate::parse_predicate;
+use crate::predicate::{CaseSensitivity, parse_policy_predicate, parse_predicate};
 
 /// Most files one plan may return.
 ///
@@ -154,11 +157,20 @@ pub async fn plan_table_scan(
     )
     .await?;
 
-    if !state.capabilities.scan_planning {
+    // Asked of the backend this namespace routes to, not of `state.capabilities`
+    // — which is the *intersection* `GET /v1/config` publishes. A refusal is
+    // per-request, so one read-only `rest` mount must remove planning from what
+    // this catalog advertises without removing it from the native tables beside
+    // it (§6.4).
+    if !state
+        .catalog
+        .capabilities_for(Some(&namespace))
+        .scan_planning
+    {
         return Err(AppError::NotSupported(
-            "This catalog federates a mount whose storage it does not manage, so it \
-             cannot read the manifests a scan plan is built from. Plan client-side \
-             against the metadata `loadTable` returns."
+            "This namespace is served by a mount whose storage this catalog does not \
+             manage, so it cannot read the manifests a scan plan is built from. Plan \
+             client-side against the metadata `loadTable` returns."
                 .to_string(),
         ));
     }
@@ -214,6 +226,46 @@ pub async fn fetch_planning_result(
     ))
 }
 
+/// `POST …/tables/{table}/tasks`
+///
+/// `fetchScanTasks` exchanges a `plan-task` for the file scan tasks it stands
+/// for. Rustberg never issues one — every plan is answered inline — so no
+/// `plan-task` this endpoint could be handed is one it produced.
+///
+/// Routed anyway, and for the same reason `GET …/plan/{plan-id}` is: a client
+/// that calls it should get the spec's own answer for an unknown task rather
+/// than a router `404` with no Iceberg error body, which a client reports as
+/// "the catalog does not implement the REST protocol" instead of "there is no
+/// such plan task".
+///
+/// # Errors
+///
+/// Always [`AppError::NoSuchPlanTask`], after the caller has been authorized —
+/// an unauthorized caller must not learn that a plan task is unknown either.
+pub async fn fetch_scan_tasks(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    RequestFacts(request): RequestFacts,
+    table: TablePath,
+) -> Result<Response> {
+    guard::authorize(
+        &state,
+        &principal,
+        &request,
+        table.namespace(),
+        Target::Table(table.name()),
+        Action::Read,
+    )
+    .await?;
+
+    Err(AppError::NoSuchPlanTask(
+        "This catalog completes every plan in the response to planTableScan and issues no \
+         plan-tasks, so there is no task to fetch. The file scan tasks are in the \
+         planTableScan response itself."
+            .to_string(),
+    ))
+}
+
 /// `DELETE …/plan/{plan-id}`
 ///
 /// Cancelling a plan that already completed is a no-op, and reporting it as one
@@ -265,6 +317,12 @@ async fn build_plan(
         _ => metadata.current_schema().clone(),
     };
 
+    // The client's `case-sensitive` flag governs *binding*, so it reaches the
+    // predicate reader as well as the scan builder. The policy filter binds the
+    // same way: a caller scanning case-insensitively and a policy filter refused
+    // for a case mismatch would be a restriction that silently stops applying.
+    let case = CaseSensitivity::from_flag(request.case_sensitive);
+
     // Validated before the empty-table shortcut below. A malformed filter must
     // be a `400` whether or not the table happens to hold data yet: accepting
     // one today and refusing it after the first commit is the worst possible
@@ -272,20 +330,23 @@ async fn build_plan(
     let requested = request
         .filter
         .as_ref()
-        .map(|json| parse_predicate(json, &schema))
+        .map(|json| parse_predicate(json, &schema, case))
         .transpose()
         .map_err(AppError::from)?;
 
     // What policy permits this caller to see, as a predicate. Permits grant, so
     // the matching filters are OR-ed; the scan is the conjunction of that and
     // whatever the client asked for.
-    let filter = match (requested, policy_predicate(obligations, &schema)?) {
+    let filter = match (requested, policy_predicate(obligations, &schema, case)?) {
         (Some(requested), Some(policy)) => Some(requested.and(policy)),
         (Some(only), None) | (None, Some(only)) => Some(only),
         (None, None) => None,
     };
 
-    let stats_fields = stats_field_ids(request.stats_fields.as_deref(), &schema, obligations)?;
+    refuse_masked_partition_columns(metadata, obligations)?;
+
+    let stats_fields =
+        stats_field_ids(request.stats_fields.as_deref(), &schema, case, obligations)?;
 
     // The residual carries the policy filter too, or a cooperating engine
     // applies only half of what the plan was built from — and the half it drops
@@ -315,21 +376,25 @@ async fn build_plan(
         None => scan.select_all(),
     };
 
+    // One more than the limit, and no further. Collecting the whole stream and
+    // then measuring it would make an unbounded scan an unbounded allocation —
+    // the refusal would arrive only after the memory it exists to avoid had
+    // already been taken.
     let tasks: Vec<iceberg::scan::FileScanTask> = scan
         .build()
         .map_err(AppError::from)?
         .plan_files()
         .await
         .map_err(AppError::from)?
+        .take(MAX_TASKS + 1)
         .try_collect()
         .await
         .map_err(AppError::from)?;
 
     if tasks.len() > MAX_TASKS {
         return Err(AppError::BadRequest(format!(
-            "This scan plans {} files, over this catalog's limit of {MAX_TASKS} for one \
-             response. Narrow the filter, or plan against a smaller snapshot.",
-            tasks.len()
+            "This scan plans more than this catalog's limit of {MAX_TASKS} files for one \
+             response. Narrow the filter, or plan against a smaller snapshot."
         )));
     }
 
@@ -357,10 +422,19 @@ async fn build_plan(
         read_manifest_files(table, snapshot, &wanted).await?
     };
 
+    let partition_types = partition_types(metadata);
+
     // Delete files first: a task references them by index into this list.
+    //
+    // Ordered, because `delete_paths` is a set: two identical requests must
+    // produce identical responses, or a client that caches or diffs a plan sees
+    // churn that is not in the table.
+    let mut ordered_deletes: Vec<&str> = delete_paths.iter().copied().collect();
+    ordered_deletes.sort_unstable();
+
     let mut delete_index: HashMap<String, usize> = HashMap::new();
     let mut delete_files = Vec::new();
-    for path in &delete_paths {
+    for path in &ordered_deletes {
         let (file, spec_id) = files.get(*path).ok_or_else(|| {
             AppError::Internal(format!(
                 "the scan referenced delete file '{path}', which is not in the snapshot's \
@@ -372,6 +446,7 @@ async fn build_plan(
             file,
             *spec_id,
             &schema,
+            &partition_types,
             stats_fields.as_ref(),
         )?);
     }
@@ -379,10 +454,14 @@ async fn build_plan(
     let mut file_scan_tasks = Vec::with_capacity(tasks.len());
     for task in &tasks {
         let data_file = match files.get(task.data_file_path.as_str()) {
-            Some((file, spec_id)) => {
-                content_file_json(file, *spec_id, &schema, stats_fields.as_ref())?
-            }
-            None => data_file_json_from_task(task)?,
+            Some((file, spec_id)) => content_file_json(
+                file,
+                *spec_id,
+                &schema,
+                &partition_types,
+                stats_fields.as_ref(),
+            )?,
+            None => data_file_json_from_task(task, &partition_types)?,
         };
 
         let mut entry = Map::new();
@@ -469,35 +548,129 @@ async fn read_manifest_files(
 /// The field ids to send statistics for, or `None` when the client asked for
 /// none.
 ///
+/// # The mask is matched on the resolved *full* name, and always case-insensitively
+///
+/// The field resolves with the request's own `case-sensitive` flag, like every
+/// other column reference in a plan — see [`CaseSensitivity`].
+///
+/// It is then compared by its **full dotted path**, because that is what a
+/// `@column_mask` names and what
+/// [`all_partition_source_columns`](crate::auth::filter_alignment::all_partition_source_columns)
+/// produces. `NestedField::name` carries the leaf only, so comparing it would
+/// miss `user.ssn` entirely while matching an unrelated top-level `ssn`.
+///
+/// The mask is then compared against the *resolved* schema name rather than what
+/// the client typed, and case-insensitively even under case-sensitive binding. A
+/// mask is a restriction, so the two error directions are not equal: withholding
+/// statistics for a column policy did not mean to mask costs a client one field
+/// it can ask for by its exact name, while publishing the bounds of a column
+/// policy *did* mask is the disclosure this exists to prevent. Matching the
+/// client's spelling instead would make `case-sensitive: false` a way around it.
+///
 /// # Errors
 ///
-/// [`AppError::BadRequest`] naming a field the schema does not have.
+/// [`AppError::BadRequest`] naming a field the schema does not have, or
+/// [`AppError::Forbidden`] naming one policy withholds.
 fn stats_field_ids(
     names: Option<&[String]>,
     schema: &Schema,
+    case: CaseSensitivity,
     obligations: &Obligations,
 ) -> Result<Option<HashSet<i32>>> {
     let Some(names) = names else { return Ok(None) };
 
     let mut ids = HashSet::new();
     for name in names {
-        // Statistics carry a column's minimum and maximum value, so sending
-        // them for a masked column publishes exactly what the mask hides.
-        if obligations.column_masks.contains(name) {
-            return Err(AppError::Forbidden(format!(
-                "Policy withholds the column '{name}', and its statistics would name its \
-                 minimum and maximum values."
-            )));
+        let field = match case {
+            CaseSensitivity::Sensitive => schema.field_by_name(name),
+            CaseSensitivity::Insensitive => schema.field_by_name_case_insensitive(name),
         }
-
-        let field = schema.field_by_name(name).ok_or_else(|| {
+        .ok_or_else(|| {
             AppError::BadRequest(format!(
                 "stats-fields names '{name}', which this table has no"
             ))
         })?;
+
+        // The **full** dotted path, not `NestedField::name`, which is the leaf
+        // only. A mask reads `user.ssn`, so comparing the leaf compares `ssn`
+        // and matches nothing — the statistics of a masked nested column would
+        // be published, which is the exact disclosure this check exists to stop.
+        // `column_masks` and `all_partition_source_columns` both speak full
+        // names, so this is the one spelling all three agree on.
+        let resolved = schema
+            .name_by_field_id(field.id)
+            .unwrap_or(field.name.as_str());
+
+        // Statistics carry a column's minimum and maximum value, so sending
+        // them for a masked column publishes exactly what the mask hides.
+        if is_masked(resolved, obligations) {
+            return Err(AppError::Forbidden(format!(
+                "Policy withholds the column '{resolved}', and its statistics would name \
+                 its minimum and maximum values."
+            )));
+        }
+
         ids.insert(field.id);
     }
     Ok(Some(ids))
+}
+
+/// Refuses a plan that could not be served without publishing a masked column.
+///
+/// # Why a plan cannot hide a partition column
+///
+/// For an ordinary column, gating `stats-fields` is enough: bounds are the only
+/// values a plan carries. A partition column leaks twice, and neither leak can
+/// be gated. Every content file carries its `partition` tuple, which the spec
+/// requires and which *is* the column's value for every row in that file; and
+/// Iceberg writes partition values into the object key, so
+/// `…/region=EU/00000-0-….parquet` names it again in the `file-path` the plan
+/// exists to hand over. Dropping the tuple leaves the path; dropping the path
+/// leaves no plan.
+///
+/// So the plan is refused, for the reason §8 refuses a credential and a
+/// signature for a restricted table: an answer that cannot carry the restriction
+/// is withheld rather than served with the restriction quietly missing. A mask
+/// over any other column plans normally.
+///
+/// Comparison is against the partition *source* column by full name, over every
+/// spec the table has, since a snapshot holds files written under specs it has
+/// evolved away from.
+///
+/// # Errors
+///
+/// [`AppError::Forbidden`] naming the column.
+fn refuse_masked_partition_columns(
+    metadata: &iceberg::spec::TableMetadata,
+    obligations: &Obligations,
+) -> Result<()> {
+    if obligations.column_masks.is_empty() {
+        return Ok(());
+    }
+
+    for column in crate::auth::filter_alignment::all_partition_source_columns(metadata) {
+        if is_masked(&column, obligations) {
+            return Err(AppError::Forbidden(format!(
+                "Policy withholds the column '{column}', and this table is partitioned on \
+                 it. Every file in a scan plan carries its partition values, and Iceberg \
+                 writes them into the object key as well, so a plan cannot be served \
+                 without publishing the column. Planning is refused rather than returning \
+                 what the mask exists to withhold."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether policy withholds a column, comparing without regard to case.
+///
+/// See [`stats_field_ids`] for why the comparison is deliberately looser than
+/// Iceberg's own name binding.
+fn is_masked(column: &str, obligations: &Obligations) -> bool {
+    obligations
+        .column_masks
+        .iter()
+        .any(|masked| masked.eq_ignore_ascii_case(column))
 }
 
 /// What policy permits this caller to see, as one predicate.
@@ -509,18 +682,27 @@ fn stats_field_ids(
 ///
 /// # Errors
 ///
-/// [`AppError::Forbidden`] when a filter cannot be bound to *this* table, most
-/// often because it names a column the table does not have. Refusing is the only
-/// safe answer: a filter that cannot be applied is a restriction that would
-/// silently not apply.
+/// [`AppError::Forbidden`] when a filter cannot be bound to *this* table — because
+/// it names a column the table does not have, a literal that does not fit one, or
+/// a term outside the grammar this catalog binds. Refusing is the only safe
+/// answer: a filter that cannot be applied is a restriction that would silently
+/// not apply.
+///
+/// Note the third case, which is why this parses with
+/// [`parse_policy_predicate`](crate::predicate::parse_policy_predicate) rather
+/// than the ordinary reader. A term the catalog cannot bind is *widened* in a
+/// client's filter, where a superset costs time and not correctness. Widening a
+/// restriction inverts it: an unbindable term becomes `AlwaysTrue`, and
+/// `@row_filter("region = 'EU'")` quietly becomes no filter at all.
 fn policy_predicate(
     obligations: &Obligations,
     schema: &iceberg::spec::SchemaRef,
+    case: CaseSensitivity,
 ) -> Result<Option<iceberg::expr::Predicate>> {
     let mut combined: Option<iceberg::expr::Predicate> = None;
 
     for filter in &obligations.row_filters {
-        let predicate = parse_predicate(filter, schema).map_err(|e| {
+        let predicate = parse_policy_predicate(filter, schema, case).map_err(|e| {
             AppError::Forbidden(format!(
                 "Policy attaches a row filter to this table that cannot be applied to it \
                  ({e}). Planning is refused rather than returning files the filter was \
@@ -564,10 +746,14 @@ fn residual_filter(requested: Option<&Value>, obligations: &Obligations) -> Opti
 // ============================================================================
 
 /// Encodes a `DataFile` in the spec's `ContentFile` shape.
+///
+/// `partition_types` maps a partition spec id to the tuple type its files carry;
+/// see [`partition_types`] for why the value's declared type is needed.
 fn content_file_json(
     file: &DataFile,
     spec_id: i32,
     schema: &Schema,
+    partition_types: &HashMap<i32, StructType>,
     stats_fields: Option<&HashSet<i32>>,
 ) -> Result<Value> {
     let mut out = Map::new();
@@ -588,7 +774,10 @@ fn content_file_json(
     out.insert("spec-id".to_string(), json!(spec_id));
     out.insert(
         "partition".to_string(),
-        Value::Array(partition_json(file.partition())?),
+        Value::Array(partition_json(
+            file.partition(),
+            partition_types.get(&spec_id),
+        )?),
     );
     out.insert(
         "file-size-in-bytes".to_string(),
@@ -664,7 +853,10 @@ fn content_file_json(
 ///
 /// The spec marks statistics optional, so a task without them is complete — and
 /// a client that wants them asks with `stats-fields`.
-fn data_file_json_from_task(task: &iceberg::scan::FileScanTask) -> Result<Value> {
+fn data_file_json_from_task(
+    task: &iceberg::scan::FileScanTask,
+    partition_types: &HashMap<i32, StructType>,
+) -> Result<Value> {
     let mut out = Map::new();
 
     out.insert("content".to_string(), json!("data"));
@@ -673,18 +865,15 @@ fn data_file_json_from_task(task: &iceberg::scan::FileScanTask) -> Result<Value>
         "file-format".to_string(),
         json!(task.data_file_format.to_string().to_lowercase()),
     );
-    out.insert(
-        "spec-id".to_string(),
-        json!(
-            task.partition_spec
-                .as_ref()
-                .map_or(0, |spec| spec.spec_id())
-        ),
-    );
+    let spec_id = task
+        .partition_spec
+        .as_ref()
+        .map_or(0, |spec| spec.spec_id());
+    out.insert("spec-id".to_string(), json!(spec_id));
     out.insert(
         "partition".to_string(),
         Value::Array(match task.partition.as_ref() {
-            Some(partition) => partition_json(partition)?,
+            Some(partition) => partition_json(partition, partition_types.get(&spec_id))?,
             None => Vec::new(),
         }),
     );
@@ -697,23 +886,72 @@ fn data_file_json_from_task(task: &iceberg::scan::FileScanTask) -> Result<Value>
     Ok(Value::Object(out))
 }
 
-/// Encodes partition values as the spec's ordered list of primitive values.
-fn partition_json(partition: &Struct) -> Result<Vec<Value>> {
-    partition
-        .iter()
-        .map(|literal| match literal {
-            Some(literal) => literal_json(literal),
-            None => Ok(Value::Null),
+/// The type of every partition tuple this snapshot's files can carry, by spec id.
+///
+/// # Why a partition value cannot be encoded from the literal alone
+///
+/// The spec serialises a value by its **declared type**, not by the shape of the
+/// bytes: a `date` is `"2023-01-08"` and not the day count the literal holds, a
+/// `time` and a `timestamp` are strings, a `decimal` is written with its scale,
+/// and a `uuid` is a UUID string rather than sixteen bytes of hex. Every one of
+/// those arrives here as `PrimitiveLiteral::Int`, `Long` or `Int128`, so a
+/// literal-only encoder emits a number where a client's parser wants a string —
+/// and `days(ts)` partitioning, the most common spec there is, hits it on every
+/// file.
+///
+/// The type is a property of the **partition spec**, so it is resolved once per
+/// plan and keyed by spec id: a snapshot holds files written under specs the
+/// table has since evolved away from, and each carries the tuple of its own.
+///
+/// A spec whose source column the current schema no longer has cannot be bound,
+/// and is simply absent here — [`partition_json`] then falls back to the untyped
+/// form rather than failing a plan over a column nobody asked about.
+fn partition_types(metadata: &TableMetadata) -> HashMap<i32, StructType> {
+    let schema = metadata.current_schema();
+    metadata
+        .partition_specs_iter()
+        .filter_map(|spec| match spec.partition_type(schema) {
+            Ok(fields) => Some((spec.spec_id(), fields)),
+            Err(e) => {
+                tracing::debug!(
+                    spec_id = spec.spec_id(),
+                    error = %e,
+                    "a partition spec cannot be bound to the current schema; its files' \
+                     partition values are encoded from the literal alone"
+                );
+                None
+            }
         })
         .collect()
 }
 
-/// Encodes one literal without knowing its declared type.
+/// Encodes partition values as the spec's ordered list of primitive values.
 ///
-/// A partition value's type comes from the partition spec's transform result,
-/// which is not on the `DataFile`. Encoding from the literal itself gives the
-/// same JSON for every type whose single-value form is its natural JSON —
-/// numbers, strings, booleans — and hex for the binary ones.
+/// `fields` is the partition tuple's declared type — see [`partition_types`] for
+/// why the literal is not enough on its own.
+fn partition_json(partition: &Struct, fields: Option<&StructType>) -> Result<Vec<Value>> {
+    let declared = fields.map(StructType::fields).unwrap_or_default();
+
+    partition
+        .iter()
+        .enumerate()
+        .map(|(index, literal)| match (literal, declared.get(index)) {
+            (None, _) => Ok(Value::Null),
+            (Some(literal), Some(field)) => literal
+                .clone()
+                .try_into_json(&field.field_type)
+                .map_err(AppError::from),
+            (Some(literal), None) => literal_json(literal),
+        })
+        .collect()
+}
+
+/// Encodes one literal whose declared type could not be resolved.
+///
+/// The fallback for the case [`partition_types`] describes. Correct for every
+/// type whose single-value form *is* its natural JSON — numbers, strings,
+/// booleans — and hex for the binary ones; the temporal and decimal types are
+/// the ones it cannot get right, which is why it is a fallback and not the path.
 fn literal_json(literal: &iceberg::spec::Literal) -> Result<Value> {
     use iceberg::spec::{Literal, PrimitiveLiteral};
 
@@ -801,4 +1039,186 @@ fn insert_value_map(
 /// Lowercase hex, which is how the spec serialises a binary single value.
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iceberg::spec::{Literal, NestedField, PrimitiveLiteral, PrimitiveType, Schema};
+
+    /// A table partitioned on a date, a timestamp and a decimal — the three
+    /// types whose JSON form is not the shape of the literal that carries them.
+    fn metadata() -> TableMetadata {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "d", Type::Primitive(PrimitiveType::Date)).into(),
+                NestedField::optional(2, "ts", Type::Primitive(PrimitiveType::Timestamp)).into(),
+                NestedField::optional(
+                    3,
+                    "amount",
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: 9,
+                        scale: 2,
+                    }),
+                )
+                .into(),
+            ])
+            .build()
+            .expect("schema builds");
+
+        let spec = iceberg::spec::UnboundPartitionSpec::builder()
+            .add_partition_field(1, "d".to_string(), iceberg::spec::Transform::Identity)
+            .expect("partition field")
+            .add_partition_field(2, "ts".to_string(), iceberg::spec::Transform::Identity)
+            .expect("partition field")
+            .add_partition_field(3, "amount".to_string(), iceberg::spec::Transform::Identity)
+            .expect("partition field")
+            .build();
+
+        iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            spec,
+            iceberg::spec::SortOrder::unsorted_order(),
+            "memory://wh/db/t".to_string(),
+            iceberg::spec::FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("metadata builds")
+        .build()
+        .expect("metadata builds")
+        .metadata
+    }
+
+    /// The tuple a file written under that spec carries: a day count, a
+    /// microsecond count, and an unscaled integer.
+    fn tuple() -> Struct {
+        Struct::from_iter([
+            Some(Literal::Primitive(PrimitiveLiteral::Int(19_723))),
+            Some(Literal::Primitive(PrimitiveLiteral::Long(
+                1_704_067_200_000_000,
+            ))),
+            Some(Literal::Primitive(PrimitiveLiteral::Int128(1_420))),
+        ])
+    }
+
+    /// The bug this encoding exists to avoid: the spec serialises a partition
+    /// value by its **declared type**, so a `date` is `"2024-01-01"` and not the
+    /// day count the literal holds. Encoding from the literal alone emits a
+    /// number where every client's parser wants a string — and `days(ts)`
+    /// partitioning hits it on every file of every table.
+    #[test]
+    fn partition_values_are_encoded_by_their_declared_type() {
+        let metadata = metadata();
+        let types = partition_types(&metadata);
+        let spec_id = metadata.default_partition_spec_id();
+
+        let encoded = partition_json(&tuple(), types.get(&spec_id)).expect("encodes");
+
+        assert_eq!(encoded[0], json!("2024-01-01"), "a date is a date string");
+        assert_eq!(
+            encoded[1],
+            json!("2024-01-01T00:00:00"),
+            "a timestamp is a timestamp string"
+        );
+        assert_eq!(
+            encoded[2],
+            json!("14.20"),
+            "a decimal carries its scale, not the unscaled integer"
+        );
+    }
+
+    /// The fallback, for a spec that cannot be bound to the current schema. It
+    /// is wrong for exactly the types above, which is why it is a fallback and
+    /// not the path — but a plan for the columns nobody asked about is better
+    /// than no plan at all.
+    #[test]
+    fn an_unbindable_spec_falls_back_to_the_literal() {
+        let encoded = partition_json(&tuple(), None).expect("encodes");
+        assert_eq!(encoded[0], json!(19_723));
+    }
+
+    /// A null partition value stays null whichever path encodes it.
+    #[test]
+    fn a_null_partition_value_is_null() {
+        let metadata = metadata();
+        let types = partition_types(&metadata);
+        let tuple = Struct::from_iter([None, None, None]);
+
+        let encoded = partition_json(&tuple, types.get(&metadata.default_partition_spec_id()))
+            .expect("encodes");
+        assert_eq!(encoded, vec![Value::Null, Value::Null, Value::Null]);
+    }
+
+    /// Every spec the table has ever had, not only the default: a snapshot holds
+    /// files written under specs it has since evolved away from, and each
+    /// carries the tuple of its own.
+    #[test]
+    fn every_partition_spec_is_resolved_not_only_the_default() {
+        let metadata = metadata();
+        let types = partition_types(&metadata);
+        assert_eq!(types.len(), metadata.partition_specs_iter().len());
+    }
+
+    fn nested_schema() -> Schema {
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(
+                    1,
+                    "user",
+                    Type::Struct(iceberg::spec::StructType::new(vec![
+                        NestedField::optional(2, "ssn", Type::Primitive(PrimitiveType::String))
+                            .into(),
+                    ])),
+                )
+                .into(),
+                NestedField::optional(3, "amount", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .expect("schema builds")
+    }
+
+    /// A `@column_mask` names a column by its **full** path, so the check has to
+    /// resolve one. `NestedField::name` is the leaf, so comparing it asks
+    /// whether `ssn` is masked when the policy said `user.ssn` — and the
+    /// statistics of a masked nested column, which are its minimum and maximum
+    /// value, would be published.
+    #[test]
+    fn statistics_for_a_masked_nested_column_are_refused() {
+        let schema = nested_schema();
+        let obligations = Obligations {
+            row_filters: Vec::new(),
+            column_masks: HashSet::from(["user.ssn".to_string()]),
+        };
+
+        let refused = stats_field_ids(
+            Some(&["user.ssn".to_string()]),
+            &schema,
+            CaseSensitivity::Sensitive,
+            &obligations,
+        );
+        assert!(
+            matches!(refused, Err(AppError::Forbidden(_))),
+            "statistics for a masked nested column must be refused, got {refused:?}"
+        );
+    }
+
+    /// And the mask must not reach a *different* column that happens to share
+    /// the leaf name.
+    #[test]
+    fn a_mask_on_a_nested_column_does_not_withhold_an_unrelated_one() {
+        let schema = nested_schema();
+        let obligations = Obligations {
+            row_filters: Vec::new(),
+            column_masks: HashSet::from(["user.ssn".to_string()]),
+        };
+
+        let allowed = stats_field_ids(
+            Some(&["amount".to_string()]),
+            &schema,
+            CaseSensitivity::Sensitive,
+            &obligations,
+        )
+        .expect("an unmasked column is served");
+        assert_eq!(allowed, Some(HashSet::from([3])));
+    }
 }

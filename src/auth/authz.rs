@@ -75,6 +75,34 @@ pub enum Action {
     Manage,
 }
 
+impl Action {
+    /// The name this action has in a Cedar policy.
+    ///
+    /// `Rustberg::Action::"Read"` is what an operator writes, so `Read` is what
+    /// an audit record naming a decision has to say — a record spelling it
+    /// `read` cannot be grepped against the policy file it came from, which is
+    /// the one thing somebody holding a denial record wants to do with it.
+    ///
+    /// Defined here rather than in the Cedar adapter because two callers read
+    /// it: the adapter builds the entity id from it, and the audit trail names
+    /// the action with it. One definition, so the two cannot disagree.
+    pub const fn cedar_name(&self) -> &'static str {
+        match self {
+            Action::Read => "Read",
+            Action::List => "List",
+            Action::Create => "Create",
+            Action::Update => "Update",
+            Action::Delete => "Delete",
+            Action::Manage => "Manage",
+        }
+    }
+}
+
+/// Lower-case, for prose: "Not permitted to update table 'x'".
+///
+/// Deliberately not [`Action::cedar_name`]. This one goes in a sentence and that
+/// one is an identifier, and the moment they were the same function one of the
+/// two uses read wrong.
 impl std::fmt::Display for Action {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -343,18 +371,29 @@ impl AuthzDecision {
 ///
 /// # What Rustberg does with them
 ///
-/// It refuses to hand out storage credentials. That is the honest limit of what
-/// a catalog can enforce: a catalog vends metadata pointers and credentials, and
-/// once an engine holds a file URL and a credential it reads every row and every
-/// column in that file. Filtering therefore cannot be enforced by *describing*
-/// it — only by not giving out the means to bypass it.
+/// Two things, and the difference between them is the whole of §4.5.
 ///
-/// So an obligation makes a table **undelegatable**: the request succeeds, the
-/// metadata is returned, and no credential is vended. Enforcing the filter
-/// itself needs server-side scan planning paired with remote signing, neither of
-/// which Rustberg implements. Declining to vend is the enforceable half, and it
-/// is chosen deliberately over vending a broad credential and calling the filter
-/// enforced.
+/// **It applies the row filter where a file-level decision can carry it.** A
+/// scan plan is built from the client's filter conjoined with what policy
+/// permits, so a restricted caller is told about fewer files, and the residual
+/// on every task carries both halves ([`plan`](crate::catalog::v1::plan)). That
+/// is selection performed, not merely reported — and it is enforcement only
+/// against a *cooperating* engine, because nothing makes an unplanned file
+/// unfetchable.
+///
+/// **And it refuses to hand out storage access.** That is the honest limit of
+/// what a catalog can enforce: once an engine holds a file URL and a credential
+/// it reads every row and every column in that file, so a filter cannot be
+/// enforced by *describing* it — only by not giving out the means to bypass it.
+/// An obligation therefore makes a table **undelegatable**: the request
+/// succeeds, the metadata is returned, and neither a vended credential nor a
+/// signature is issued for it. A plan that could not carry the restriction —
+/// a `@column_mask` over a partition column — is refused on the same rule.
+///
+/// Tying the two together, so that a signature covered only the files a plan
+/// named, is the one thing that would make this architectural rather than
+/// cooperative. What stops it is stated in the design's "what is not built", and
+/// it is a decision rather than an omission.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Obligations {
     /// Row filters, to be combined as a disjunction.
@@ -506,59 +545,19 @@ pub trait Authorizer: Send + Sync {
         None
     }
 
-    /// Decides `ctx`, discarding obligations.
+    /// Whether `ctx` is permitted, with no record written.
     ///
-    /// Only correct where obligations cannot apply — a namespace or catalog
-    /// resource, or a listing decision. For anything that hands out access to
-    /// table *data*, use [`authorize`](Self::authorize).
-    async fn authorize_ignoring_obligations(&self, ctx: &AuthzContext) -> AuthzDecision {
-        self.decide(ctx).await.decision
-    }
-
-    /// Authorizes `ctx`, auditing a denial, and returns the obligations.
+    /// For questions the *server* asks on its own behalf rather than on the
+    /// client's: "should this row appear in the listing?", "is this resource
+    /// visible at all, so that a denial can be reported as `404` rather than
+    /// `403`?" A denial there is an ordinary outcome and not a security event,
+    /// and one record per row scanned would bury the real ones.
     ///
-    /// # Errors
-    ///
-    /// Returns [`AuthError::Forbidden`] when no policy permits the request.
-    async fn authorize(&self, ctx: &AuthzContext) -> Result<Obligations> {
-        let AuthzOutcome {
-            decision,
-            obligations,
-            ..
-        } = self.decide(ctx).await;
-
-        if let AuthzDecision::Deny(reason) = decision {
-            use super::audit::log_authz_denied;
-            log_authz_denied(
-                ctx.principal.id(),
-                ctx.principal.tenant_id(),
-                &ctx.resource.resource_type.to_string(),
-                &ctx.resource.path(),
-                &ctx.action.to_string(),
-            );
-            return Err(AuthError::Forbidden(reason));
-        }
-
-        Ok(obligations)
-    }
-
-    /// Authorizes `ctx` and discards the obligations.
-    ///
-    /// For resources that carry none: namespaces, the catalog root, listings.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AuthError::Forbidden`] when no policy permits the request.
-    async fn check(&self, ctx: &AuthzContext) -> Result<()> {
-        self.authorize(ctx).await.map(|_| ())
-    }
-
-    /// Whether `ctx` is permitted, without auditing a denial.
-    ///
-    /// For speculative questions the caller asks on its own behalf rather than
-    /// on the client's — "may this principal also write?", "should this row
-    /// appear in the listing?" — where a denial is an ordinary outcome and not a
-    /// security event worth a record.
+    /// It is **not** for a question whose answer widens what the caller walks
+    /// away with. Deciding whether a vended credential may write, or whether a
+    /// signature covers a `DeleteObjects`, is a grant; those go through
+    /// [`Authorized::also_permits`](crate::catalog::v1::guard::Authorized::also_permits),
+    /// which records.
     async fn permits(&self, ctx: &AuthzContext) -> bool {
         self.decide(ctx).await.is_allowed()
     }
@@ -636,16 +635,16 @@ mod tests {
     #[tokio::test]
     async fn deny_all_refuses() {
         assert!(DenyAllAuthorizer.decide(&ctx()).await.decision.is_denied());
-        assert!(DenyAllAuthorizer.check(&ctx()).await.is_err());
         assert!(!DenyAllAuthorizer.permits(&ctx()).await);
     }
 
-    /// `authorize` returns the obligations rather than dropping them. Dropping
+    /// `decide` returns the obligations rather than dropping them. Dropping
     /// them is what made `@row_filter` silently ineffective.
     #[tokio::test]
-    async fn authorize_surfaces_obligations() {
-        let obligations = AllowAllAuthorizer.authorize(&ctx()).await.unwrap();
-        assert!(obligations.is_empty());
+    async fn decide_surfaces_obligations() {
+        let outcome = AllowAllAuthorizer.decide(&ctx()).await;
+        assert!(outcome.is_allowed());
+        assert!(outcome.obligations.is_empty());
     }
 
     // ── Context re-aiming ─────────────────────────────────────────────────

@@ -266,6 +266,53 @@ async fn a_policy_set_that_would_lock_the_author_out_is_refused() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// A grant conditioned on the caller's address is an ordinary rule — "policy is
+/// administered from inside the VPC". The self-lockout check has to ask whether
+/// the author can administer policy *as they are administering it now*, so it
+/// carries this request's context. Asking without one evaluates every
+/// address-conditioned permit to false and refuses a policy set that plainly
+/// works.
+#[tokio::test]
+async fn a_grant_conditioned_on_the_callers_address_is_not_mistaken_for_a_lockout() {
+    let (app, admin, _) = app_with_policies().await;
+
+    // In-process requests carry no address, so `context has source_ip` is false
+    // and this is the shape that must still be accepted: the guard has already
+    // permitted the call under the *current* rules, and under the new rules the
+    // same call is permitted for the same reason.
+    let address_guarded = r#"
+        permit(principal in Rustberg::Group::"admin", action, resource)
+          when { resource.tenant == principal.tenant };
+
+        forbid(
+          principal,
+          action == Rustberg::Action::"Manage",
+          resource
+        ) when {
+          context has source_ip && !context.source_ip.isInRange(ip("10.0.0.0/8"))
+        };
+    "#;
+
+    let (status, body) = send(
+        &app,
+        Method::PUT,
+        "/management/v1/policies",
+        &admin,
+        Some(json!({ "source": address_guarded })),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the author can still administer policy under these rules: {body}"
+    );
+
+    // And it really did take effect.
+    let (status, _) = send(&app, Method::GET, "/management/v1/policies", &admin, None).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
 // ── History and rollback ────────────────────────────────────────────────────
 
 #[tokio::test]

@@ -36,12 +36,82 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 
+/// Joins namespace levels inside a stored key, and separates a namespace from a
+/// name.
+///
+/// Re-exported from [`crate::names`] rather than defined here. Both backends
+/// have to agree on them character for character — the conformance tests assert
+/// the two page in the same order, and a per-file constant makes that assertion
+/// vacuous — and so do the four subsystems *outside* the registry that build the
+/// same string: the path a request arrives on, the Cedar entity id a policy
+/// names, the `rest` mount's wire path, and the signer endpoint. One definition,
+/// in the module that explains why a validated name can never contain either.
+pub use crate::names::{NAME_SEPARATOR, PART_SEPARATOR};
+
 use async_trait::async_trait;
 use iceberg::spec::ViewMetadata;
 use iceberg::table::Table;
 use iceberg::{
     Namespace, NamespaceIdent, Result, TableCreation, TableIdent, TableRequirement, TableUpdate,
 };
+
+use super::capabilities::Capabilities;
+
+/// Reports a stale v3 row-lineage assignment as the commit conflict it is.
+///
+/// # What goes wrong without this
+///
+/// Format version 3 gives every row an id. The table carries `next-row-id`, a
+/// writer stamps its snapshot with `first-row-id` taken from the metadata it
+/// read, and the commit advances the counter by the rows it added. Two writers
+/// that read the same metadata therefore stamp the *same* `first-row-id`, and
+/// the second one to arrive is stale.
+///
+/// That is a lost race, and the answer to a lost race is `409
+/// CommitFailedException`: the client refreshes, re-derives `first-row-id` from
+/// the new `next-row-id`, and commits again. `iceberg-rust`'s metadata builder
+/// catches the condition — correctly — but reports it as `DataInvalid`, which
+/// this server maps to `400`. A `400` says *your request is malformed*, and no
+/// client retries one. Concurrent writers on a v3 table would see their second
+/// write rejected permanently, with a message about row ids.
+///
+/// # Why the condition is re-checked here rather than the message re-read
+///
+/// Matching upstream's error text would break silently the first time it was
+/// reworded. The precondition is one comparison and is written in the spec, so
+/// it is asked directly. Upstream still enforces it either way — if this check
+/// ever drifted, the outcome would be the old `400`, not an unsafe accept.
+///
+/// # Errors
+///
+/// [`ErrorKind::CatalogCommitConflicts`] naming both row ids, or nothing when
+/// the commit is not a stale v3 snapshot.
+pub(crate) fn reject_stale_row_lineage(
+    ident: &TableIdent,
+    base: &iceberg::spec::TableMetadata,
+    updates: &[TableUpdate],
+) -> Result<()> {
+    if base.format_version() < iceberg::spec::FormatVersion::V3 {
+        return Ok(());
+    }
+
+    for update in updates {
+        if let TableUpdate::AddSnapshot { snapshot } = update
+            && let Some((first_row_id, _added)) = snapshot.row_range()
+            && first_row_id < base.next_row_id()
+        {
+            return Err(iceberg::Error::new(
+                iceberg::ErrorKind::CatalogCommitConflicts,
+                format!(
+                    "Commit conflict on table {ident}: the snapshot assigns row ids from                      {first_row_id}, but another writer has already taken them — this table                      is at {}. Refresh the table and commit again; the new snapshot must                      start at the table's current next-row-id.",
+                    base.next_row_id()
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
 
 /// Largest page a caller may ask for.
 ///
@@ -399,10 +469,35 @@ pub trait CatalogStore: Debug + Send + Sync {
         metadata: ViewMetadata,
     ) -> Result<(String, ViewMetadata)>;
 
-    /// Replaces a view's metadata, writing a new file and swapping the pointer.
+    /// Replaces a view's metadata, writing a new file and swapping the pointer
+    /// **only if** it still points where the caller last read.
+    ///
+    /// # Why the expected location is a parameter
+    ///
+    /// A view commit is a read-modify-write that spans this trait: the handler
+    /// loads the metadata, applies the updates the client sent, and hands back a
+    /// finished document. A table commit does not — it hands over
+    /// `(requirements, updates)` and the *store* reads the base, so its
+    /// compare-and-swap witnesses the same read the updates were applied to.
+    ///
+    /// Without this parameter a view store can only compare against a read of
+    /// its own, taken after the handler's. That is not a compare-and-swap, it is
+    /// a re-read: a commit landing between the handler's load and the store's
+    /// read is confirmed rather than detected, and the caller's updates
+    /// overwrite it. Invariant 2 says concurrent writers never lose an update,
+    /// and views are the path where that is easiest to get wrong precisely
+    /// because the pointer swap *looks* atomic on its own.
+    ///
+    /// So the witness travels with the request: this is the `metadata_location`
+    /// [`Self::load_view`] returned, and a store that finds anything else
+    /// answers [`ErrorKind::CatalogCommitConflicts`] so the client refreshes and
+    /// retries.
+    ///
+    /// [`ErrorKind::CatalogCommitConflicts`]: iceberg::ErrorKind::CatalogCommitConflicts
     async fn update_view(
         &self,
         view: &TableIdent,
+        expected_metadata_location: &str,
         metadata: ViewMetadata,
     ) -> Result<(String, ViewMetadata)>;
 
@@ -426,6 +521,42 @@ pub trait CatalogStore: Debug + Send + Sync {
     /// falls back to the server's. A federated mount over a remote catalog is
     /// the case: it stores nothing itself.
     async fn warehouse_for(&self, namespace: &NamespaceIdent) -> Option<String>;
+
+    /// Where this backend keeps `namespace`'s resources: `<warehouse>/<levels…>`.
+    ///
+    /// The counterpart to [`warehouse_for`](Self::warehouse_for), and it has to
+    /// route the same way. A mount's name is a segment of the namespace *here*
+    /// and not a segment of the path *there*, so a caller that built this prefix
+    /// from the federated namespace would bound a mounted table to
+    /// `…/prod/db/events` while the mount keeps it at `…/db/events` — and every
+    /// register into a mount would fail a check against a path nothing uses.
+    ///
+    /// `None` from a backend that stores nothing, which is a `rest` mount. It
+    /// refuses every write on capability grounds long before a location is
+    /// checked, so the caller falls back to this server's own layout rather than
+    /// inventing a bound for storage nobody here manages.
+    fn namespace_prefix_for(&self, namespace: &NamespaceIdent) -> Option<String>;
+
+    /// What this backend can do for `namespace`.
+    ///
+    /// Distinct from the set `GET /v1/config` publishes, which is the
+    /// **intersection** across every mount — the only promise a single
+    /// `endpoints` list can honestly make (see
+    /// [`capabilities`](super::capabilities)). A *refusal* is per-request, so a
+    /// handler asks this one: one read-only mount must remove an operation from
+    /// what the catalog advertises without removing it from the native tables
+    /// beside it.
+    ///
+    /// `None` asks about the backend as a whole rather than about one
+    /// namespace, which is what folding the advertised set needs. It is a
+    /// separate case rather than an empty [`NamespaceIdent`] because there is no
+    /// such value — `iceberg` refuses one — and because "every namespace" and
+    /// "this namespace" are genuinely different questions to a router.
+    ///
+    /// Synchronous, and deliberately: a capability is a fact the process
+    /// already holds, negotiated once at startup. A capability check that could
+    /// touch the network would be one more thing to fail on the request path.
+    fn capabilities_for(&self, namespace: Option<&NamespaceIdent>) -> Capabilities;
 
     /// Checks that the metadata store is reachable, for `/ready`.
     async fn storage_health_check(&self) -> Result<StorageHealthStatus>;
@@ -535,7 +666,12 @@ impl CatalogStore for UnreachableStore {
     async fn create_view(&self, _: &TableIdent, _: ViewMetadata) -> Result<(String, ViewMetadata)> {
         Self::down()
     }
-    async fn update_view(&self, _: &TableIdent, _: ViewMetadata) -> Result<(String, ViewMetadata)> {
+    async fn update_view(
+        &self,
+        _: &TableIdent,
+        _: &str,
+        _: ViewMetadata,
+    ) -> Result<(String, ViewMetadata)> {
         Self::down()
     }
     async fn drop_view(&self, _: &TableIdent) -> Result<()> {
@@ -546,6 +682,14 @@ impl CatalogStore for UnreachableStore {
     }
     async fn warehouse_for(&self, _: &NamespaceIdent) -> Option<String> {
         None
+    }
+    fn namespace_prefix_for(&self, _: &NamespaceIdent) -> Option<String> {
+        None
+    }
+    /// Everything, so a caller's refusal comes from the store being down rather
+    /// than from a capability that was never the reason.
+    fn capabilities_for(&self, _: Option<&NamespaceIdent>) -> Capabilities {
+        Capabilities::full()
     }
     async fn storage_health_check(&self) -> Result<StorageHealthStatus> {
         Ok(StorageHealthStatus::unhealthy("unreachable", "test double"))

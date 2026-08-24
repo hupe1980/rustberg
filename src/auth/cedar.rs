@@ -50,7 +50,12 @@ use super::authz::{
 use super::error::{AuthError, Result};
 
 /// Separator joining path segments inside an entity id.
-const SEP: char = '\u{1F}';
+///
+/// The same character the registries key on and the request path arrives with,
+/// and it has to be: an entity id a policy names is built from the same parts a
+/// request builds one from, so two spellings of this would make a policy cover a
+/// resource nobody can reach and miss the one it was written for.
+use crate::names::PART_SEPARATOR as SEP;
 
 /// Cedar schema for the catalog's entities and actions.
 ///
@@ -219,7 +224,7 @@ impl CedarAuthorizer {
                 ))
             })?;
 
-            crate::predicate::validate_shape(&json).map_err(|e| {
+            crate::predicate::validate_policy_filter(&json).map_err(|e| {
                 AuthError::Configuration(format!(
                     "policy '{}' has a @row_filter that is not a predicate: {e}",
                     policy.id()
@@ -248,60 +253,71 @@ impl CedarAuthorizer {
     /// Silent for the overwhelmingly common case of a policy set with no filters
     /// at all.
     fn warn_broad_permits(&self) {
-        let unannotated = self.broad_permits_over_restrictions();
-        if unannotated.is_empty() {
-            return;
+        for (restriction, unannotated) in self.broad_permits_over_restrictions() {
+            tracing::warn!(
+                restriction = %restriction,
+                unannotated_permits = ?unannotated,
+                policy_set_version = %self.policy_set_version,
+                "This policy set carries @{restriction} on some permits and not others. \
+                 Wherever one of the listed permits matches the same request as an annotated \
+                 one, the restriction is voided — permits grant, so an unannotated permit \
+                 contributes every row to the union of filters and withholds no column from \
+                 the intersection of masks. Check the listed permits against the annotated \
+                 ones."
+            );
         }
-
-        tracing::warn!(
-            unannotated_permits = ?unannotated,
-            policy_set_version = %self.policy_set_version,
-            "This policy set carries @row_filter or @column_mask on some permits and not \
-             others. Wherever an unannotated permit matches the same request as a restricted \
-             one, the restriction is voided and the caller sees every row and every column — \
-             permits grant, so an unrestricted permit wins over a filtered one and a permit \
-             withholding no column grants every column. Check the listed permits against the \
-             restricted ones."
-        );
     }
 
-    /// Unannotated permits, when this policy set also has restricted ones.
+    /// Unannotated permits, **per restriction kind**, when this policy set also
+    /// carries that kind somewhere.
     ///
     /// Empty when nothing can be voided: no annotations anywhere, or every
-    /// permit annotated. Separated from the warning so it can be asserted on
-    /// directly — a test that had to capture log output would be testing
-    /// `tracing`.
+    /// permit annotated with every kind in use. Separated from the warning so it
+    /// can be asserted on directly — a test that had to capture log output would
+    /// be testing `tracing`.
     ///
-    /// **Both** annotations count, because both are voided by the same shape of
-    /// policy set even though they compose in opposite directions. Row filters
-    /// are OR-ed, so an unannotated permit contributes "every row"; column masks
-    /// are intersected, so an unannotated permit contributes "withhold nothing".
-    /// Either way the restriction disappears, so warning about one and not the
-    /// other would leave the quieter half of the hazard unreported.
-    fn broad_permits_over_restrictions(&self) -> Vec<String> {
-        let mut annotated = 0usize;
-        let mut unannotated: Vec<String> = Vec::new();
+    /// # Why the kinds are counted separately
+    ///
+    /// They compose in opposite directions but are voided identically: row
+    /// filters are OR-ed, so an unannotated permit contributes "every row";
+    /// column masks are intersected, so an unannotated permit contributes
+    /// "withhold nothing". Either way the restriction disappears.
+    ///
+    /// Asking one question about both kinds together missed the most likely way
+    /// an operator hits this. Split the two restrictions across two permits —
+    /// one carrying `@row_filter`, the other `@column_mask`, which is how anyone
+    /// writing "EU rows, and hide `ssn`" naturally spells it — and *both* permits
+    /// look annotated. Each one is nonetheless unannotated for the *other's*
+    /// kind, so each voids the other, and the caller sees every row and every
+    /// column while the policy file reads as though it restricts both.
+    fn broad_permits_over_restrictions(&self) -> Vec<(&'static str, Vec<String>)> {
+        [ROW_FILTER_ANNOTATION, COLUMN_MASK_ANNOTATION]
+            .into_iter()
+            .filter_map(|restriction| {
+                let mut annotated = 0usize;
+                let mut unannotated: Vec<String> = Vec::new();
 
-        for policy in self.policies.policies() {
-            // Only permits compose this way. A `forbid` restricts regardless of
-            // whether it is annotated, so it can never void a restriction.
-            if policy.effect() != cedar_policy::Effect::Permit {
-                continue;
-            }
-            let restricted = policy.annotation(ROW_FILTER_ANNOTATION).is_some()
-                || policy.annotation(COLUMN_MASK_ANNOTATION).is_some();
-            if restricted {
-                annotated += 1;
-            } else {
-                unannotated.push(policy.id().to_string());
-            }
-        }
+                for policy in self.policies.policies() {
+                    // Only permits compose this way. A `forbid` restricts
+                    // regardless of whether it is annotated, so it can never
+                    // void a restriction.
+                    if policy.effect() != cedar_policy::Effect::Permit {
+                        continue;
+                    }
+                    if policy.annotation(restriction).is_some() {
+                        annotated += 1;
+                    } else {
+                        unannotated.push(policy.id().to_string());
+                    }
+                }
 
-        if annotated == 0 {
-            return Vec::new();
-        }
-        unannotated.sort();
-        unannotated
+                if annotated == 0 || unannotated.is_empty() {
+                    return None;
+                }
+                unannotated.sort();
+                Some((restriction, unannotated))
+            })
+            .collect()
     }
 
     /// Whether the policy set contains no policies at all.
@@ -335,14 +351,7 @@ impl CedarAuthorizer {
     }
 
     fn action_uid(action: &Action) -> Result<EntityUid> {
-        let name = match action {
-            Action::Read => "Read",
-            Action::List => "List",
-            Action::Create => "Create",
-            Action::Update => "Update",
-            Action::Delete => "Delete",
-            Action::Manage => "Manage",
-        };
+        let name = action.cedar_name();
         let type_name = EntityTypeName::from_str("Rustberg::Action")
             .map_err(|e| AuthError::Internal(format!("Invalid action type: {e}")))?;
         Ok(EntityUid::from_type_name_and_id(
@@ -503,6 +512,47 @@ impl CedarAuthorizer {
             .map(|id| id.to_string())
             .collect();
 
+        // A policy that fails to *evaluate* is a policy Cedar skipped.
+        //
+        // This is the one place where "deny by default, including on evaluation
+        // error" has to be implemented rather than inherited. Cedar's contract
+        // is that an erroring policy contributes nothing and is reported here,
+        // not that the request is denied — so a `forbid` whose condition raises
+        // is silently not applied, and a request the operator wrote a rule to
+        // stop is decided by whatever `permit` still stands.
+        //
+        // Load-time validation does not close it. The validator types
+        // expressions and refuses some of the constructors that could raise, but
+        // `Long` arithmetic typechecks and overflows at run time.
+        //
+        // Loud rather than sampled: such a policy is not doing its job on every
+        // request that reaches it.
+        let errors: Vec<String> = response
+            .diagnostics()
+            .errors()
+            .map(|error| error.to_string())
+            .collect();
+        if !errors.is_empty() {
+            tracing::error!(
+                errors = ?errors,
+                resource = %ctx.resource.path(),
+                action = %ctx.action,
+                policy_set_version = %self.policy_set_version,
+                "A policy failed to evaluate. Cedar skips such a policy, so a forbid that \
+                 errors would not have been applied; denying instead."
+            );
+            return Ok(AuthzOutcome {
+                decision: AuthzDecision::Deny(format!(
+                    "A policy failed to evaluate for '{}' on '{}', so this request is denied \
+                     rather than decided by the rules that did evaluate.",
+                    ctx.action,
+                    ctx.resource.path()
+                )),
+                obligations: Obligations::default(),
+                matched_policies,
+            });
+        }
+
         match response.decision() {
             Decision::Allow => Ok(AuthzOutcome {
                 decision: AuthzDecision::Allow,
@@ -637,19 +687,23 @@ impl CedarAuthorizer {
             match self.policies.annotation(id, ROW_FILTER_ANNOTATION) {
                 // Validated at load, so this cannot fail here — and if it
                 // somehow did, treating the filter as absent would *widen* the
-                // grant. Skipping the permit's contribution is the safe
+                // grant. Dropping the permit's row contribution is the safe
                 // direction: the caller keeps whatever the other permits allow.
+                //
+                // Only the *row* contribution: the two restrictions are
+                // independent and are read independently. Skipping the rest of
+                // the loop body here would drop this permit out of the mask
+                // intersection as well, and that error runs in the *safe*
+                // direction — an intersection over fewer sets withholds more —
+                // so nothing would report it.
                 Some(filter) => match serde_json::from_str(filter) {
                     Ok(predicate) => row_filters.push(predicate),
-                    Err(e) => {
-                        tracing::error!(
-                            policy = %id,
-                            error = %e,
-                            "A @row_filter that passed validation no longer parses; \
-                             ignoring this permit's grant"
-                        );
-                        continue;
-                    }
+                    Err(e) => tracing::error!(
+                        policy = %id,
+                        error = %e,
+                        "A @row_filter that passed validation no longer parses; ignoring \
+                         this permit's row grant"
+                    ),
                 },
                 // An unannotated permit grants every row, and union with
                 // "unrestricted" is unrestricted.
@@ -658,8 +712,25 @@ impl CedarAuthorizer {
 
             match self.policies.annotation(id, COLUMN_MASK_ANNOTATION) {
                 Some(mask) => {
+                    // Empty entries are dropped rather than becoming a column
+                    // named "". `@column_mask("")` and a trailing comma are both
+                    // things an operator writes, and a mask on a column no table
+                    // has would make every table look restricted — refused a
+                    // credential and a signature — for no reason anyone could
+                    // find in the policy file.
+                    let columns: HashSet<String> = mask
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|column| !column.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    if columns.is_empty() {
+                        unmasked_permits.push(id.to_string());
+                        mask_sets.push(HashSet::new());
+                        continue;
+                    }
                     any_mask = true;
-                    mask_sets.push(mask.split(',').map(|c| c.trim().to_string()).collect());
+                    mask_sets.push(columns);
                 }
                 // A permit that withholds nothing grants every column, and
                 // the intersection with the empty set is empty — exactly as
@@ -983,7 +1054,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             mixed.broad_permits_over_restrictions(),
-            vec!["policy1".to_string()],
+            vec![("row_filter", vec!["policy1".to_string()])],
             "the unannotated permit is the one that voids"
         );
 
@@ -1013,6 +1084,79 @@ mod tests {
         )
         .unwrap();
         assert!(all_filtered.broad_permits_over_restrictions().is_empty());
+    }
+
+    /// The shape an operator reaches for first, and the one a single combined
+    /// check missed: "EU rows, and hide `ssn`" written as two permits.
+    ///
+    /// Each permit is annotated — so neither looks broad — yet each is
+    /// *unannotated for the other's kind*, and permits grant. The row filter is
+    /// voided by the mask permit and the mask by the filter permit, leaving a
+    /// caller who sees every row and every column while the policy file reads as
+    /// though it restricts both.
+    #[test]
+    fn two_permits_carrying_different_restrictions_void_each_other() {
+        let authz = CedarAuthorizer::new(
+            r#"
+            @row_filter("{\"type\":\"eq\",\"term\":\"region\",\"value\":\"EU\"}")
+            permit(
+              principal in Rustberg::Group::"analysts",
+              action == Rustberg::Action::"Read",
+              resource in Rustberg::Tenant::"acme"
+            );
+            @column_mask("ssn")
+            permit(
+              principal in Rustberg::Group::"analysts",
+              action == Rustberg::Action::"Read",
+              resource in Rustberg::Tenant::"acme"
+            );"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            authz.broad_permits_over_restrictions(),
+            vec![
+                ("row_filter", vec!["policy1".to_string()]),
+                ("column_mask", vec!["policy0".to_string()]),
+            ],
+            "each permit is unannotated for the other's restriction, and must be named"
+        );
+
+        let outcome = authz
+            .evaluate(&table_ctx("acme", &["ns"], "t", Action::Read))
+            .unwrap();
+        assert!(outcome.decision.is_allowed());
+        assert!(
+            outcome.obligations.is_empty(),
+            "both restrictions really are voided; the warning is not a false alarm"
+        );
+    }
+
+    /// A mask naming nothing must not become a mask on a column called "".
+    ///
+    /// It would make every table look restricted — refused a credential and a
+    /// signature — for a reason nobody could find in the policy file.
+    #[test]
+    fn an_empty_column_mask_restricts_nothing() {
+        for annotation in [r#"@column_mask("")"#, r#"@column_mask(" , ")"#] {
+            let authz = CedarAuthorizer::new(&format!(
+                r#"{annotation}
+                   permit(
+                     principal in Rustberg::Group::"analysts",
+                     action == Rustberg::Action::"Read",
+                     resource in Rustberg::Tenant::"acme"
+                   );"#
+            ))
+            .unwrap();
+
+            let outcome = authz
+                .evaluate(&table_ctx("acme", &["ns"], "t", Action::Read))
+                .unwrap();
+            assert!(
+                outcome.obligations.is_empty(),
+                "{annotation} names no column, so it withholds none"
+            );
+        }
     }
 
     /// A `forbid` is not a permit and never voids a filter.
@@ -1191,7 +1335,7 @@ mod tests {
 
         assert_eq!(
             authz.broad_permits_over_restrictions(),
-            vec!["policy1".to_string()],
+            vec![("column_mask", vec!["policy1".to_string()])],
             "a policy set that can void a mask has the same shape as one that can void a filter"
         );
 
@@ -1266,54 +1410,47 @@ mod tests {
     /// failure, so publishing one hands the reader a server that will not boot —
     /// and a `permit` that silently never matches is worse still.
     ///
-    /// Covers every documentation file, not just `authorization.md`: an invalid
-    /// policy in any page is one a reader will copy.
+    /// # The file list is discovered, not written down
+    ///
+    /// The failure mode is a page nobody remembered to add to a list, so there
+    /// is no list: this walks the docs directory, as
+    /// `documented_toml_matches_the_schema` does, and a page added later is
+    /// covered without anyone remembering.
     #[test]
     fn every_documented_policy_validates() {
-        // Each file is listed explicitly: `include_str!` needs a literal path, and
-        // an explicit list means adding a page with policies is a deliberate act.
-        let docs: &[(&str, &str)] = &[
-            (
-                "site/content/docs/authorization.md",
-                include_str!("../../site/content/docs/authorization.md"),
-            ),
-            (
-                "site/content/docs/security.md",
-                include_str!("../../site/content/docs/security.md"),
-            ),
-            (
-                "site/content/docs/authentication.md",
-                include_str!("../../site/content/docs/authentication.md"),
-            ),
-            (
-                "site/content/docs/configuration.md",
-                include_str!("../../site/content/docs/configuration.md"),
-            ),
-            (
-                "site/content/docs/getting-started.md",
-                include_str!("../../site/content/docs/getting-started.md"),
-            ),
-            (
-                "site/content/docs/kubernetes.md",
-                include_str!("../../site/content/docs/kubernetes.md"),
-            ),
-            (
-                "site/content/docs/architecture.md",
-                include_str!("../../site/content/docs/architecture.md"),
-            ),
-            ("README.md", include_str!("../../README.md")),
-            ("CONCEPT.md", include_str!("../../CONCEPT.md")),
-        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        let mut files: Vec<std::path::PathBuf> =
+            std::fs::read_dir(root.join("site").join("content").join("docs"))
+                .expect("read the documentation directory")
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| path.extension().is_some_and(|e| e == "md"))
+                .collect();
+        files.push(root.join("README.md"));
+        // The design document, which is not part of the published tree and may
+        // simply not be here. Skipped when absent rather than required, like the
+        // optional sources `documented_toml_matches_the_schema` reads.
+        files.push(root.join("CONCEPT.md"));
+        files.sort();
 
         let mut checked = 0;
-        for (path, doc) in docs {
-            for block in cedar_blocks(doc) {
+        for path in &files {
+            let Ok(doc) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let name = path
+                .strip_prefix(root)
+                .unwrap_or(path.as_path())
+                .display()
+                .to_string();
+
+            for block in cedar_blocks(&doc) {
                 // Schema blocks declare entities and actions; they are not policies.
                 if !block.contains("permit(") && !block.contains("forbid(") {
                     continue;
                 }
                 CedarAuthorizer::new(block).unwrap_or_else(|e| {
-                    panic!("policy in {path} does not validate: {e}\n---\n{block}")
+                    panic!("policy in {name} does not validate: {e}\n---\n{block}")
                 });
                 checked += 1;
             }
@@ -1591,6 +1728,43 @@ mod tests {
 
     /// `decide` is the required method and must carry obligations through, since
     /// dropping them is exactly the bug this trait shape exists to prevent.
+    /// Cedar's contract is that a policy which *errors* contributes nothing and
+    /// is reported in the diagnostics — not that the request is denied. So a
+    /// `forbid` whose condition raises is simply not applied, and without the
+    /// check in `evaluate` the request it was written to stop is allowed.
+    ///
+    /// Cedar's validator closes some of this class — it refuses an extension
+    /// constructor over a non-literal, so `ip(principal.tenant)` never loads —
+    /// but not the arithmetic: `Long` addition typechecks and overflows at run
+    /// time. That is the shape of the whole class. Well-typed, load-validated,
+    /// and fatal only once a request reaches it.
+    #[tokio::test]
+    async fn a_forbid_that_cannot_evaluate_denies_rather_than_being_skipped() {
+        let authz = CedarAuthorizer::new(
+            r#"permit(
+                 principal,
+                 action == Rustberg::Action::"Read",
+                 resource in Rustberg::Tenant::"acme"
+               );
+               forbid(
+                 principal,
+                 action == Rustberg::Action::"Read",
+                 resource in Rustberg::Tenant::"acme"
+               ) when { context.utc_hour + 9223372036854775807 + 9223372036854775807 > 0 };"#,
+        )
+        .expect("both policies typecheck against the schema");
+
+        let outcome = authz
+            .decide(&table_ctx("acme", &["ns"], "t", Action::Read))
+            .await;
+
+        assert!(
+            !outcome.decision.is_allowed(),
+            "a forbid Cedar could not evaluate was skipped, so the permit decided the \
+             request — evaluation error must deny"
+        );
+    }
+
     #[tokio::test]
     async fn decide_carries_obligations_through_the_trait() {
         let authz = CedarAuthorizer::new(
@@ -1617,11 +1791,6 @@ mod tests {
             "obligations were dropped crossing the trait boundary"
         );
 
-        // And through `authorize`, which is what the handlers call.
-        let obligations = authz
-            .authorize(&table_ctx("acme", &["ns"], "t", Action::Read))
-            .await
-            .unwrap();
         assert_eq!(
             obligations.row_filters,
             vec![serde_json::json!({ "type": "eq", "term": "region", "value": "EU" })]

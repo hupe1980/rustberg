@@ -21,18 +21,29 @@
   kubectl --namespace {{ .Release.Namespace }} port-forward $POD_NAME 8080:$CONTAINER_PORT
 {{- end }}
 
-2. Verify the catalog is healthy:
-  curl http://<RUSTBERG_URL>/health
-  curl http://<RUSTBERG_URL>/ready
+2. Verify the catalog is healthy. These carry no credential — along with
+   /metrics, they are the only endpoints that do not, which is what makes them
+   usable as probes and as a scrape target:
+  curl http://<RUSTBERG_URL>/health   # the process is up
+  curl http://<RUSTBERG_URL>/ready    # the catalog and warehouse are usable
 
-3. List namespaces:
-  curl http://<RUSTBERG_URL>/v1/namespaces
+3. Get a credential. Authentication is on by default, so every /v1 call below
+   needs one and an anonymous request answers 401. With no API keys or OIDC
+   configured, the pod mints a temporary admin key at startup and logs it:
 
-4. Configure your Iceberg client:
+  kubectl logs --namespace {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "rustberg.name" . }}" | grep X-API-Key
+
+   That key lives in memory, so a restart mints a new one. Configure
+   `[[server.auth.api_keys]]` or OIDC in `rustberg.config` before relying on it.
+
+4. List namespaces:
+  curl -H "X-API-Key: $RUSTBERG_KEY" http://<RUSTBERG_URL>/v1/namespaces
+
+5. Configure your Iceberg client:
 
    # PyIceberg
    from pyiceberg.catalog import load_catalog
-   catalog = load_catalog("rustberg", uri="http://<RUSTBERG_URL>")
+   catalog = load_catalog("rustberg", uri="http://<RUSTBERG_URL>", token="$RUSTBERG_KEY")
 
    # Spark
    spark.sql("CREATE CATALOG rustberg USING iceberg WITH ('catalog-impl'='org.apache.iceberg.rest.RESTCatalog', 'uri'='http://<RUSTBERG_URL>')")

@@ -315,11 +315,38 @@ jobs:
           tags: rustberg:test
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # `--version` and `--help` prove the binary links. They do not prove the
+      # image *starts*, which is a different question and the one that was
+      # wrong: production mode refuses to run without an explicit catalog
+      # location, so the image's own documented `docker run` exited immediately
+      # while this job stayed green. The smoke test now starts a container the
+      # way the README tells a reader to and waits for it to report ready.
       - name: Test Docker image
         run: |
+          set -euo pipefail
           docker buildx build --platform linux/amd64 --load -t rustberg:test-amd64 .
           docker run --rm rustberg:test-amd64 --version
           docker run --rm rustberg:test-amd64 --help
+
+          docker run -d --name rustberg-smoke -p 8000:8000 \
+            -e RUSTBERG_INSECURE_HTTP=true rustberg:test-amd64
+          # The image's own HEALTHCHECK is what a compose file and a swarm read,
+          # so waiting on it tests the probe as well as the server.
+          for _ in $(seq 1 30); do
+            state=$(docker inspect -f '{{.State.Health.Status}}' rustberg-smoke)
+            [ "$state" = "healthy" ] && break
+            [ "$state" = "unhealthy" ] && break
+            sleep 2
+          done
+          docker logs rustberg-smoke
+          test "$(docker inspect -f '{{.State.Health.Status}}' rustberg-smoke)" = healthy
+          # Authentication is on by default, so the catalog API answers 401 to
+          # an anonymous caller. That is the assertion: a *401* proves the
+          # router is serving, where a connection refused or a 500 would not.
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/v1/config)
+          echo "GET /v1/config -> $code"
+          test "$code" = 401
+          docker rm -f rustberg-smoke
 
   # Advisories, licences, bans and sources, all from `deny.toml` — one policy
   # file and one ignore list, rather than an audit action checking a subset of
@@ -331,6 +358,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
+          # Explicit rather than relying on the action's default, because the
+          # `bans` list in deny.toml is what enforces "no OpenSSL under any
+          # feature combination" — and it can only do that over a graph that
+          # includes the optional dependencies.
+          arguments: --all-features
           command: check advisories bans licenses sources
 
   helm-lint:

@@ -1,217 +1,203 @@
-//! Audit logging for security-relevant events.
+//! The record one security-relevant event produces.
 //!
-//! This module provides structured audit logging for authentication,
-//! authorization, and data access events. Audit logs are essential for:
+//! This module defines the *shape* of a record. Where records go, and what
+//! happens when they cannot get there, is [`audit_sink`](super::audit_sink).
 //!
-//! - Security monitoring and incident response
-//! - Compliance requirements (SOC 2, GDPR, HIPAA)
-//! - Forensic analysis
+//! # Every record goes to the sink
 //!
-//! # Event Types
+//! A record is written through [`Auditor`](super::Auditor) or it does not
+//! exist. Nothing here emits one on its own, and in particular nothing emits one
+//! through `tracing`: a macro returns `()`, so a record written that way cannot
+//! report that it was lost, and records on stderr are missing from the file a
+//! deployment configured.
 //!
-//! The audit system captures several categories of events:
+//! # What is recorded
 //!
-//! - **Authentication**: Login attempts, API key usage, token validation
-//! - **Authorization**: Permission checks, access denials
-//! - **Data Access**: Namespace/table operations (create, read, update, delete)
-//! - **Admin Operations**: API key management, configuration changes
+//! Five things, one per [`AuditAction`]. The list is closed: a variant nothing
+//! emits is a claim about the trail that reading the trail disproves.
 //!
-//! # Output Format
+//! | Action | Emitted by | Fails the request if unrecordable |
+//! |---|---|---|
+//! | [`Authenticate`](AuditAction::Authenticate) | the auth middleware | no |
+//! | [`Decision`](AuditAction::Decision) | [`guard`](crate::catalog::v1::guard) | for a permitted mutation |
+//! | [`VendCredentials`](AuditAction::VendCredentials) | `loadTable`, `/credentials` | when a write credential was granted |
+//! | [`SignRequest`](AuditAction::SignRequest) | `/sign` | when a write signature was minted |
+//! | [`RateLimit`](AuditAction::RateLimit) | the auth middleware | no |
 //!
-//! Audit events are emitted as structured JSON logs compatible with:
-//! - Splunk
-//! - Elasticsearch/OpenSearch
-//! - AWS CloudWatch
-//! - Google Cloud Logging
-//! - Azure Monitor
+//! Every "yes" in that column is a grant that happened. Handing an engine a
+//! credential that can `PutObject`, or signing a `DeleteObjects`, changes what
+//! the world can do with the warehouse, so losing the record and keeping the
+//! grant is the same trade as losing a commit record and keeping the commit.
 //!
 //! # Example
 //!
 //! ```
-//! use rustberg::auth::audit::{AuditEvent, AuditOutcome, AuditAction};
+//! use rustberg::auth::{AuditEvent, Auditor};
 //!
-//! // Log an authentication event
-//! AuditEvent::authentication(AuditAction::ApiKeyAuth)
-//!     .with_principal_id("user-123")
-//!     .with_client_ip("192.168.1.1")
-//!     .with_outcome(AuditOutcome::Success)
-//!     .with_detail("api_key", "rb_xxx...xxx")
-//!     .emit();
+//! let auditor = Auditor::disabled();
+//! auditor.record_lossy(
+//!     &AuditEvent::authentication("api_key", true).with_principal_id("svc-etl"),
+//! );
 //! ```
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
 use uuid::Uuid;
 
 // ============================================================================
 // Audit Event Types
 // ============================================================================
 
-/// Category of audit event.
+/// Which subsystem produced a record.
+///
+/// Coarse on purpose: it exists so a pipeline can route or retain the four
+/// streams differently, not to classify events finely. [`AuditAction`] is the
+/// field that says what happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditCategory {
-    /// Authentication events (login, API key validation).
+    /// A caller presented a credential.
     Authentication,
-    /// Authorization events (permission checks).
+    /// A policy decision was made about a resource.
     Authorization,
-    /// Data access events (CRUD operations).
-    DataAccess,
-    /// Administrative operations.
-    Admin,
-    /// System events (startup, shutdown, errors).
+    /// Access to the object store was handed out, or withheld.
+    StorageAccess,
+    /// Something the server did that was not a request.
     System,
 }
 
-/// Specific action within an audit category.
+/// What happened.
+///
+/// One variant per event this server actually emits. See the module docs for
+/// why the list is closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditAction {
-    // Authentication actions
-    /// API key authentication attempt.
-    ApiKeyAuth,
-    /// OAuth token validation.
-    TokenAuth,
-    /// Session creation.
-    SessionCreate,
-    /// Session termination.
-    SessionDestroy,
-
-    // Authorization actions
-    /// Permission check.
-    PermissionCheck,
-    /// Access denied.
-    AccessDenied,
-
-    // Data access actions
-    /// Namespace created.
-    NamespaceCreate,
-    /// Namespace read/listed.
-    NamespaceRead,
-    /// Namespace updated.
-    NamespaceUpdate,
-    /// Namespace deleted.
-    NamespaceDelete,
-    /// Table created.
-    TableCreate,
-    /// Table read/loaded.
-    TableRead,
-    /// Table updated/committed.
-    TableUpdate,
-    /// Table deleted.
-    TableDelete,
-    /// Table renamed.
-    TableRename,
-
-    // Admin actions
-    /// API key created.
-    ApiKeyCreate,
-    /// API key revoked.
-    ApiKeyRevoke,
-    /// API key disabled.
-    ApiKeyDisable,
-    /// Configuration changed.
-    ConfigChange,
-
-    // System actions
-    /// Service started.
-    ServiceStart,
-    /// Service stopped.
-    ServiceStop,
-    /// Rate limit triggered.
-    RateLimitTriggered,
-    /// Security alert.
-    SecurityAlert,
+    /// A credential was presented and accepted, or rejected.
+    Authenticate,
+    /// A policy decision was made. [`AuditEvent::operation`] names the action.
+    Decision,
+    /// A storage credential was vended, withheld, or could not be obtained.
+    VendCredentials,
+    /// A storage request was signed, or refused.
+    SignRequest,
+    /// A request was refused by a rate limit.
+    RateLimit,
 }
 
-/// Outcome of the audited action.
+/// How the audited event turned out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditOutcome {
-    /// Action succeeded.
+    /// It was permitted, and it worked.
     Success,
-    /// Action failed due to error.
+    /// Policy permitted it, and it failed anyway — a credential exchange that
+    /// the cloud provider refused, for instance. Distinct from `Denied`,
+    /// because one is a policy question and the other is an outage.
     Failure,
-    /// Action was denied (authz failure).
+    /// Policy refused it.
     Denied,
-    /// Action was rate limited.
+    /// A rate limit refused it.
     RateLimited,
-    /// Action is pending (for async operations).
-    Pending,
 }
 
-/// Severity level of the audit event.
+/// How loudly a record should read.
+///
+/// Derived from the outcome rather than chosen, so two records describing the
+/// same kind of event never disagree about how serious it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditSeverity {
-    /// Informational event.
+    /// Something permitted happened.
     Info,
-    /// Warning event.
+    /// Something was refused.
     Warning,
-    /// Error event.
+    /// Something broke.
     Error,
-    /// Critical security event.
-    Critical,
+}
+
+impl AuditSeverity {
+    /// The severity an outcome implies.
+    const fn of(outcome: AuditOutcome) -> Self {
+        match outcome {
+            AuditOutcome::Success => Self::Info,
+            AuditOutcome::Denied | AuditOutcome::RateLimited => Self::Warning,
+            AuditOutcome::Failure => Self::Error,
+        }
+    }
 }
 
 // ============================================================================
 // Audit Event
 // ============================================================================
 
-/// A structured audit event.
+/// One line of the audit trail.
 ///
-/// This is the main type for recording audit events. Use the builder pattern
-/// to construct events with the appropriate fields.
+/// Serialises to a single JSON object; the sink writes one per line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
-    /// Unique event identifier.
+    /// Unique event identifier. UUIDv7, so records sort by time.
     #[serde(rename = "event_id")]
     pub id: String,
 
-    /// Timestamp in milliseconds since Unix epoch.
+    /// Timestamp in milliseconds since the Unix epoch.
     #[serde(rename = "timestamp_ms")]
     pub timestamp: u64,
 
-    /// ISO 8601 formatted timestamp.
+    /// The same instant, RFC 3339.
     #[serde(rename = "timestamp")]
     pub timestamp_iso: String,
 
-    /// Event category.
+    /// Which subsystem produced this.
     pub category: AuditCategory,
 
-    /// Specific action.
+    /// What happened.
     pub action: AuditAction,
 
-    /// Outcome of the action.
+    /// How it turned out.
     pub outcome: AuditOutcome,
 
-    /// Severity level.
+    /// How loudly it reads.
     pub severity: AuditSeverity,
 
-    /// Principal/user identifier.
+    /// What was being done, in the vocabulary of the subsystem that recorded it.
+    ///
+    /// The Cedar action on a decision (`Read`, `Update`, …), whether a vended
+    /// credential could write, whether a signed request read or wrote. A
+    /// first-class field rather than a `details` entry, because it is half of
+    /// what every query against this trail filters on — the other half being
+    /// [`resource_id`](Self::resource_id).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+
+    /// Principal the request authenticated as.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub principal_id: Option<String>,
 
-    /// Tenant identifier.
+    /// Tenant the principal belongs to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
 
-    /// Client IP address.
+    /// Address the request came from, as resolved by [`crate::remote_ip`].
+    ///
+    /// Absent when it could not be resolved, which is not the same as absent
+    /// because nobody looked: a hop that cannot be read makes the address
+    /// unknown, and inventing one would put a fiction in the trail.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_ip: Option<String>,
 
-    /// Request ID for correlation.
+    /// The `X-Request-Id` echoed to the client, so a record joins to an
+    /// application log line.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 
-    /// Resource type (namespace, table, etc.).
+    /// What kind of thing was acted on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_type: Option<String>,
 
-    /// Resource identifier.
+    /// Which one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_id: Option<String>,
 
@@ -239,28 +225,29 @@ pub struct AuditEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_set_version: Option<String>,
 
-    /// Additional details.
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    /// Anything else the recording site wanted to carry.
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub details: HashMap<String, String>,
 
-    /// Error message if outcome is failure.
+    /// Why it failed, when the outcome is not a policy decision.
+    ///
+    /// Never a provider's own message: those name roles, endpoints and account
+    /// identifiers. The recording site logs the detail where reading it needs
+    /// access to the host, and puts a sentence here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
 impl AuditEvent {
-    /// Creates a new audit event with the specified category and action.
-    pub fn new(category: AuditCategory, action: AuditAction) -> Self {
+    /// The empty record for one category and action.
+    fn new(category: AuditCategory, action: AuditAction, outcome: AuditOutcome) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
-
         let timestamp_ms = now.as_millis() as u64;
-
-        // Generate ISO 8601 timestamp
-        let datetime = chrono::DateTime::from_timestamp_millis(timestamp_ms as i64)
-            .unwrap_or_else(chrono::Utc::now);
-        let timestamp_iso = datetime.to_rfc3339();
+        let timestamp_iso = chrono::DateTime::from_timestamp_millis(timestamp_ms as i64)
+            .unwrap_or_else(chrono::Utc::now)
+            .to_rfc3339();
 
         Self {
             id: Uuid::now_v7().to_string(),
@@ -268,8 +255,9 @@ impl AuditEvent {
             timestamp_iso,
             category,
             action,
-            outcome: AuditOutcome::Success,
-            severity: AuditSeverity::Info,
+            outcome,
+            severity: AuditSeverity::of(outcome),
+            operation: None,
             principal_id: None,
             tenant_id: None,
             client_ip: None,
@@ -284,96 +272,157 @@ impl AuditEvent {
     }
 
     // ========================================================================
-    // Builder Methods
+    // The five events
     // ========================================================================
 
-    /// Creates an authentication audit event.
-    pub fn authentication(action: AuditAction) -> Self {
-        Self::new(AuditCategory::Authentication, action)
+    /// A caller presented a credential.
+    ///
+    /// `method` is how it was presented — `api_key`, `jwt`, `anonymous`, `host`.
+    /// A rejection carries no principal: nothing was established.
+    pub fn authentication(method: &str, accepted: bool) -> Self {
+        let outcome = if accepted {
+            AuditOutcome::Success
+        } else {
+            AuditOutcome::Denied
+        };
+        Self::new(
+            AuditCategory::Authentication,
+            AuditAction::Authenticate,
+            outcome,
+        )
+        .with_operation(method)
     }
 
-    /// Creates an authorization audit event.
-    pub fn authorization(action: AuditAction) -> Self {
-        Self::new(AuditCategory::Authorization, action)
+    /// An authorization decision.
+    ///
+    /// Both outcomes are recorded. A trail of denials alone answers "who was
+    /// turned away" but not "who read this table", which is where an
+    /// investigation actually starts.
+    pub fn decision(operation: &str, resource_type: &str, resource: &str, allowed: bool) -> Self {
+        let outcome = if allowed {
+            AuditOutcome::Success
+        } else {
+            AuditOutcome::Denied
+        };
+        Self::new(AuditCategory::Authorization, AuditAction::Decision, outcome)
+            .with_operation(operation)
+            .with_resource(resource_type, resource)
     }
 
-    /// Creates a data access audit event.
-    pub fn data_access(action: AuditAction) -> Self {
-        Self::new(AuditCategory::DataAccess, action)
+    /// A storage credential was vended, withheld, or could not be obtained.
+    ///
+    /// `access` is what the caller actually walked away with — `read`,
+    /// `read-write`, or `none` — and it is the field that makes this record
+    /// worth keeping: the authorization record above it says the caller could
+    /// `Read` the table, and only this one says whether the credential it
+    /// received could also overwrite it. `none` is not the same as `read`: a
+    /// withheld credential never had a width decided for it.
+    pub fn credential_vend(access: &str, table: &str, outcome: AuditOutcome) -> Self {
+        Self::new(
+            AuditCategory::StorageAccess,
+            AuditAction::VendCredentials,
+            outcome,
+        )
+        .with_operation(access)
+        .with_resource("table", table)
     }
 
-    /// Creates an admin audit event.
-    pub fn admin(action: AuditAction) -> Self {
-        Self::new(AuditCategory::Admin, action)
+    /// A storage request was signed, or refused.
+    ///
+    /// `operation` is `read` or `write`. The locations the request addressed go
+    /// in `details`, because a `DeleteObjects` names up to a thousand of them
+    /// and the record has to stay one line.
+    pub fn request_sign(operation: &str, table: &str, allowed: bool) -> Self {
+        let outcome = if allowed {
+            AuditOutcome::Success
+        } else {
+            AuditOutcome::Denied
+        };
+        Self::new(
+            AuditCategory::StorageAccess,
+            AuditAction::SignRequest,
+            outcome,
+        )
+        .with_operation(operation)
+        .with_resource("table", table)
     }
 
-    /// Creates a system audit event.
-    pub fn system(action: AuditAction) -> Self {
-        Self::new(AuditCategory::System, action)
+    /// A request was refused by a rate limit.
+    ///
+    /// `scope` is `ip` or `tenant` — which bucket ran out, since the two mean
+    /// different things about who is responsible.
+    pub fn rate_limit(scope: &str) -> Self {
+        Self::new(
+            AuditCategory::System,
+            AuditAction::RateLimit,
+            AuditOutcome::RateLimited,
+        )
+        .with_operation(scope)
     }
 
-    /// Sets the outcome.
-    pub fn with_outcome(mut self, outcome: AuditOutcome) -> Self {
-        self.outcome = outcome;
-        // Auto-adjust severity based on outcome
-        if matches!(outcome, AuditOutcome::Denied | AuditOutcome::RateLimited) {
-            self.severity = AuditSeverity::Warning;
-        }
-        if matches!(outcome, AuditOutcome::Failure) && self.severity == AuditSeverity::Info {
-            self.severity = AuditSeverity::Error;
-        }
+    // ========================================================================
+    // Builders
+    // ========================================================================
+
+    /// Sets what was being done.
+    fn with_operation<S: Into<String>>(mut self, operation: S) -> Self {
+        self.operation = Some(operation.into());
         self
     }
 
-    /// Sets the severity level.
-    pub fn with_severity(mut self, severity: AuditSeverity) -> Self {
-        self.severity = severity;
-        self
-    }
-
-    /// Sets the principal ID.
+    /// Sets the principal.
+    #[must_use]
     pub fn with_principal_id<S: Into<String>>(mut self, id: S) -> Self {
         self.principal_id = Some(id.into());
         self
     }
 
-    /// Sets the tenant ID.
+    /// Sets the tenant.
+    #[must_use]
     pub fn with_tenant_id<S: Into<String>>(mut self, id: S) -> Self {
         self.tenant_id = Some(id.into());
         self
     }
 
-    /// Sets the client IP.
-    pub fn with_client_ip<S: Into<String>>(mut self, ip: S) -> Self {
-        self.client_ip = Some(ip.into());
-        self
-    }
-
-    /// Sets the client IP from an IpAddr.
-    pub fn with_client_ip_addr(mut self, ip: IpAddr) -> Self {
+    /// Sets the caller's address.
+    #[must_use]
+    pub fn with_client_ip(mut self, ip: IpAddr) -> Self {
         self.client_ip = Some(ip.to_string());
         self
     }
 
-    /// Records the policies that produced the decision, and the policy set they
-    /// came from.
-    pub fn with_policy_provenance(
-        mut self,
-        matched: &[String],
-        policy_set_version: Option<String>,
-    ) -> Self {
-        self.matched_policies = matched.to_vec();
-        self.policy_set_version = policy_set_version;
-        self
+    /// Sets the caller's address, when there is one.
+    ///
+    /// The `Option`-taking form exists because every call site has one: the
+    /// address is genuinely unknown for an in-process caller and for a
+    /// forwarding chain that could not be read, and `if let` at each site was
+    /// where records went missing.
+    #[must_use]
+    pub fn with_optional_client_ip(self, ip: Option<IpAddr>) -> Self {
+        match ip {
+            Some(ip) => self.with_client_ip(ip),
+            None => self,
+        }
     }
 
-    /// Sets the request ID for correlation.
+    /// Sets the request id.
+    #[must_use]
     pub fn with_request_id<S: Into<String>>(mut self, id: S) -> Self {
         self.request_id = Some(id.into());
         self
     }
 
-    /// Sets the resource type and ID.
+    /// Sets the request id, when there is one.
+    #[must_use]
+    pub fn with_optional_request_id(self, id: Option<&str>) -> Self {
+        match id {
+            Some(id) => self.with_request_id(id),
+            None => self,
+        }
+    }
+
+    /// Sets what was acted on.
+    #[must_use]
     pub fn with_resource<S1: Into<String>, S2: Into<String>>(
         mut self,
         resource_type: S1,
@@ -384,166 +433,34 @@ impl AuditEvent {
         self
     }
 
-    /// Sets the namespace resource.
-    pub fn with_namespace<S: Into<String>>(self, namespace: S) -> Self {
-        self.with_resource("namespace", namespace)
+    /// Records which rules decided, and which policy set they came from.
+    #[must_use]
+    pub fn with_policy_provenance(
+        mut self,
+        matched: &[String],
+        policy_set_version: Option<String>,
+    ) -> Self {
+        self.matched_policies = matched.to_vec();
+        self.policy_set_version = policy_set_version;
+        self
     }
 
-    /// Sets the table resource.
-    pub fn with_table<S1: Into<String>, S2: Into<String>>(self, namespace: S1, table: S2) -> Self {
-        let resource_id = format!("{}.{}", namespace.into(), table.into());
-        self.with_resource("table", resource_id)
-    }
-
-    /// Adds a detail key-value pair.
+    /// Adds one detail.
+    #[must_use]
     pub fn with_detail<K: Into<String>, V: Into<String>>(mut self, key: K, value: V) -> Self {
         self.details.insert(key.into(), value.into());
         self
     }
 
-    /// Sets the error message.
+    /// Records why something failed, and marks the outcome as a failure rather
+    /// than a denial.
+    #[must_use]
     pub fn with_error<S: Into<String>>(mut self, error: S) -> Self {
         self.error = Some(error.into());
-        if self.severity == AuditSeverity::Info {
-            self.severity = AuditSeverity::Error;
-        }
+        self.outcome = AuditOutcome::Failure;
+        self.severity = AuditSeverity::of(AuditOutcome::Failure);
         self
     }
-
-    /// A record of an authorization decision.
-    ///
-    /// Both outcomes are recorded. A trail of denials alone answers "who was
-    /// turned away" but not "who read this table", which is where an
-    /// investigation actually starts.
-    pub fn decision(action: &str, resource_type: &str, resource: &str, allowed: bool) -> Self {
-        let outcome = if allowed {
-            AuditOutcome::Success
-        } else {
-            AuditOutcome::Denied
-        };
-        Self::new(AuditCategory::Authorization, AuditAction::PermissionCheck)
-            .with_outcome(outcome)
-            .with_resource(resource_type, resource)
-            .with_detail("action", action)
-    }
-
-    // ========================================================================
-    // Emission Methods
-    // ========================================================================
-
-    /// Emits the audit event to the logging system.
-    ///
-    /// The event is serialized as JSON and logged at the appropriate level.
-    pub fn emit(self) {
-        let json = serde_json::to_string(&self).unwrap_or_else(|e| {
-            format!("{{\"error\": \"failed to serialize audit event: {}\"}}", e)
-        });
-
-        // Log at appropriate level based on severity
-        match self.severity {
-            AuditSeverity::Info => {
-                info!(
-                    target: "audit",
-                    category = ?self.category,
-                    action = ?self.action,
-                    outcome = ?self.outcome,
-                    "{}",
-                    json
-                );
-            }
-            AuditSeverity::Warning | AuditSeverity::Error | AuditSeverity::Critical => {
-                warn!(
-                    target: "audit",
-                    category = ?self.category,
-                    action = ?self.action,
-                    outcome = ?self.outcome,
-                    severity = ?self.severity,
-                    "{}",
-                    json
-                );
-            }
-        }
-    }
-
-    /// Converts the event to JSON string.
-    pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string(self)
-    }
-
-    /// Converts the event to pretty-printed JSON string.
-    pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string_pretty(self)
-    }
-}
-
-// ============================================================================
-// Convenience Functions
-// ============================================================================
-
-/// Logs an authentication success event.
-pub fn log_auth_success(
-    principal_id: &str,
-    tenant_id: &str,
-    client_ip: Option<&str>,
-    method: &str,
-) {
-    let mut event = AuditEvent::authentication(AuditAction::ApiKeyAuth)
-        .with_principal_id(principal_id)
-        .with_tenant_id(tenant_id)
-        .with_outcome(AuditOutcome::Success)
-        .with_detail("method", method);
-
-    if let Some(ip) = client_ip {
-        event = event.with_client_ip(ip);
-    }
-
-    event.emit();
-}
-
-/// Logs an authentication failure event.
-pub fn log_auth_failure(client_ip: Option<&str>, reason: &str) {
-    let mut event = AuditEvent::authentication(AuditAction::ApiKeyAuth)
-        .with_outcome(AuditOutcome::Failure)
-        .with_severity(AuditSeverity::Warning)
-        .with_error(reason);
-
-    if let Some(ip) = client_ip {
-        event = event.with_client_ip(ip);
-    }
-
-    event.emit();
-}
-
-/// Logs an authorization denial event.
-pub fn log_authz_denied(
-    principal_id: &str,
-    tenant_id: &str,
-    resource_type: &str,
-    resource_id: &str,
-    action: &str,
-) {
-    AuditEvent::authorization(AuditAction::AccessDenied)
-        .with_principal_id(principal_id)
-        .with_tenant_id(tenant_id)
-        .with_resource(resource_type, resource_id)
-        .with_outcome(AuditOutcome::Denied)
-        .with_detail("requested_action", action)
-        .emit();
-}
-
-/// Logs a rate limit triggered event.
-pub fn log_rate_limit(client_ip: &str, tenant_id: Option<&str>, limit_type: &str) {
-    let mut event = AuditEvent::system(AuditAction::RateLimitTriggered)
-        .with_client_ip(client_ip)
-        .with_outcome(AuditOutcome::RateLimited)
-        .with_severity(AuditSeverity::Warning)
-        .with_detail("limit_type", limit_type);
-
-    if let Some(tid) = tenant_id {
-        event = event.with_tenant_id(tid);
-    }
-
-    event.emit();
 }
 
 // ============================================================================
@@ -555,107 +472,88 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_audit_event_creation() {
-        let event = AuditEvent::new(AuditCategory::Authentication, AuditAction::ApiKeyAuth);
+    fn an_accepted_credential_is_a_success() {
+        let event = AuditEvent::authentication("api_key", true).with_principal_id("svc-etl");
 
-        assert!(!event.id.is_empty());
-        assert!(event.timestamp > 0);
         assert_eq!(event.category, AuditCategory::Authentication);
-        assert_eq!(event.action, AuditAction::ApiKeyAuth);
+        assert_eq!(event.action, AuditAction::Authenticate);
         assert_eq!(event.outcome, AuditOutcome::Success);
         assert_eq!(event.severity, AuditSeverity::Info);
+        assert_eq!(event.operation.as_deref(), Some("api_key"));
+    }
+
+    /// A rejection is a warning, not an info line: it is the thing somebody
+    /// watching this stream is watching for.
+    #[test]
+    fn a_rejected_credential_is_a_warning() {
+        let event = AuditEvent::authentication("jwt", false);
+        assert_eq!(event.outcome, AuditOutcome::Denied);
+        assert_eq!(event.severity, AuditSeverity::Warning);
+        assert!(event.principal_id.is_none(), "nothing was established");
+    }
+
+    /// The Cedar action is a field, not a `details` entry: `action` names the
+    /// kind of event, and free-form details are neither stable nor documented.
+    #[test]
+    fn a_decision_names_its_action_in_a_field() {
+        let event = AuditEvent::decision("Update", "table", "acme/web/events", true);
+
+        assert_eq!(event.action, AuditAction::Decision);
+        assert_eq!(event.operation.as_deref(), Some("Update"));
+        assert_eq!(event.resource_id.as_deref(), Some("acme/web/events"));
+        assert!(event.details.is_empty());
+    }
+
+    /// The point of the vending record: the decision above it says `Read` was
+    /// permitted, and only this says the credential could also write.
+    #[test]
+    fn a_vending_record_says_whether_the_credential_could_write() {
+        let event =
+            AuditEvent::credential_vend("read-write", "acme/web/events", AuditOutcome::Success);
+
+        assert_eq!(event.category, AuditCategory::StorageAccess);
+        assert_eq!(event.operation.as_deref(), Some("read-write"));
     }
 
     #[test]
-    fn test_audit_event_builder() {
-        let event = AuditEvent::authentication(AuditAction::ApiKeyAuth)
-            .with_principal_id("user-123")
-            .with_tenant_id("tenant-456")
-            .with_client_ip("192.168.1.1")
-            .with_request_id("req-789")
-            .with_outcome(AuditOutcome::Success)
-            .with_detail("api_key_prefix", "rb_");
+    fn a_refused_signature_is_denied_and_a_broken_exchange_is_a_failure() {
+        let refused = AuditEvent::request_sign("write", "acme/web/events", false);
+        assert_eq!(refused.outcome, AuditOutcome::Denied);
+        assert_eq!(refused.severity, AuditSeverity::Warning);
 
-        assert_eq!(event.principal_id, Some("user-123".to_string()));
-        assert_eq!(event.tenant_id, Some("tenant-456".to_string()));
-        assert_eq!(event.client_ip, Some("192.168.1.1".to_string()));
-        assert_eq!(event.request_id, Some("req-789".to_string()));
-        assert_eq!(
-            event.details.get("api_key_prefix"),
-            Some(&"rb_".to_string())
-        );
+        let broken = AuditEvent::credential_vend("read", "t", AuditOutcome::Success)
+            .with_error("the credential exchange failed");
+        assert_eq!(broken.outcome, AuditOutcome::Failure);
+        assert_eq!(broken.severity, AuditSeverity::Error);
     }
 
     #[test]
-    fn test_audit_event_with_resource() {
-        let event = AuditEvent::data_access(AuditAction::TableCreate)
-            .with_table("my_namespace", "my_table");
+    fn optional_fields_are_omitted_rather_than_null() {
+        let event = AuditEvent::rate_limit("ip");
+        let json: serde_json::Value = serde_json::to_value(&event).unwrap();
 
-        assert_eq!(event.resource_type, Some("table".to_string()));
-        assert_eq!(event.resource_id, Some("my_namespace.my_table".to_string()));
+        assert_eq!(json["action"], "rate_limit");
+        assert_eq!(json["operation"], "ip");
+        assert!(json.get("principal_id").is_none());
+        assert!(json.get("details").is_none());
+    }
+
+    /// An unresolved address is absent, never a placeholder: the trail must not
+    /// claim a request came from somewhere it might not have.
+    #[test]
+    fn an_unknown_address_leaves_the_field_out() {
+        let event = AuditEvent::authentication("api_key", false).with_optional_client_ip(None);
+        assert!(event.client_ip.is_none());
+
+        let known = AuditEvent::authentication("api_key", true)
+            .with_optional_client_ip(Some("10.0.0.5".parse().unwrap()));
+        assert_eq!(known.client_ip.as_deref(), Some("10.0.0.5"));
     }
 
     #[test]
-    fn test_audit_event_json_serialization() {
-        let event = AuditEvent::authentication(AuditAction::ApiKeyAuth)
-            .with_principal_id("user-123")
-            .with_outcome(AuditOutcome::Success);
-
-        let json = event.to_json().unwrap();
-        assert!(json.contains("\"category\":\"authentication\""));
-        assert!(json.contains("\"action\":\"api_key_auth\""));
-        assert!(json.contains("\"principal_id\":\"user-123\""));
-    }
-
-    #[test]
-    fn test_audit_outcome_affects_severity() {
-        let denied =
-            AuditEvent::authorization(AuditAction::AccessDenied).with_outcome(AuditOutcome::Denied);
-        assert_eq!(denied.severity, AuditSeverity::Warning);
-
-        let failure =
-            AuditEvent::authentication(AuditAction::ApiKeyAuth).with_outcome(AuditOutcome::Failure);
-        assert_eq!(failure.severity, AuditSeverity::Error);
-    }
-
-    #[test]
-    fn test_audit_event_with_error() {
-        let event = AuditEvent::authentication(AuditAction::ApiKeyAuth)
-            .with_outcome(AuditOutcome::Failure)
-            .with_error("Invalid API key format");
-
-        assert_eq!(event.error, Some("Invalid API key format".to_string()));
-        assert_eq!(event.severity, AuditSeverity::Error);
-    }
-
-    #[test]
-    fn test_audit_categories() {
-        // Test each category creation shorthand
-        let auth = AuditEvent::authentication(AuditAction::ApiKeyAuth);
-        assert_eq!(auth.category, AuditCategory::Authentication);
-
-        let authz = AuditEvent::authorization(AuditAction::PermissionCheck);
-        assert_eq!(authz.category, AuditCategory::Authorization);
-
-        let data = AuditEvent::data_access(AuditAction::TableCreate);
-        assert_eq!(data.category, AuditCategory::DataAccess);
-
-        let admin = AuditEvent::admin(AuditAction::ApiKeyCreate);
-        assert_eq!(admin.category, AuditCategory::Admin);
-
-        let system = AuditEvent::system(AuditAction::ServiceStart);
-        assert_eq!(system.category, AuditCategory::System);
-    }
-
-    #[test]
-    fn test_audit_event_timestamp_format() {
-        let event = AuditEvent::new(AuditCategory::System, AuditAction::ServiceStart);
-
-        // Check ISO format contains expected components
-        assert!(event.timestamp_iso.contains("T"));
-        assert!(event.timestamp_iso.contains("Z") || event.timestamp_iso.contains("+"));
-
-        // Timestamp should be reasonable (after year 2020)
-        assert!(event.timestamp > 1577836800000); // Jan 1, 2020
+    fn records_sort_by_time_through_their_ids() {
+        let first = AuditEvent::rate_limit("ip");
+        let second = AuditEvent::rate_limit("ip");
+        assert!(first.id < second.id, "UUIDv7 ids must be ordered");
     }
 }

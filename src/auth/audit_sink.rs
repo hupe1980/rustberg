@@ -307,7 +307,7 @@ impl Default for Auditor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::audit::{AuditAction, AuditEvent, AuditOutcome};
+    use crate::auth::audit::AuditEvent;
 
     /// A sink that always fails, to exercise the fail-closed path.
     #[derive(Debug)]
@@ -326,9 +326,7 @@ mod tests {
     }
 
     fn event() -> AuditEvent {
-        AuditEvent::authentication(AuditAction::ApiKeyAuth)
-            .with_principal_id("alice")
-            .with_outcome(AuditOutcome::Success)
+        AuditEvent::authentication("api_key", true).with_principal_id("alice")
     }
 
     #[test]

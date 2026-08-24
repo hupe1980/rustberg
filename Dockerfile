@@ -57,9 +57,21 @@ RUN mkdir -p src && \
     echo 'fn main() { println!("dummy"); }' > src/main.rs && \
     echo 'pub fn dummy() {}' > src/lib.rs
 
-# Build dependencies only (this layer is cached)
+# Build dependencies only (this layer is cached).
+#
+# `--all-features`, matching what CI builds and what the release workflow ships.
+# A narrower list here was how this image came to be built with a feature that
+# no longer exists (`slatedb-storage`, from a storage backend removed long ago):
+# the flag silently drifted away from every other build in the repository, and
+# an image built from a subset would in any case ship without Postgres, cloud
+# warehouses, credential vending or request signing — most of what the
+# documentation tells an operator to configure.
+#
+# `|| true` here only, because this layer builds against a dummy `src/` and its
+# whole purpose is to warm the dependency cache. The real build below must fail
+# the image if it fails.
 RUN RUST_TARGET=$(cat /tmp/rust-target) && \
-    cargo zigbuild --release --target $RUST_TARGET --features slatedb-storage,cli,tls 2>/dev/null || true
+    cargo zigbuild --release --target $RUST_TARGET --all-features 2>/dev/null || true
 
 # Remove dummy source
 RUN rm -rf src/
@@ -72,9 +84,14 @@ RUN touch src/main.rs src/lib.rs
 
 # Build the actual binary
 RUN RUST_TARGET=$(cat /tmp/rust-target) && \
-    cargo zigbuild --release --target $RUST_TARGET --features slatedb-storage,cli,tls && \
+    cargo zigbuild --release --target $RUST_TARGET --all-features && \
     cp /build/target/$RUST_TARGET/release/rustberg /build/rustberg && \
     strip /build/rustberg 2>/dev/null || true
+
+# The state directory, created here because the runtime image is distroless and
+# has no shell to create one in. Owned by UID 65532, which is `nonroot`.
+RUN mkdir -p /build/rustberg-data/data /build/rustberg-data/warehouse && \
+    chown -R 65532:65532 /build/rustberg-data
 
 # Verify binary
 RUN ls -lh /build/rustberg && file /build/rustberg
@@ -99,17 +116,37 @@ LABEL org.opencontainers.image.documentation="https://hupe1980.github.io/rustber
 # Copy binary from builder
 COPY --from=builder /build/rustberg /usr/local/bin/rustberg
 
-# Environment defaults
+# Environment defaults.
+#
+# `RUSTBERG_CATALOG_URL` is set because production mode — the default — refuses
+# to start without an explicit catalog location, and an image whose only
+# documented `docker run` exits immediately is not a quick start. The path is a
+# declared volume, so a container started without `-v` still runs and simply
+# loses its catalog when it is removed, which is the same bargain every other
+# stateful image makes. Mount something over it for anything that has to
+# survive, or point the variable at `postgres://…` for a replicated deployment.
 ENV RUSTBERG_HOST=0.0.0.0
 ENV RUSTBERG_PORT=8000
 ENV RUSTBERG_INSECURE_HTTP=false
+ENV RUSTBERG_CATALOG_URL=file:///var/lib/rustberg/data
+ENV RUSTBERG_WAREHOUSE=/var/lib/rustberg/warehouse
 ENV RUST_LOG=info
+
+# Writable by UID 65532, the `nonroot` user the image runs as.
+COPY --from=builder --chown=65532:65532 /build/rustberg-data /var/lib/rustberg
+VOLUME ["/var/lib/rustberg"]
 
 # Expose default port
 EXPOSE 8000
 
 # Run as non-root (distroless:nonroot uses UID 65532)
 USER nonroot:nonroot
+
+# The image is distroless, so the only thing that can probe it is the binary
+# itself. `healthcheck` reads /ready, which reports whether the catalog store
+# and the policy set are usable — not merely that the process is alive.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/rustberg", "healthcheck"]
 
 # Entrypoint
 ENTRYPOINT ["/usr/local/bin/rustberg"]
@@ -128,11 +165,22 @@ COPY --from=builder /build/rustberg /usr/local/bin/rustberg
 ENV RUSTBERG_HOST=0.0.0.0
 ENV RUSTBERG_PORT=8000
 ENV RUSTBERG_INSECURE_HTTP=false
+ENV RUSTBERG_CATALOG_URL=file:///var/lib/rustberg/data
+ENV RUSTBERG_WAREHOUSE=/var/lib/rustberg/warehouse
 ENV RUST_LOG=debug
+
+COPY --from=builder --chown=65532:65532 /build/rustberg-data /var/lib/rustberg
+VOLUME ["/var/lib/rustberg"]
 
 EXPOSE 8000
 
 USER nonroot:nonroot
+
+# The image is distroless, so the only thing that can probe it is the binary
+# itself. `healthcheck` reads /ready, which reports whether the catalog store
+# and the policy set are usable — not merely that the process is alive.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/rustberg", "healthcheck"]
 
 ENTRYPOINT ["/usr/local/bin/rustberg"]
 

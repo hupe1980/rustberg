@@ -13,6 +13,18 @@
 //! included. The scope joins principal, tenant, method and path with the unit
 //! separator, which none of them can contain.
 //!
+//! # A retry, not a race
+//!
+//! The receipt is written *after* the operation, so two requests carrying the
+//! same key **concurrently** both execute. That is deliberate. Reserving the key
+//! first would need a second round trip to the shared store on the happy path of
+//! every mutation, plus a lease with an expiry, plus a rule for what a caller
+//! sees while the first attempt is still in flight — and it would buy protection
+//! against a case that is not what the header is for. `Idempotency-Key` exists
+//! for a *retry*: a client that did not hear the answer and asks again. Two
+//! genuinely simultaneous attempts at the same commit are already resolved,
+//! correctly, by compare-and-swap — the loser gets a `409`.
+//!
 //! # Replicas share the store
 //!
 //! The cache is in-process, and behind a load balancer a retry lands on a
@@ -35,7 +47,12 @@ use crate::auth::Principal;
 /// Header name for idempotency keys.
 pub const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 
-/// Response header indicating an idempotency key was used.
+/// Response header marking a response that was **replayed** rather than executed.
+///
+/// Set by [`CachedResponse::into_axum_response`] and nowhere else. Setting it on
+/// the response that did the work as well would put it on every response
+/// carrying a key, and it would then distinguish nothing — which is the one
+/// thing it exists to do.
 pub const IDEMPOTENCY_KEY_USED_HEADER: &str = "idempotency-key-used";
 
 /// Default TTL for idempotency keys (24 hours).
@@ -49,11 +66,24 @@ const MAX_KEY_LENGTH: usize = 256;
 /// The unit separator cannot appear in a principal id, a tenant, or a validated
 /// path segment, so no two distinct scopes render to the same string. Joining
 /// with `:` would let a principal named `a:b` collide with tenant `b`.
+/// Separates the fields of an idempotency key's scope.
+///
+/// Deliberately *not* [`crate::names::PART_SEPARATOR`], despite being the same
+/// byte. That constant is the namespace-part separator and has one job; this
+/// joins a principal, a tenant, a method and a path, which are not namespace
+/// parts and never become one. Importing it would couple two rules that have no
+/// reason to change together — the mirror of the copy that constant exists to
+/// prevent. What matters here is only that no field can contain it: an id and a
+/// tenant are held to the name rule, a method is a fixed token, and a path
+/// arrives percent-encoded.
 const SCOPE_SEPARATOR: &str = "\u{1F}";
 
-/// Maximum number of entries in the idempotency cache.
-/// SEC-026: Bounded cache size prevents memory exhaustion attacks.
-const MAX_CACHE_SIZE: usize = 100_000;
+/// Most entries the in-process cache holds.
+///
+/// Bounded because the key is client-chosen: without a ceiling a caller could
+/// mint receipts until the process ran out of memory. Eviction costs the evicted
+/// key its idempotency, which is the same outcome as never having sent one.
+const MAX_CACHE_SIZE: u64 = 100_000;
 
 // ============================================================================
 // Idempotency Key
@@ -84,12 +114,13 @@ impl IdempotencyKey {
     ) -> Option<Self> {
         let key = key.into();
 
-        // Validate key length
         if key.is_empty() || key.len() > MAX_KEY_LENGTH {
             return None;
         }
 
-        // Validate key characters (alphanumeric, hyphens, underscores)
+        // The alphabet covers the UUIDv7 the spec asks for and the shapes
+        // clients actually send, and excludes the separator below — so a key
+        // cannot forge a scope boundary.
         if !key
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -180,11 +211,6 @@ impl CachedResponse {
         }
     }
 
-    /// Checks if this response has expired.
-    pub fn is_expired(&self, ttl: Duration) -> bool {
-        self.cached_at.elapsed() > ttl
-    }
-
     /// Converts to an Axum response.
     pub fn into_axum_response(self) -> axum::response::Response {
         use axum::http::header::CONTENT_TYPE;
@@ -198,7 +224,8 @@ impl CachedResponse {
             response.headers_mut().insert(CONTENT_TYPE, value);
         }
 
-        // Add header indicating this was a cached response
+        // Says the response was replayed rather than executed, so a client can
+        // tell a successful retry from a first attempt.
         response.headers_mut().insert(
             IDEMPOTENCY_KEY_USED_HEADER,
             HeaderValue::from_static("true"),
@@ -263,7 +290,7 @@ impl IdempotencyCache {
     pub fn new(ttl: Duration) -> Self {
         Self {
             cache: Cache::builder()
-                .max_capacity(MAX_CACHE_SIZE as u64)
+                .max_capacity(MAX_CACHE_SIZE)
                 .time_to_live(ttl)
                 .build(),
             shared: None,
@@ -420,19 +447,25 @@ mod tests {
         assert_eq!(key.value(), "test-key-123");
     }
 
-    #[test]
-    fn test_cached_response_expiry() {
-        let response = CachedResponse::new(
-            StatusCode::OK,
-            Bytes::from("test"),
-            Some("application/json".to_string()),
-        );
+    /// Expiry belongs to the cache, not to the entry: the local cache is
+    /// TTL-evicting and the shared store filters on `expires_at_ms`. An entry
+    /// that could be asked whether it had expired was a third answer nobody
+    /// consulted, and a place for the three to disagree.
+    #[tokio::test]
+    async fn an_entry_expires_with_the_cache_that_holds_it() {
+        let cache = IdempotencyCache::new(Duration::from_millis(50));
+        let key = IdempotencyKey::new("expiring", "POST", "/v1/tables", &who("alice")).unwrap();
+        cache
+            .set(
+                key.clone(),
+                CachedResponse::new(StatusCode::OK, Bytes::from("body"), None),
+            )
+            .await;
 
-        // Not expired immediately
-        assert!(!response.is_expired(Duration::from_secs(60)));
-
-        // Would be expired if TTL was 0
-        assert!(response.is_expired(Duration::from_nanos(1)));
+        assert!(cache.get(&key).await.is_some());
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        cache.cache.run_pending_tasks();
+        assert!(cache.get(&key).await.is_none());
     }
 
     #[tokio::test]
@@ -594,6 +627,6 @@ mod tests {
         }
 
         cache.cache.run_pending_tasks();
-        assert!(cache.cache.entry_count() as usize <= MAX_CACHE_SIZE);
+        assert!(cache.cache.entry_count() <= MAX_CACHE_SIZE);
     }
 }

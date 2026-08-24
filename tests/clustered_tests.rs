@@ -52,7 +52,15 @@ struct Cluster {
 
 impl Cluster {
     async fn start() -> Self {
-        let container = GenericImage::new("postgres", "16-alpine")
+        // Debian-based, deliberately, and **not** `-alpine`. Alpine is musl,
+        // whose `strcoll` is byte comparison, so every locale there behaves like
+        // `C` — which is exactly the property `listings_come_back_in_byte_order`
+        // exists to check, making the test vacuous on the image that was here
+        // before. Real deployments run glibc: the Debian image, RDS, Cloud SQL,
+        // Aurora. There `en_US.utf8` orders `aa, ab, Ärger, _underscore, Zulu`
+        // and byte order gives `Zulu, _underscore, aa, ab`, which is a different
+        // listing from redb's for the same catalog.
+        let container = GenericImage::new("postgres", "16")
             .with_exposed_port(5432.tcp())
             .with_wait_for(WaitFor::message_on_stderr(
                 "database system is ready to accept connections",

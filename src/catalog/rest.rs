@@ -53,7 +53,13 @@ use super::store::{CatalogStore, Entry, Page, PageRequest, StorageHealthStatus};
 ///
 /// A unit separator, percent-encoded in the URL. Joining on `.` would be
 /// ambiguous for a namespace whose name contains one.
-const NAMESPACE_SEPARATOR: &str = "\u{1F}";
+/// The same separator this crate keys on, sent across the hop.
+///
+/// A remote catalog's REST path encodes a multi-level namespace with the unit
+/// separator, which is also what the registries key on and what a request
+/// arrives with — so this is [`crate::names::PART_SEPARATOR`], not a second
+/// opinion about it.
+const NAMESPACE_SEPARATOR: char = crate::names::PART_SEPARATOR;
 
 /// Separates a remote page token from the offset into the page it produced.
 ///
@@ -241,6 +247,11 @@ impl RestCatalog {
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
+            // A mount carries a bearer token that belongs to *this* server, and
+            // a redirect is the remote choosing where that token goes next. A
+            // catalog URI does not legitimately redirect, so following one is
+            // all risk and no function.
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("rustberg/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| Error::new(ErrorKind::Unexpected, format!("HTTP client: {e}")))?;
@@ -267,12 +278,7 @@ impl RestCatalog {
             ));
         }
 
-        let config: RemoteConfig = response.json().await.map_err(|e| {
-            Error::new(
-                ErrorKind::Unexpected,
-                format!("Malformed config response from {uri}: {e}"),
-            )
-        })?;
+        let config: RemoteConfig = read_json(response, "GET /v1/config").await?;
 
         let capabilities = Self::negotiate(&config.endpoints);
 
@@ -323,7 +329,7 @@ impl RestCatalog {
 
     /// Percent-encodes a namespace into one path segment.
     fn encode_namespace(namespace: &NamespaceIdent) -> String {
-        encode_segment(&namespace.as_ref().join(NAMESPACE_SEPARATOR))
+        encode_segment(&namespace.as_ref().join(&NAMESPACE_SEPARATOR.to_string()))
     }
 
     /// Issues a GET and decodes the body.
@@ -400,14 +406,7 @@ impl RestCatalog {
             ));
         }
 
-        let value = response.json::<T>().await.map_err(|e| {
-            Error::new(
-                ErrorKind::Unexpected,
-                format!("Malformed response from the mounted catalog ({path}): {e}"),
-            )
-        })?;
-
-        Ok(Some(value))
+        read_json(response, path).await.map(Some)
     }
 
     /// Paging parameters, in the spelling the spec uses.
@@ -415,6 +414,14 @@ impl RestCatalog {
     /// The size asked for is the caller's limit **plus** whatever the cursor
     /// says to drop, so that a resumed page still yields a full one after the
     /// skip. See [`RemoteCursor`] for why a skip exists at all.
+    ///
+    /// Capped at [`MAX_PAGE_SIZE`](crate::catalog::MAX_PAGE_SIZE), which is the
+    /// most this crate asks any source for. When the cap bites, the resumed page
+    /// is *short* rather than wrong — [`collect_page`] loops until it is full —
+    /// and [`Self::repage`] handles the case where the remote comes back with
+    /// fewer rows than the position being resumed to.
+    ///
+    /// [`collect_page`]: crate::catalog::v1::pagination::collect_page
     fn page_query(page: &PageRequest, resume: &RemoteCursor) -> Vec<(&'static str, String)> {
         let size = page
             .effective_limit()
@@ -440,9 +447,33 @@ impl RestCatalog {
         limit: usize,
     ) -> Page<T> {
         let total = items.len();
-        let mut entries = Vec::with_capacity(total.saturating_sub(resume.skip).min(limit));
 
-        for (index, item) in items.into_iter().enumerate().skip(resume.skip).take(limit) {
+        // A skip names a position *inside* a page that held more than `skip`
+        // items, so a re-fetch that comes back shorter than that has broken the
+        // assumption the cursor was minted under — the remote paged differently,
+        // or its data moved.
+        //
+        // Skipping the whole page would be the quiet failure: `entries` comes
+        // back empty, `collect_page` advances to the page after this one, and
+        // every row between the resume point and the end of this page is never
+        // served. Restarting the page instead repeats rows the client has
+        // already seen, which it can see happening. That is the same trade
+        // `RemoteCursor::parse` makes for a token it does not recognise.
+        let skip = if resume.skip > 0 && resume.skip >= total {
+            tracing::warn!(
+                skip = resume.skip,
+                returned = total,
+                "A mounted catalog returned fewer rows than the position being resumed to. \
+                 Restarting this page rather than stepping over the rows in it."
+            );
+            0
+        } else {
+            resume.skip
+        };
+
+        let mut entries = Vec::with_capacity(total.saturating_sub(skip).min(limit));
+
+        for (index, item) in items.into_iter().enumerate().skip(skip).take(limit) {
             // The last item of a remote page is best resumed with the remote's
             // own next-page token: it says the same thing as "skip this whole
             // page" and costs no re-fetch. Every other position has no token of
@@ -497,6 +528,59 @@ impl RestCatalog {
 }
 
 /// Builds a query string, or an empty one when there is nothing to send.
+/// Largest response body accepted from a mounted catalog.
+///
+/// A `rest` mount is somebody else's catalog, so its response is untrusted input
+/// on the request path of every call into that subtree. `Response::json` reads
+/// to the end of the stream, so without a ceiling a remote that answers
+/// `Content-Length: 40GB` — or lies about the length and keeps writing — takes
+/// the whole server down, and there is no engine or client involved to blame.
+///
+/// The bound is generous by the standards of what actually crosses this hop: a
+/// page of identifiers is kilobytes, and the largest thing here is one table's
+/// metadata document, which is megabytes only after a long snapshot history.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Reads a JSON body, refusing one larger than [`MAX_RESPONSE_BYTES`].
+///
+/// Read chunk by chunk rather than through `Response::json`, which allocates
+/// whatever arrives before anything gets to look at it — the check has to happen
+/// while the body is still being read, or it is a report rather than a limit.
+async fn read_json<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+    what: &str,
+) -> Result<T> {
+    let mut body: Vec<u8> = Vec::new();
+
+    loop {
+        let chunk = response.chunk().await.map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Reading the mounted catalog's response failed ({what}): {e}"),
+            )
+        })?;
+        let Some(chunk) = chunk else { break };
+
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "The mounted catalog's response to {what} is larger than \
+                     {MAX_RESPONSE_BYTES} bytes and was not read."
+                ),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&body).map_err(|e| {
+        Error::new(
+            ErrorKind::Unexpected,
+            format!("Malformed response from the mounted catalog ({what}): {e}"),
+        )
+    })
+}
+
 fn encode_query(pairs: &[(&str, String)]) -> String {
     if pairs.is_empty() {
         return String::new();
@@ -543,7 +627,10 @@ impl CatalogStore for RestCatalog {
         let resume = RemoteCursor::parse(page.after.as_deref());
         let mut query = Self::page_query(page, &resume);
         if let Some(parent) = parent {
-            query.push(("parent", parent.as_ref().join(NAMESPACE_SEPARATOR)));
+            query.push((
+                "parent",
+                parent.as_ref().join(&NAMESPACE_SEPARATOR.to_string()),
+            ));
         }
 
         let Some(response) = self
@@ -786,7 +873,12 @@ impl CatalogStore for RestCatalog {
         Err(Self::read_only("Creating a view"))
     }
 
-    async fn update_view(&self, _: &TableIdent, _: ViewMetadata) -> Result<(String, ViewMetadata)> {
+    async fn update_view(
+        &self,
+        _: &TableIdent,
+        _: &str,
+        _: ViewMetadata,
+    ) -> Result<(String, ViewMetadata)> {
         Err(Self::read_only("Updating a view"))
     }
 
@@ -804,6 +896,18 @@ impl CatalogStore for RestCatalog {
         // A remote mount stores nothing of its own, and it is read-only, so no
         // client-supplied location is ever recorded through it.
         None
+    }
+
+    /// A remote mount stores nothing of its own, so it lays nothing out.
+    fn namespace_prefix_for(&self, _namespace: &NamespaceIdent) -> Option<String> {
+        None
+    }
+
+    /// What the remote's own `/v1/config` said it serves, negotiated once when
+    /// the mount was opened — never assumed, and never widened by what this
+    /// server can do.
+    fn capabilities_for(&self, _namespace: Option<&NamespaceIdent>) -> Capabilities {
+        self.capabilities()
     }
 
     async fn storage_health_check(&self) -> Result<StorageHealthStatus> {
@@ -965,6 +1069,51 @@ mod tests {
         }
     }
 
+    /// A remote whose page came back shorter than the resume point has broken
+    /// the assumption the cursor was minted under. Stepping over the page would
+    /// lose every row in it silently; restarting it repeats rows the client can
+    /// see.
+    #[test]
+    fn a_page_that_shrank_below_the_resume_point_is_restarted_not_skipped() {
+        let resume = RemoteCursor {
+            token: Some("tok".to_string()),
+            skip: 5,
+        };
+
+        let page = RestCatalog::repage(
+            vec![ident("a"), ident("b"), ident("c")],
+            Some("next-tok".to_string()),
+            &resume,
+            10,
+        );
+
+        assert_eq!(
+            page.entries.len(),
+            3,
+            "every row the remote returned must be served, not stepped over"
+        );
+    }
+
+    /// The ordinary resumed page: the skip is inside what came back, so it is
+    /// applied exactly.
+    #[test]
+    fn a_resumed_page_drops_exactly_what_it_already_served() {
+        let resume = RemoteCursor {
+            token: Some("tok".to_string()),
+            skip: 2,
+        };
+
+        let page = RestCatalog::repage(
+            vec![ident("a"), ident("b"), ident("c"), ident("d")],
+            None,
+            &resume,
+            10,
+        );
+
+        let names: Vec<String> = page.entries.iter().map(|e| e.item.name.clone()).collect();
+        assert_eq!(names, vec!["c".to_string(), "d".to_string()]);
+    }
+
     /// The last item of a page is named by the remote's own next token, so an
     /// unfiltered walk costs one round trip per page rather than re-fetching.
     #[test]
@@ -1006,8 +1155,10 @@ mod tests {
         );
     }
 
-    /// A remote that caps `pageSize` below the skip yields nothing this round —
-    /// which must still advance, not stall.
+    /// A page shorter than the skip is an inconsistency, not a smaller page: the
+    /// skip was minted from a fetch of the *same* token that returned more rows
+    /// than this. Whatever is served, the listing must keep a token so the
+    /// caller does not read the short page as the end of the list.
     #[test]
     fn a_page_shorter_than_the_skip_still_advances() {
         let resume = RemoteCursor {
@@ -1021,11 +1172,14 @@ mod tests {
             10,
         );
 
-        assert!(page.entries.is_empty());
         assert_eq!(
             page.next.as_deref(),
             Some(&*RemoteCursor::start_of("next-tok")),
             "without a token the caller would read this as the end of the list"
+        );
+        assert!(
+            !page.entries.is_empty(),
+            "the rows the remote did return must be served, not stepped over"
         );
     }
 

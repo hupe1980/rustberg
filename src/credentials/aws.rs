@@ -179,6 +179,11 @@ impl AwsStsCredentialProvider {
             ))
         })?;
 
+        // Escaped, because everything after this point is IAM's pattern language
+        // and the bucket and key come from a table location a caller influences.
+        let bucket = escape_iam(bucket);
+        let key_prefix = escape_iam(key_prefix);
+
         let object_arn = if key_prefix.is_empty() {
             format!("arn:aws:s3:::{bucket}/*")
         } else {
@@ -231,6 +236,39 @@ impl AwsStsCredentialProvider {
 
         Ok(policy)
     }
+}
+
+/// Escapes the characters IAM reads as pattern syntax.
+///
+/// # Why a table name reaches this at all
+///
+/// The `Resource` ARN and the `s3:prefix` condition below are built from the
+/// table's storage location, and the last segment of that location is the
+/// table's *name*. A name may contain any Unicode outside general category `C`
+/// (`names`), which includes `*` and `?` — and both are
+/// wildcards to IAM.
+///
+/// Interpolating them raw widens the credential instead of narrowing it. A table
+/// named `*` in namespace `db` yields `arn:aws:s3:::bucket/wh/db/*/*`, which
+/// matches every object under every *sibling* table — so a caller permitted to
+/// create one table, and to read it, receives read access to all of them. A
+/// policy that grants `Read` on one specific table is escaped that way too.
+/// `$` is escaped with them because `${…}` introduces a policy variable.
+///
+/// IAM defines `${*}`, `${?}` and `${$}` as the literal forms, so the escaped
+/// prefix still names exactly the object it was built from. `$` goes first, or
+/// the `$` in a replacement would be escaped again.
+///
+/// The alternative — forbidding these characters in a name — would reject names
+/// Iceberg permits, to fix a problem that belongs to one of four places a name
+/// is used. Escaping at the boundary is the same choice
+/// [`catalog::v1::sign`](crate::catalog::v1::sign) makes when a key becomes a
+/// URL path.
+fn escape_iam(value: &str) -> String {
+    value
+        .replace('$', "${$}")
+        .replace('*', "${*}")
+        .replace('?', "${?}")
 }
 
 #[async_trait]
@@ -559,6 +597,42 @@ mod tests {
             Some(("bucket", ""))
         );
         assert_eq!(AwsStsCredentialProvider::split_location("gs://b/x"), None);
+    }
+
+    /// A table name may contain any Unicode outside general category `C`, and
+    /// `*` is a wildcard to IAM. Interpolated raw, a table named `*` yields
+    /// `arn:aws:s3:::bucket/wh/db/*/*` — read access to every sibling table,
+    /// from the ability to create one.
+    #[test]
+    fn a_wildcard_in_a_table_name_cannot_widen_the_policy() {
+        let p = policy("s3://bucket/wh/db/*", false);
+
+        assert_eq!(
+            p["Statement"][0]["Resource"], "arn:aws:s3:::bucket/wh/db/${*}/*",
+            "the name's asterisk must be IAM's literal form, not a wildcard"
+        );
+        assert_eq!(
+            p["Statement"][1]["Condition"]["StringLike"]["s3:prefix"][0],
+            "wh/db/${*}/*"
+        );
+    }
+
+    #[test]
+    fn every_iam_metacharacter_in_a_name_is_escaped() {
+        let p = policy("s3://bucket/wh/db/a*b?c$d", false);
+        assert_eq!(
+            p["Statement"][0]["Resource"],
+            "arn:aws:s3:::bucket/wh/db/a${*}b${?}c${$}d/*"
+        );
+    }
+
+    /// `$` must be escaped before `*` and `?`, or the `$` this introduces would
+    /// be escaped a second time and the prefix would name a different object.
+    #[test]
+    fn escaping_does_not_double_escape_its_own_output() {
+        assert_eq!(escape_iam("a*b"), "a${*}b");
+        assert_eq!(escape_iam("$"), "${$}");
+        assert_eq!(escape_iam("plain/key"), "plain/key");
     }
 
     /// The credential must reach the requested table's prefix and nothing above it.

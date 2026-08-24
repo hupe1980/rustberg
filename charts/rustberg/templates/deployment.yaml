@@ -41,6 +41,12 @@ spec:
       serviceAccountName: {{ include "rustberg.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # Covers the in-process drain delay plus the drain itself. Rustberg keeps
+      # serving for `shutdown.drainDelaySeconds` after SIGTERM so that its
+      # removal from the Service's endpoints has time to propagate, then closes
+      # in-flight requests. There is no preStop hook because the image is
+      # distroless: no shell, nothing to run `sleep` in.
+      terminationGracePeriodSeconds: {{ .Values.shutdown.terminationGracePeriodSeconds }}
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
@@ -65,6 +71,8 @@ spec:
             {{- if not .Values.rustberg.server.tls.enabled }}
             - "--insecure-http"
             {{- end }}
+            - "--shutdown-delay"
+            - "{{ .Values.shutdown.drainDelaySeconds }}"
           ports:
             - name: http
               containerPort: {{ .Values.rustberg.server.port }}

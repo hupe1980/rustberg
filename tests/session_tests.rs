@@ -335,6 +335,127 @@ async fn a_host_drives_the_whole_lifecycle_in_process() {
     assert!(!session.namespace_exists(&ns(&["lab"])).await.unwrap());
 }
 
+/// The smallest view metadata a catalog will accept.
+///
+/// `ViewRepresentations` has private fields, so it is built through serde
+/// exactly as the REST handler builds it.
+fn view_metadata(
+    namespace: &NamespaceIdent,
+    name: &str,
+    location: &str,
+) -> iceberg::spec::ViewMetadata {
+    use iceberg::ViewCreation;
+    use iceberg::spec::{ViewMetadataBuilder, ViewRepresentations};
+
+    let creation = ViewCreation::builder()
+        .name(name.to_string())
+        .location(location.to_string())
+        .schema(
+            iceberg::spec::Schema::builder()
+                .with_schema_id(0)
+                .build()
+                .unwrap(),
+        )
+        .default_namespace(namespace.clone())
+        .representations(
+            serde_json::from_value::<ViewRepresentations>(json!([{
+                "type": "sql",
+                "sql": "SELECT 1",
+                "dialect": "spark"
+            }]))
+            .expect("representation is well-formed"),
+        )
+        .summary(HashMap::from([(
+            "operation".to_string(),
+            "create".to_string(),
+        )]))
+        .properties(HashMap::new())
+        .build();
+
+    ViewMetadataBuilder::from_view_creation(creation)
+        .expect("view creation is valid")
+        .build()
+        .expect("view metadata builds")
+        .metadata
+}
+
+/// A host creates, commits and drops a view without a router.
+///
+/// `Session` promises that anything reachable through the server is reachable
+/// in-process, with four stated exceptions — idempotency keys, conditional
+/// loading, delegation negotiation and storage access. Views were a fifth that
+/// nobody stated: a host could *list*, *load* and *drop* one but not create or
+/// commit one, so the embedded surface could destroy a view it had no way to
+/// make.
+#[tokio::test]
+async fn a_host_drives_a_views_whole_lifecycle_in_process() {
+    let (app, _admin, _analyst) = seeded().await;
+    let session = app.as_principal(principal("admin", &["admin"]));
+
+    session
+        .create_namespace(&ns(&["viewlab"]), HashMap::new())
+        .await
+        .expect("create namespace");
+
+    let ident = table(&["viewlab"], "summary");
+    let warehouse = app.state().default_warehouse.advertised().to_string();
+    let location = format!("{warehouse}/viewlab/summary");
+
+    let (created_at, _) = session
+        .create_view(
+            &ident,
+            view_metadata(&ns(&["viewlab"]), "summary", &location),
+        )
+        .await
+        .expect("create view");
+    assert!(
+        !created_at.is_empty(),
+        "a created view names where it lives"
+    );
+
+    let (read_at, metadata) = session.load_view(&ident).await.expect("load view");
+
+    let edited = metadata
+        .into_builder()
+        .set_properties(HashMap::from([(
+            "comment".to_string(),
+            "in-process".to_string(),
+        )]))
+        .expect("set properties")
+        .build()
+        .expect("build")
+        .metadata;
+
+    session
+        .commit_view(&ident, &read_at, edited.clone())
+        .await
+        .expect("commit view");
+
+    // The same edit again, from the same read, has lost its race — the guard is
+    // the one the HTTP path uses, not a second opinion about it.
+    let err = session
+        .commit_view(&ident, &read_at, edited)
+        .await
+        .expect_err("a commit from a stale read must be refused");
+    assert_eq!(
+        err.status_code(),
+        axum::http::StatusCode::CONFLICT,
+        "a lost race is a conflict the host retries: {err}"
+    );
+
+    let (_, live) = session.load_view(&ident).await.expect("reload");
+    assert_eq!(
+        live.properties().get("comment").map(String::as_str),
+        Some("in-process")
+    );
+
+    session.drop_view(&ident).await.expect("drop view");
+    assert!(
+        session.load_view(&ident).await.is_err(),
+        "a dropped view is gone on this path too"
+    );
+}
+
 /// A client-supplied location outside the warehouse is refused in-process too.
 ///
 /// This is the confused-deputy check. An in-process path that skipped it would
@@ -521,6 +642,22 @@ async fn the_documented_library_api_still_compiles() {
         .await;
     let _ = session.obligations_for(&events).await;
     let _ = session.list_namespaces(None, page(10)).await;
+
+    // The view block on that page.
+    let summary = table(&["analytics"], "summary");
+    if let Ok((location, metadata)) = session.load_view(&summary).await {
+        let edited = metadata
+            .into_builder()
+            .set_properties(HashMap::from([(
+                "comment".to_string(),
+                "nightly rollup".to_string(),
+            )]))
+            .expect("set properties")
+            .build()
+            .expect("build")
+            .metadata;
+        let _ = session.commit_view(&summary, &location, edited).await;
+    }
 }
 
 /// A session is safe to hold across tasks, which a host will do.
@@ -528,4 +665,52 @@ async fn the_documented_library_api_still_compiles() {
 fn a_session_is_send_and_sync() {
     fn is_send_sync<T: Send + Sync>() {}
     is_send_sync::<rustberg::catalog::Session>();
+}
+
+/// Deletion protection has to hold on both paths, or an embedding host bypasses
+/// a guardrail every HTTP client sees. The `409` is the same on both.
+#[tokio::test]
+async fn a_protected_namespace_is_refused_on_both_paths() {
+    let (app, admin_secret, _) = seeded().await;
+
+    let (status, body) = http(
+        &app,
+        Method::POST,
+        "/v1/namespaces",
+        &admin_secret,
+        Some(json!({
+            "namespace": ["guarded"],
+            "properties": { "rustberg.protected": "true" }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seed: {body}");
+
+    // Over HTTP.
+    let (status, body) = http(
+        &app,
+        Method::DELETE,
+        "/v1/namespaces/guarded",
+        &admin_secret,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    // In process, as the same principal.
+    let session = app.as_principal(principal("admin", &["admin"]));
+    let err = session
+        .drop_namespace(&ns(&["guarded"]))
+        .await
+        .expect_err("the library path must refuse it too");
+
+    assert_eq!(
+        err.status_code(),
+        StatusCode::CONFLICT,
+        "both paths must agree: {err}"
+    );
+    assert!(
+        err.to_string().contains("rustberg.protected"),
+        "and name the property to clear: {err}"
+    );
 }

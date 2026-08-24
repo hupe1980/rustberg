@@ -353,13 +353,18 @@ impl InMemoryApiKeyStore {
     pub fn with_keys(keys: impl IntoIterator<Item = ApiKey>) -> Self {
         let store = Self::new();
         for key in keys {
-            // Use blocking since this is initialization
-            let _ = store.store_sync(key);
+            store.store_sync(key);
         }
         store
     }
 
-    fn store_sync(&self, key: ApiKey) -> Result<(), String> {
+    /// Indexes one key.
+    ///
+    /// Infallible: every index here is a map insert or a push, and a key with an
+    /// id that is already present replaces it. It returned `Result<(), String>`
+    /// and could only ever answer `Ok`, which made the one call site that
+    /// discarded the value read as though it were ignoring a failure.
+    fn store_sync(&self, key: ApiKey) {
         let id = key.id;
         let prefix = key.key_prefix.clone();
         let tenant = key.tenant_id.clone();
@@ -374,8 +379,6 @@ impl InMemoryApiKeyStore {
 
         // Add to tenant index
         self.keys_by_tenant.entry(tenant).or_default().push(id);
-
-        Ok(())
     }
 }
 
@@ -414,7 +417,8 @@ impl ApiKeyStore for InMemoryApiKeyStore {
     }
 
     async fn store(&self, key: ApiKey) -> Result<(), String> {
-        self.store_sync(key)
+        self.store_sync(key);
+        Ok(())
     }
 
     async fn update(&self, key: ApiKey) -> Result<(), String> {
@@ -532,7 +536,7 @@ mod tests {
         // Store the key
         store.store(key.clone()).await.unwrap();
 
-        // Retrieve by prefix and verify with Argon2
+        // Retrieve by prefix and verify the secret
         let candidates = store.get_by_prefix(&key_prefix).await;
         assert_eq!(candidates.len(), 1);
         let retrieved = candidates
@@ -572,7 +576,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_same_prefix_different_keys() {
-        // With Argon2, storing keys with the same prefix is allowed
+        // Storing keys that share a prefix is allowed
         // (they have different Argon2 hashes)
         let store = InMemoryApiKeyStore::new();
 

@@ -126,11 +126,22 @@ zeroize = { version = "1.8", features = ["derive"] }
 # Authorization
 cedar-policy = "4.12"
 
-# Cryptography (encryption at rest)
-
 # Caching
 moka = { version = "0.12", features = ["future", "sync"] }
 dashmap = "6.2"
+
+# Name validation. A table name becomes a path segment, a Cedar entity id and an
+# audit field, so two names that render identically but differ in bytes are an
+# authorization hazard rather than a cosmetic one — `catalog::v1::validation`.
+# Both crates are already in the tree via `url`/`idna`, so this costs no build
+# time; declaring them directly only makes the dependency visible.
+#
+# `default-features = false` on unicode-properties drops the emoji tables, which
+# nothing here asks about.
+unicode-normalization = "0.1"
+unicode-properties = { version = "0.1", default-features = false, features = [
+    "general-category",
+] }
 
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
@@ -151,15 +162,9 @@ parking_lot = "0.12"
 # CI exists to catch, and did not, because the matrix was never built.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form"] }
 
-# Validation
-
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-
-# Backup/Restore
-tar = "0.4"
-flate2 = "1.0"
 
 # TLS (optional)
 rcgen = { version = "0.14", optional = true }
@@ -174,11 +179,24 @@ sqlx = { version = "0.8", optional = true, default-features = false, features = 
 ] }
 redb = "4"
 
-# Storage backends (optional)
-
 # AWS SDK for credential vending (optional)
 aws-config = { version = "1.10", optional = true }
-aws-sdk-sts = { version = "1.110", optional = true }
+# `default-features = false`, and the reason is a whole second TLS stack.
+#
+# `aws-sdk-sts`'s default feature set contains `rustls`, which despite the name
+# is the *legacy* client: `aws-smithy-runtime/tls-rustls` → hyper 0.14, h2 0.3,
+# rustls 0.21 and rustls-webpki 0.101 — none of which anything here calls, and
+# all of which carried open advisories while the modern stack beside them was
+# patched. `default-https-client` is the current path (hyper 1.x, rustls 0.23),
+# and it is what `aws-config` itself defaults to; STS was the one crate in the
+# tree still dragging the old one in.
+#
+# `sigv4a` is dropped with it: it signs for multi-region access points, and the
+# only call made here is `AssumeRole` against a regional STS endpoint.
+aws-sdk-sts = { version = "1.110", optional = true, default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
 
 # SigV4 request signing, for the `/sign` endpoint. AWS's own implementation:
 # see the `remote-signing` feature for why this is not hand-rolled.
@@ -188,10 +206,6 @@ aws-credential-types = { version = "1.3", optional = true }
 
 # GCP SDK for credential vending (optional)
 google-cloud-auth = { version = "1.15", optional = true }
-
-# Rate limiting (optional)
-
-# Metrics and observability (optional)
 
 # CLI (optional)
 clap = { version = "4", features = ["derive", "env"], optional = true }

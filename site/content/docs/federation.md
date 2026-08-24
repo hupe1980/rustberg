@@ -140,6 +140,15 @@ this server's own storage layer, and a mounted catalog's manifests are in storag
 this server does not manage — so a `rest` mount reports it cannot plan, and one
 such mount removes `/plan` from the advertised list.
 
+A `read_only` **native** mount keeps planning: `read_only` says *do not change
+mine*, where a `rest` mount says *this catalog is somebody else's*, and only the
+second puts the manifests out of reach.
+
+It does not remove it from the *native* tables beside it, because a refusal asks
+the backend the namespace routes to: `POST …/plan` succeeds under `analytics.`
+and answers `501` under `partner.`, while `/v1/config` — which speaks for the
+whole catalog — advertises neither.
+
 ---
 
 ## Listing the root

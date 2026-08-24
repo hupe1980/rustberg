@@ -152,9 +152,9 @@ rustberg:
   #   policy_file = "/config/catalog.cedar"
   #
   #   [server.auth.jwt]
-  #   issuer   = "https://auth.example.com"
-  #   audience = "rustberg"
-  #   jwks_url = "https://auth.example.com/.well-known/jwks.json"
+  #   issuer    = "https://auth.example.com"
+  #   audiences = ["rustberg"]
+  #   # jwks_url is discovered from the issuer; set it only to skip discovery.
   #
   # Credential vending is configured the same way. `storage.*` above gives the
   # SERVER its warehouse access; `[credentials]` is what lets it mint scoped,
@@ -260,6 +260,25 @@ readinessProbe:
   periodSeconds: 5
   timeoutSeconds: 3
   failureThreshold: 3
+
+# =============================================================================
+# Shutdown
+# =============================================================================
+# Removing a pod from the Service's endpoints and sending it SIGTERM happen at
+# the same time, and the removal still has to reach every kube-proxy and
+# ingress. A server that stops accepting the instant it is signalled refuses
+# whatever arrives in that window, and clients see connection errors on every
+# rolling update.
+#
+# The usual fix is a preStop hook that sleeps, which cannot work here: the image
+# is distroless and has no shell. Rustberg does the wait itself — it keeps
+# serving for `drainDelaySeconds` after SIGTERM, then drains in-flight requests.
+#
+# terminationGracePeriodSeconds must cover the delay *plus* the drain, or the
+# kubelet SIGKILLs the process partway through it.
+shutdown:
+  drainDelaySeconds: 5
+  terminationGracePeriodSeconds: 60
 
 # =============================================================================
 # Persistence

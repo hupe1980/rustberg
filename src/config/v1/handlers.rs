@@ -7,25 +7,29 @@ use std::collections::HashMap;
 
 use crate::app::AppState;
 
-/// Endpoints this server implements, in the form the spec requires:
-/// `<HTTP verb> <resource path from the OpenAPI spec>`.
-///
-/// Clients feature-detect from this list, so the paths must match the spec
-/// exactly — including the `{prefix}` segment. Non-spec routes (health, metrics)
-/// are deliberately absent: this list describes the catalog API, and advertising
-/// paths a client cannot interpret only invites confusion.
-/// Endpoints that only exist when a capability is present.
+/// The endpoints this deployment advertises, given what it can actually do.
 ///
 /// Advertising is the **intersection** across mounts, not the union: `endpoints`
 /// is one list describing one catalog, a client feature-detects from it once,
 /// and an entry that fails on some namespaces is worse than an absent one. The
 /// operation is still reachable on the mounts that support it — what the
 /// intersection governs is only what is promised.
-fn endpoints_for(capabilities: &crate::catalog::Capabilities, signing: bool) -> Vec<String> {
+///
+/// `signing` and `vending` are the two entries that work the other way round.
+/// They are properties of how *storage access* was configured rather than of a
+/// backend, so they are added when available instead of removed when missing.
+fn endpoints_for(
+    capabilities: &crate::catalog::Capabilities,
+    signing: bool,
+    vending: bool,
+) -> Vec<String> {
     let mut endpoints: Vec<String> = SUPPORTED_ENDPOINTS.iter().map(|s| s.to_string()).collect();
 
     if signing {
         endpoints.push(SIGN_ENDPOINT.to_string());
+    }
+    if vending {
+        endpoints.push(CREDENTIALS_ENDPOINT.to_string());
     }
 
     if !capabilities.write {
@@ -41,21 +45,31 @@ fn endpoints_for(capabilities: &crate::catalog::Capabilities, signing: bool) -> 
         endpoints.retain(|e| !e.ends_with("/register") && !e.ends_with("register-view"));
     }
     if !capabilities.scan_planning {
-        endpoints.retain(|e| !e.contains("/plan"));
+        endpoints.retain(|e| !is_planning(e));
     }
 
     endpoints
 }
 
+/// Whether an endpoint is part of the scan-planning interface.
+///
+/// The three go in and out together: `planTableScan`, the poll it would be
+/// answered by, and `fetchScanTasks`. Matching on `"/plan"` alone left `/tasks`
+/// behind — advertised on a catalog that cannot plan, and dropped from a
+/// read-only one that can.
+fn is_planning(endpoint: &str) -> bool {
+    endpoint.contains("/plan") || endpoint.ends_with("/tasks")
+}
+
 /// Whether an endpoint changes catalog state.
 ///
+/// The rule is *mutation*, not the HTTP verb — see the exceptions below.
 fn is_mutating(endpoint: &str) -> bool {
-    // Two `POST`s and one `DELETE` change nothing in the catalog: reporting scan
-    // telemetry, planning a scan, and cancelling a plan. All three work on a
-    // read-only mount, so classifying by verb would under-advertise them — an
-    // advertisement is a lie when it under-reports as much as when it
-    // over-reports.
-    if endpoint.ends_with("/metrics") || endpoint.contains("/plan") {
+    // Reporting scan telemetry and the three planning endpoints change nothing
+    // in the catalog, whatever their verb. They work on a read-only mount, so
+    // classifying by verb would under-advertise them — an advertisement is a lie
+    // when it under-reports as much as when it over-reports.
+    if endpoint.ends_with("/metrics") || is_planning(endpoint) {
         return false;
     }
     endpoint.starts_with("POST ") || endpoint.starts_with("DELETE ")
@@ -66,6 +80,27 @@ fn is_mutating(endpoint: &str) -> bool {
 /// it is added rather than removed.
 const SIGN_ENDPOINT: &str = "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/sign";
 
+/// Advertised only where credential vending covers every warehouse this catalog
+/// serves — see [`AppState::vending`](crate::AppState::vending).
+///
+/// Added rather than removed, for the same reason as [`SIGN_ENDPOINT`]: it is a
+/// property of how storage access was configured, not of a backend. Advertised
+/// unconditionally, a deployment with no credential provider promises an
+/// endpoint whose only possible answer is `501` — the shape of lie the
+/// intersection rule exists to prevent, one layer up from the mounts.
+const CREDENTIALS_ENDPOINT: &str =
+    "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials";
+
+/// Endpoints this server implements unconditionally, in the form the spec
+/// requires: `<HTTP verb> <resource path from the OpenAPI spec>`.
+///
+/// Clients feature-detect from this list, so the paths must match the spec
+/// exactly — including the `{prefix}` segment. Non-spec routes (health, metrics)
+/// are deliberately absent: this list describes the catalog API, and advertising
+/// paths a client cannot interpret only invites confusion.
+///
+/// [`endpoints_for`] then removes what a mount cannot do and adds the two that
+/// depend on storage access being configured.
 const SUPPORTED_ENDPOINTS: &[&str] = &[
     "GET /v1/{prefix}/namespaces",
     "POST /v1/{prefix}/namespaces",
@@ -79,10 +114,15 @@ const SUPPORTED_ENDPOINTS: &[&str] = &[
     "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}",
     "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}",
     "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}",
-    "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials",
     "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/plan",
     "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/plan/{plan-id}",
     "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}/plan/{plan-id}",
+    // `fetchScanTasks`. Advertised beside the other two planning endpoints
+    // because it is routed and answers the spec's own `NoSuchPlanTaskException`
+    // — the same reason the poll endpoint is advertised even though every plan
+    // here completes inline. Two of three would say this server implements part
+    // of an interface it implements all of.
+    "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/tasks",
     "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics",
     "POST /v1/{prefix}/namespaces/{namespace}/register",
     "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/unregister",
@@ -198,7 +238,7 @@ pub async fn get_config(
         // No defaults are sent. The spec's illustrative `clients: "4"` means
         // nothing to any client, and echoing it would be noise.
         defaults: HashMap::new(),
-        endpoints: endpoints_for(&state.capabilities, state.signing.enabled),
+        endpoints: endpoints_for(&state.capabilities, state.signing.enabled, state.vending),
         idempotency_key_lifetime: iso8601_duration(state.idempotency_cache.ttl()),
     }))
 }
@@ -247,11 +287,46 @@ mod tests {
     /// one.
     #[test]
     fn signing_is_advertised_only_when_configured() {
-        let off = endpoints_for(&crate::catalog::Capabilities::full(), false);
+        let off = endpoints_for(&crate::catalog::Capabilities::full(), false, false);
         assert!(!off.iter().any(|e| e.ends_with("/sign")));
 
-        let on = endpoints_for(&crate::catalog::Capabilities::full(), true);
+        let on = endpoints_for(&crate::catalog::Capabilities::full(), true, false);
         assert!(on.iter().any(|e| e.ends_with("/sign")));
+    }
+
+    /// Credential vending is advertised only where the provider covers every
+    /// warehouse this catalog serves. Without one, `loadCredentials` can only
+    /// ever answer `501`, and promising it is the same lie a union across mounts
+    /// would be.
+    #[test]
+    fn credential_vending_is_advertised_only_when_it_works_everywhere() {
+        let off = endpoints_for(&crate::catalog::Capabilities::full(), false, false);
+        assert!(!off.iter().any(|e| e.ends_with("/credentials")));
+
+        let on = endpoints_for(&crate::catalog::Capabilities::full(), false, true);
+        assert!(on.iter().any(|e| e.ends_with("/credentials")));
+    }
+
+    /// All three planning endpoints are routed, so all three are advertised —
+    /// and all three disappear together on a mount that cannot plan.
+    #[test]
+    fn every_planning_endpoint_is_advertised_together() {
+        let full = endpoints_for(&crate::catalog::Capabilities::full(), false, false);
+        for suffix in ["/plan", "/plan/{plan-id}", "/tasks"] {
+            assert!(full.iter().any(|e| e.ends_with(suffix)), "missing {suffix}");
+        }
+
+        let unplannable = crate::catalog::Capabilities {
+            scan_planning: false,
+            ..crate::catalog::Capabilities::full()
+        };
+        let none = endpoints_for(&unplannable, false, false);
+        for suffix in ["/plan", "/plan/{plan-id}", "/tasks"] {
+            assert!(
+                !none.iter().any(|e| e.ends_with(suffix)),
+                "still advertising {suffix}"
+            );
+        }
     }
 
     /// Clients feature-detect from this list, so every entry must be a real
@@ -261,6 +336,7 @@ mod tests {
         for ep in SUPPORTED_ENDPOINTS
             .iter()
             .chain(std::iter::once(&SIGN_ENDPOINT))
+            .chain(std::iter::once(&CREDENTIALS_ENDPOINT))
         {
             let (verb, path) = ep.split_once(' ').expect("`<VERB> <path>`");
             assert!(
@@ -325,7 +401,7 @@ mod tests {
     /// list is advertised.
     #[test]
     fn full_capabilities_advertise_every_endpoint() {
-        let endpoints = endpoints_for(&crate::catalog::Capabilities::full(), false);
+        let endpoints = endpoints_for(&crate::catalog::Capabilities::full(), false, false);
         assert_eq!(endpoints.len(), SUPPORTED_ENDPOINTS.len());
     }
 
@@ -333,7 +409,7 @@ mod tests {
     /// catalog promises, because the list cannot say "except over there".
     #[test]
     fn a_read_only_catalog_advertises_no_mutations() {
-        let endpoints = endpoints_for(&crate::catalog::Capabilities::read_only(), false);
+        let endpoints = endpoints_for(&crate::catalog::Capabilities::read_only(), false, false);
 
         assert!(!endpoints.is_empty(), "reads are still advertised");
         for endpoint in &endpoints {
@@ -351,7 +427,7 @@ mod tests {
     /// endpoint that works everywhere, which is a lie in the other direction.
     #[test]
     fn a_read_only_catalog_still_advertises_metrics_reporting() {
-        let endpoints = endpoints_for(&crate::catalog::Capabilities::read_only(), false);
+        let endpoints = endpoints_for(&crate::catalog::Capabilities::read_only(), false, false);
         assert!(endpoints.iter().any(|e| e.ends_with("/metrics")));
     }
 
@@ -361,7 +437,7 @@ mod tests {
             views: false,
             ..crate::catalog::Capabilities::full()
         };
-        let endpoints = endpoints_for(&capabilities, false);
+        let endpoints = endpoints_for(&capabilities, false, false);
 
         assert!(endpoints.iter().all(|e| !e.contains("/views")));
         assert!(
@@ -378,7 +454,7 @@ mod tests {
             multi_table_commit: false,
             ..crate::catalog::Capabilities::full()
         };
-        let endpoints = endpoints_for(&capabilities, false);
+        let endpoints = endpoints_for(&capabilities, false, false);
         assert!(
             endpoints
                 .iter()

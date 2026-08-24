@@ -13,8 +13,10 @@ pub mod credentials;
 pub mod error;
 pub mod location;
 pub mod management;
+pub mod names;
 pub mod observability;
 pub mod predicate;
+pub mod remote_ip;
 pub mod server;
 mod utils;
 

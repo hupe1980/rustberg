@@ -851,7 +851,12 @@ async fn test_commit_table_snapshot_persisted() {
                     "summary": {
                         "operation": "append"
                     },
-                    "manifest-list": "file:///tmp/test-manifest-list.avro",
+                    // Inside the warehouse. A manifest list outside it is
+                    // refused — see
+                    // `commit_cannot_move_a_table_outside_the_warehouse` — and
+                    // this test is about the snapshot being persisted, not
+                    // about where a client may put one.
+                    "manifest-list": "memory://test/snapshot-persist-test/snapshot_table/metadata/snap-1.avro",
                     "schema-id": 0
                 }
             },
@@ -1537,13 +1542,13 @@ async fn test_idempotency_key_on_create_namespace() {
     let response1 = router.clone().oneshot(request1).await.unwrap();
     assert_eq!(response1.status(), StatusCode::OK);
 
-    // Check that idempotency key was used
-    assert_eq!(
-        response1
-            .headers()
-            .get("idempotency-key-used")
-            .map(|v| v.to_str().unwrap()),
-        Some("true")
+    // The request that did the work is not a replay. Marking it as one would put
+    // the header on every response carrying a key, which is the one thing it
+    // must not do — a client could then no longer tell a successful retry from a
+    // first attempt.
+    assert!(
+        response1.headers().get("idempotency-key-used").is_none(),
+        "the response that executed the operation is not a replay"
     );
 
     // Second request with same idempotency key should return cached response
@@ -1563,7 +1568,8 @@ async fn test_idempotency_key_on_create_namespace() {
             .headers()
             .get("idempotency-key-used")
             .map(|v| v.to_str().unwrap()),
-        Some("true")
+        Some("true"),
+        "only the replay carries the marker"
     );
 }
 
@@ -1781,6 +1787,114 @@ async fn test_request_id_header_propagation() {
 
     // Verify request ID header is present in response
     assert!(response.headers().contains_key("x-request-id"));
+}
+
+/// A `401` carries a challenge, which RFC 9110 makes a MUST.
+///
+/// A client that negotiates its scheme from `WWW-Authenticate` — `curl
+/// --anyauth`, a generated OpenAPI client, anything driven by an HTTP library's
+/// auth layer — is otherwise left with a status code and nothing to act on.
+/// `Bearer` is accurate for both mechanisms: the API key path reads
+/// `Authorization: Bearer <key>` as well as `X-API-Key`.
+#[tokio::test]
+async fn an_unauthorized_response_carries_a_challenge() {
+    let (app, _state, store) = create_test_app_with_auth().await;
+    let (api_key, secret) = ApiKeyBuilder::new("challenge-key", "tenant-challenge")
+        .with_role("admin")
+        .build();
+    store.store(api_key).await.expect("store key");
+    let router = app.into_router();
+
+    for credential in [None, Some("rb_definitelynotarealkey0000000000000000000")] {
+        let mut builder = Request::builder().method(Method::GET).uri("/v1/config");
+        if let Some(credential) = credential {
+            builder = builder.header("x-api-key", credential);
+        }
+        let response = router
+            .clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{credential:?}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer realm=\"rustberg\""),
+            "a 401 must carry a challenge ({credential:?})"
+        );
+    }
+
+    // And the real key still works, so the challenge is not being emitted in
+    // place of a successful authentication.
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/config")
+                .header("x-api-key", secret.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// An inbound correlation id is carried through when this server can carry it,
+/// and **replaced** when it cannot.
+///
+/// Replaced rather than ignored: the response echoes whatever reached the
+/// request-id layer, so an id dropped only from the audit record would leave the
+/// echo and the record naming different things — and a caller could unjoin every
+/// one of its requests from the trail by sending an oversized id. The rule and
+/// the echo have to be the same rule.
+#[tokio::test]
+async fn an_unusable_correlation_id_is_replaced_rather_than_echoed() {
+    let (app, _state) = create_test_app_no_auth().await;
+    let router = app.into_router();
+
+    let echoed = |id: &str| {
+        let router = router.clone();
+        let id = id.to_string();
+        async move {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("/v1/config")
+                .header("x-request-id", id)
+                .body(Body::empty())
+                .unwrap();
+            let response = router.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+                .expect("every response carries one")
+        }
+    };
+
+    assert_eq!(
+        echoed("trace-abc.123:x").await,
+        "trace-abc.123:x",
+        "a usable id must survive the hop"
+    );
+
+    for unusable in ["a".repeat(300), "has space".to_string(), " ".to_string()] {
+        let back = echoed(&unusable).await;
+        assert_ne!(back, unusable, "{unusable:?} must not be echoed");
+        assert!(
+            uuid::Uuid::parse_str(&back).is_ok(),
+            "an unusable id must be replaced by a minted one, got {back:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2931,6 +3045,56 @@ async fn load_table_returns_an_etag() {
         etag.starts_with('"') && etag.ends_with('"'),
         "quoted: {etag}"
     );
+
+    // A validator under `no-store` is an instruction not to use it: a client
+    // that honours `no-store` keeps no copy, so it never sends
+    // `If-None-Match`. `no-cache` is the header that means "keep it, but
+    // revalidate before reuse", which is what conditional loading is.
+    let cache = headers
+        .get("cache-control")
+        .expect("a cacheable response says so")
+        .to_str()
+        .unwrap();
+    assert!(
+        cache.contains("no-cache"),
+        "an ETag needs a revalidate-before-reuse directive, got: {cache}"
+    );
+    assert!(
+        cache.contains("private"),
+        "the response is scoped to one principal and must not enter a shared cache: {cache}"
+    );
+    assert!(
+        !cache.contains("no-store"),
+        "no-store forbids the stored copy the ETag exists to revalidate: {cache}"
+    );
+}
+
+/// The other half of the rule: a response carrying a freshly minted credential
+/// has no stable identity, gets no validator, and must not be stored at all.
+#[tokio::test]
+async fn a_credentialed_load_is_not_cacheable() {
+    let (app, _state) = create_test_app_no_auth().await;
+    let path = table_for_freshness_tests(&app, "uncacheable_ns").await;
+
+    let (status, headers, _) = request_with_headers(
+        &app,
+        Method::GET,
+        &path,
+        &[("x-iceberg-access-delegation", "vended-credentials")],
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers.get("etag").is_none(),
+        "a response carrying an expiring credential has no stable identity"
+    );
+    let cache = headers.get("cache-control").unwrap().to_str().unwrap();
+    assert!(
+        cache.contains("no-store"),
+        "a response that may carry a credential must not be stored: {cache}"
+    );
 }
 
 /// The point of the feature: an unchanged table costs a header exchange rather
@@ -2971,6 +3135,84 @@ async fn a_stale_etag_returns_the_full_document() {
 
     assert_eq!(status, StatusCode::OK, "a tag we never issued is a miss");
     assert!(body.contains("metadata"), "the full document is returned");
+}
+
+/// A client that echoes a tag *and* asks for credentials must not be told "not
+/// modified" — a `304` carries no body, so it would be left with nothing to read
+/// the table with, and no way to tell that is what happened.
+///
+/// `loadTable` is not one representation. Asked for `vended-credentials` it
+/// returns a freshly minted, expiring credential alongside the metadata, and
+/// that has no stable identity to name with a validator. So no tag is issued
+/// and no conditional request is answered.
+#[tokio::test]
+async fn a_load_asking_for_credentials_is_never_answered_304() {
+    let (app, _state) = create_test_app_no_auth().await;
+    let path = table_for_freshness_tests(&app, "delegated_etag_ns").await;
+
+    // A plain load names a version.
+    let (_, headers, _) = request_with_headers(&app, Method::GET, &path, &[], None).await;
+    let etag = headers.get("etag").unwrap().to_str().unwrap().to_string();
+
+    // The same load, now asking for storage access, must not reuse it.
+    let (status, headers, body) = request_with_headers(
+        &app,
+        Method::GET,
+        &path,
+        &[
+            ("if-none-match", &etag),
+            ("x-iceberg-access-delegation", "vended-credentials"),
+        ],
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a credentialed load has no cached form to satisfy"
+    );
+    assert!(body.contains("metadata"), "the full document is returned");
+    assert!(
+        headers.get("etag").is_none(),
+        "a response carrying an expiring credential must not be given a validator"
+    );
+}
+
+/// A load asking for remote signing can return a *different document* from a
+/// plain one — where the deployment offers signing, it carries the signer block
+/// — so the two must not share a validator. The tag is keyed on what was
+/// *asked for* rather than on what came back, so it does not quietly start
+/// colliding when signing is switched on. Unlike a vended credential the signer
+/// block holds no secret and does not expire, so this representation still
+/// caches.
+#[tokio::test]
+async fn a_signed_load_and_a_plain_load_do_not_share_a_validator() {
+    let (app, _state) = create_test_app_no_auth().await;
+    let path = table_for_freshness_tests(&app, "signing_etag_ns").await;
+
+    let (_, headers, _) = request_with_headers(&app, Method::GET, &path, &[], None).await;
+    let plain = headers.get("etag").unwrap().to_str().unwrap().to_string();
+
+    let (status, headers, _) = request_with_headers(
+        &app,
+        Method::GET,
+        &path,
+        &[
+            ("if-none-match", &plain),
+            ("x-iceberg-access-delegation", "remote-signing"),
+        ],
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "different content must be re-sent");
+    let signed = headers
+        .get("etag")
+        .expect("a signed load is still cacheable")
+        .to_str()
+        .unwrap();
+    assert_ne!(signed, plain);
 }
 
 /// The tag folds in the snapshot scope, so a client holding the pruned document
@@ -3578,5 +3820,608 @@ async fn a_conditional_load_never_reads_the_metadata_document() {
         status,
         StatusCode::NOT_MODIFIED,
         "a 304 must be answerable from the registry pointer alone: {body}"
+    );
+}
+
+// ── Deletion protection ─────────────────────────────────────────────────────
+
+/// `rustberg.protected = "true"` refuses a drop until it is cleared. It guards
+/// against the accident — a `DROP TABLE` against the wrong catalog — and says so
+/// with `409`, because the caller is permitted and the *resource* is in a state
+/// that forbids the operation.
+#[tokio::test]
+async fn a_protected_table_cannot_be_dropped_until_it_is_unprotected() {
+    let (app, _state) = create_test_app_no_auth().await;
+    let router = app.clone().into_router();
+
+    let create_ns = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/namespaces")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "namespace": ["prot_ns"] })).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(create_ns).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let create_table = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/namespaces/prot_ns/tables")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "name": "keepme",
+                "schema": { "type": "struct", "fields": [], "schema-id": 0 },
+                "properties": { "rustberg.protected": "true" }
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let created = router.clone().oneshot(create_table).await.unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    // The drop is refused, and the message names the property to clear.
+    let drop = Request::builder()
+        .method(Method::DELETE)
+        .uri("/v1/namespaces/prot_ns/tables/keepme")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.clone().oneshot(drop).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("rustberg.protected"),
+        "the refusal must name the property to clear: {body}"
+    );
+
+    // Still there.
+    let head = Request::builder()
+        .method(Method::HEAD)
+        .uri("/v1/namespaces/prot_ns/tables/keepme")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(head).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+
+    // Clearing it is an ordinary commit — protection stops an accident, not an
+    // adversary, and the docs say exactly that.
+    let unprotect = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/namespaces/prot_ns/tables/keepme")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "requirements": [],
+                "updates": [{ "action": "remove-properties", "removals": ["rustberg.protected"] }]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(unprotect).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let drop = Request::builder()
+        .method(Method::DELETE)
+        .uri("/v1/namespaces/prot_ns/tables/keepme")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(drop).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+}
+
+/// A namespace is protected the same way, through its own properties.
+#[tokio::test]
+async fn a_protected_namespace_cannot_be_dropped() {
+    let (app, _state) = create_test_app_no_auth().await;
+    let router = app.clone().into_router();
+
+    let create = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/namespaces")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "namespace": ["prot_keep"],
+                "properties": { "rustberg.protected": "true" }
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(create).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let drop = Request::builder()
+        .method(Method::DELETE)
+        .uri("/v1/namespaces/prot_keep")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(drop).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+}
+
+/// A commit may not move a table's location.
+///
+/// `TableUpdate::SetLocation` is an ordinary update, so `commitTable` accepts a
+/// client-supplied location the way `createTable` and `registerTable` do — and
+/// needs the same confinement.
+///
+/// The reachable consequence is not the location itself; it is what reads it. A
+/// vended credential and a signed request are both scoped to *the table's
+/// location*, so a caller with `Update` on one table of its own could point that
+/// table at another tenant's prefix inside the same warehouse and ask for
+/// credentials on it.
+#[tokio::test]
+async fn commit_cannot_move_a_table_outside_the_warehouse() {
+    let (app, _state) = create_test_app_no_auth().await;
+    namespace_for_location_tests(&app, "move_ns").await;
+
+    let (status, body) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/move_ns/tables",
+        None,
+        Some(json!({ "name": "t", "schema": location_test_schema() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // `set-location` is the obvious one. The other three are the ones that are
+    // easy to miss, because they read as "record a snapshot" and "record a
+    // sketch" rather than "supply a path" — and each names a file that scan
+    // planning reads or a purge deletes.
+    let outside = "memory://someone-else/secrets";
+    let updates = [
+        json!({ "action": "set-location", "location": outside }),
+        json!({ "action": "set-location", "location": "memory://test/../elsewhere" }),
+        json!({
+            "action": "add-snapshot",
+            "snapshot": {
+                "snapshot-id": 1,
+                "sequence-number": 1,
+                "timestamp-ms": 1_700_000_000_000i64,
+                "manifest-list": format!("{outside}/snap-1.avro"),
+                "summary": { "operation": "append" },
+                "schema-id": 0
+            }
+        }),
+        json!({
+            "action": "set-statistics",
+            "snapshot-id": 1,
+            "statistics": {
+                "snapshot-id": 1,
+                "statistics-path": format!("{outside}/stats.puffin"),
+                "file-size-in-bytes": 1,
+                "file-footer-size-in-bytes": 1,
+                "blob-metadata": []
+            }
+        }),
+        json!({
+            "action": "set-partition-statistics",
+            "partition-statistics": {
+                "snapshot-id": 1,
+                "statistics-path": format!("{outside}/partition-stats.parquet"),
+                "file-size-in-bytes": 1
+            }
+        }),
+    ];
+
+    for update in updates {
+        let (status, body) = make_request(
+            &app,
+            Method::POST,
+            "/v1/namespaces/move_ns/tables/t",
+            None,
+            Some(json!({ "requirements": [], "updates": [update.clone()] })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a commit carried a location outside this table ({update}): {body}"
+        );
+        // Two bounds, two sentences. `set-location` is refused by what the
+        // table's *name* entitles it to; the three that name files are refused
+        // by the table's own storage, which is where its files legitimately are
+        // even when a rename has left them somewhere its name does not imply.
+        let expected = if update["action"] == "set-location" {
+            "where this catalog keeps this resource's files"
+        } else {
+            "outside the table's own storage"
+        };
+        assert!(
+            body.contains(expected),
+            "the refusal should name the boundary that applied ({update}): {body}"
+        );
+    }
+}
+
+/// A rename moves a table's registry entry and never its files — that is
+/// Iceberg's semantics — so the files of `db.old` renamed to `db.new` stay at
+/// `…/db/old`.
+///
+/// That is why a commit's file-naming updates are bounded by the table's *own
+/// location* rather than by the prefix its name implies. Bounding them by the
+/// name makes every rename produce an unwritable table, with each subsequent
+/// commit refused for naming a manifest list "outside" a table that is sitting
+/// exactly where the catalog put it.
+#[tokio::test]
+async fn a_renamed_table_can_still_be_committed_to() {
+    let (app, _state) = create_test_app_no_auth().await;
+    namespace_for_location_tests(&app, "rename_ns").await;
+
+    let (status, body) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/rename_ns/tables",
+        None,
+        Some(json!({ "name": "old", "schema": location_test_schema() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let location =
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["metadata"]["location"]
+            .as_str()
+            .expect("a created table names its location")
+            .to_string();
+    assert!(location.ends_with("rename_ns/old"), "{location}");
+
+    let (status, body) = make_request(
+        &app,
+        Method::POST,
+        "/v1/tables/rename",
+        None,
+        Some(json!({
+            "source": { "namespace": ["rename_ns"], "name": "old" },
+            "destination": { "namespace": ["rename_ns"], "name": "new" }
+        })),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is after the epoch")
+        .as_millis() as i64;
+
+    let (status, body) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/rename_ns/tables/new",
+        None,
+        Some(json!({
+            "requirements": [],
+            "updates": [{
+                "action": "add-snapshot",
+                "snapshot": {
+                    "snapshot-id": 1,
+                    "sequence-number": 1,
+                    "timestamp-ms": now,
+                    "manifest-list": format!("{location}/metadata/snap-1.avro"),
+                    "summary": { "operation": "append" },
+                    "schema-id": 0
+                }
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a renamed table must still accept commits naming its own files: {body}"
+    );
+}
+
+/// The other half: a location inside the table's *own* prefix still commits, so
+/// the check is a boundary and not a ban. Reorganising underneath a table is
+/// its own business.
+#[tokio::test]
+async fn commit_may_move_a_table_within_its_own_prefix() {
+    let (app, _state) = create_test_app_no_auth().await;
+    namespace_for_location_tests(&app, "move_ok_ns").await;
+
+    let (status, body) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/move_ok_ns/tables",
+        None,
+        Some(json!({ "name": "t", "schema": location_test_schema() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/move_ok_ns/tables/t",
+        None,
+        Some(json!({
+            "requirements": [],
+            "updates": [{
+                "action": "set-location",
+                "location": "memory://test/move_ok_ns/t/relocated"
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("move_ok_ns/t/relocated"),
+        "the new location should be in the response: {body}"
+    );
+}
+
+/// And the boundary that matters: a *sibling* location inside the same
+/// warehouse is refused.
+///
+/// This is the whole reason the bound is the table's prefix rather than the
+/// warehouse. Storage access is scoped to the table's location, so a caller
+/// with `Update` on one table of its own could otherwise point that table at a
+/// prefix its policy never mentioned and be handed a correctly-scoped
+/// credential for it. Every step of that sequence is permitted; the location
+/// was simply not the caller's to choose.
+#[tokio::test]
+async fn commit_cannot_move_a_table_onto_a_sibling_prefix() {
+    let (app, _state) = create_test_app_no_auth().await;
+    namespace_for_location_tests(&app, "sibling_ns").await;
+
+    for name in ["mine", "secret"] {
+        let (status, body) = make_request(
+            &app,
+            Method::POST,
+            "/v1/namespaces/sibling_ns/tables",
+            None,
+            Some(json!({ "name": name, "schema": location_test_schema() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    // Another table in the same namespace...
+    let (status, body) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/sibling_ns/tables/mine",
+        None,
+        Some(json!({
+            "requirements": [],
+            "updates": [{
+                "action": "set-location",
+                "location": "memory://test/sibling_ns/secret"
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // ...and another namespace entirely.
+    let (status, body) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/sibling_ns/tables/mine",
+        None,
+        Some(json!({
+            "requirements": [],
+            "updates": [{
+                "action": "set-location",
+                "location": "memory://test/finance/payroll"
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// `createTable` and `registerTable` name a location outright, so they carry the
+/// same hazard as `set-location` and get the same answer.
+#[tokio::test]
+async fn a_created_table_cannot_claim_another_namespaces_prefix() {
+    let (app, _state) = create_test_app_no_auth().await;
+    namespace_for_location_tests(&app, "claim_ns").await;
+
+    for location in [
+        "memory://test/finance/payroll",    // another namespace
+        "memory://test/claim_ns/neighbour", // a sibling in this one
+        "memory://test",                    // the warehouse root
+    ] {
+        let (status, body) = make_request(
+            &app,
+            Method::POST,
+            "/v1/namespaces/claim_ns/tables",
+            None,
+            Some(json!({
+                "name": "t",
+                "location": location,
+                "schema": location_test_schema()
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "createTable claimed '{location}': {body}"
+        );
+    }
+
+    // Its own canonical prefix is accepted, which is what a client that echoes
+    // the location back sends.
+    let (status, body) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/claim_ns/tables",
+        None,
+        Some(json!({
+            "name": "t",
+            "location": "memory://test/claim_ns/t",
+            "schema": location_test_schema()
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Every error carries the Iceberg envelope, including the ones the framework
+/// answers on its own.
+///
+/// The spec defines *every* error as `{"error": {"message", "type", "code"}}`,
+/// and a client reads `error.message` out of it. An unrouted path and a wrong
+/// method are answered by the router, beneath every handler, and they used to
+/// arrive as a bare status with an empty body — so "you sent a PUT where this
+/// takes POST" reached the client as a JSON parse failure. The same was true of
+/// the body-limit and timeout layers.
+#[tokio::test]
+async fn framework_errors_carry_the_iceberg_envelope() {
+    let (app, _state) = create_test_app_no_auth().await;
+
+    for (method, path, expected) in [
+        (Method::GET, "/no/such/path", StatusCode::NOT_FOUND),
+        (
+            Method::PUT,
+            "/v1/namespaces",
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+    ] {
+        let (status, body) = make_request(&app, method.clone(), path, None, None).await;
+        assert_eq!(status, expected, "{method} {path}: {body}");
+
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("{method} {path} did not answer JSON ({e}): {body:?}"));
+        assert_eq!(parsed["error"]["code"], expected.as_u16(), "{body}");
+        assert!(parsed["error"]["type"].is_string(), "{body}");
+        assert!(
+            parsed["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("/v1/config")),
+            "the message should say where to find what this server serves: {body}"
+        );
+    }
+}
+
+/// The other half: a response that already says what it is passes through.
+///
+/// The envelope layer keys on `Content-Type` being absent, so anything this
+/// server wrote deliberately — including the three endpoints that are not part
+/// of the catalog API — must be untouched.
+#[tokio::test]
+async fn the_envelope_layer_leaves_deliberate_responses_alone() {
+    let (app, _state) = create_test_app_no_auth().await;
+
+    for (path, expect) in [
+        ("/health", "\"status\":\"healthy\""),
+        ("/ready", "\"components\""),
+        ("/metrics", "rustberg_info"),
+    ] {
+        let (status, body) = make_request(&app, Method::GET, path, None, None).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert!(body.contains(expect), "{path} was rewritten: {body}");
+        assert!(
+            !body.starts_with("{\"error\""),
+            "{path} was given an error envelope: {body}"
+        );
+    }
+}
+
+/// Two writers racing on a v3 table get `409`, not `400`.
+///
+/// Format version 3 gives every row an id: the table carries `next-row-id`, and
+/// a writer stamps its snapshot with `first-row-id` taken from the metadata it
+/// read. Two writers that read the same metadata stamp the same value, and the
+/// second is stale — a lost race, whose answer is `409 CommitFailedException`
+/// so the client refreshes and commits again.
+///
+/// `iceberg-rust`'s builder catches the condition and reports it as invalid
+/// data, which maps to `400`. A `400` says *your request is malformed*, and no
+/// client retries one, so concurrent writers on a v3 table would have their
+/// second write rejected permanently over row ids.
+#[tokio::test]
+async fn a_stale_row_id_assignment_is_a_conflict_not_a_bad_request() {
+    let (app, _state) = create_test_app_no_auth().await;
+    namespace_for_location_tests(&app, "v3_ns").await;
+
+    let (status, body) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/v3_ns/tables",
+        None,
+        Some(json!({
+            "name": "t",
+            "schema": location_test_schema(),
+            "properties": { "format-version": "3" }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Snapshot timestamps must not go backwards, so they are taken from the
+    // clock rather than written down.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_millis() as i64;
+
+    // Both writers read `next-row-id: 0` and stamp `first-row-id: 0`.
+    let snapshot = |id: i64| {
+        json!({
+            "requirements": [],
+            "updates": [{
+                "action": "add-snapshot",
+                "snapshot": {
+                    "snapshot-id": id,
+                    "sequence-number": 1,
+                    "timestamp-ms": now + id,
+                    "manifest-list": format!(
+                        "memory://test/v3_ns/t/metadata/snap-{id}.avro"
+                    ),
+                    "summary": { "operation": "append" },
+                    "schema-id": 0,
+                    "first-row-id": 0,
+                    "added-rows": 10
+                }
+            }]
+        })
+    };
+
+    let (status, body) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/v3_ns/tables/t",
+        None,
+        Some(snapshot(1)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the first writer wins: {body}");
+
+    let (status, body) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/v3_ns/tables/t",
+        None,
+        Some(snapshot(2)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the second writer lost a race and must be told to retry: {body}"
+    );
+    assert!(
+        body.contains("CommitFailedException"),
+        "a lost race is a commit failure, which is what clients retry: {body}"
     );
 }

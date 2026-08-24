@@ -89,9 +89,8 @@ rustberg:
     policy_file = "/config/catalog.cedar"
 
     [server.auth.jwt]
-    issuer   = "https://auth.example.com"
-    audience = "rustberg"
-    jwks_url = "https://auth.example.com/.well-known/jwks.json"
+    issuer    = "https://auth.example.com"
+    audiences = ["rustberg"]
 
 ingress:
   enabled: true
@@ -200,6 +199,13 @@ helm upgrade rustberg charts/rustberg -f values.yaml
 
 With the Postgres backend this is an ordinary rolling update. With redb it is a
 `Recreate`, so expect a few seconds of downtime.
+
+A pod leaving rotation keeps serving for `shutdown.drainDelaySeconds` after
+`SIGTERM`, so its removal from the Service's endpoints has time to reach every
+kube-proxy and ingress before it stops answering. There is no `preStop` hook —
+the image is distroless and has no shell — so the wait is in the binary, and
+`shutdown.terminationGracePeriodSeconds` has to cover it plus the 30-second
+drain that follows.
 
 ## Uninstalling
 

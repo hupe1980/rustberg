@@ -82,13 +82,13 @@ use iceberg::{
 };
 
 use super::v1::guard::{self, Target};
-use super::v1::ownership::{self, set_owner, strip_reserved};
+use super::v1::ownership::{self, reject_if_protected, set_owner, strip_reserved};
 use super::v1::pagination::{FilteredPage, collect_page};
-use super::v1::validation::{validate_namespace, validate_properties, validate_table_name};
 use super::{MAX_PAGE_SIZE, PageRequest};
 use crate::app::AppState;
 use crate::auth::{Action, Obligations, Principal, RequestContext, Resource};
 use crate::error::{AppError, Result};
+use crate::names::{validate_namespace, validate_properties, validate_table_name};
 
 /// One caller's authorized view of the catalog.
 ///
@@ -293,6 +293,12 @@ impl Session {
         )
         .await?;
 
+        let existing = self.state.catalog.get_namespace(namespace).await?;
+        reject_if_protected(
+            existing.properties(),
+            &format!("Namespace '{}'", namespace.join(".")),
+        )?;
+
         self.state.catalog.drop_namespace(namespace).await?;
         Ok(())
     }
@@ -392,8 +398,9 @@ impl Session {
     ///
     /// A client-supplied `location` is confined to the warehouse of the namespace
     /// it is created in — under federation each mount has its own, so this is not
-    /// "the" warehouse. An unconfined location is a confused-deputy hole: it
-    /// later becomes the prefix of any credential vended for the table.
+    /// "the" warehouse — and then to the prefix this table's own name puts it
+    /// in. An unconfined location is a confused-deputy hole: it later becomes
+    /// the prefix of any credential vended for the table.
     pub async fn create_table(
         &self,
         namespace: &NamespaceIdent,
@@ -403,10 +410,10 @@ impl Session {
         validate_properties(&creation.properties)?;
 
         if let Some(ref location) = creation.location {
-            crate::location::ensure_within_warehouse(
-                &self.state.warehouse_for(namespace).await,
-                location,
-            )?;
+            self.state
+                .location_bound(namespace, &creation.name)
+                .await
+                .ensure(location)?;
         }
 
         guard::authorize(
@@ -427,6 +434,12 @@ impl Session {
     /// The requirements are applied exactly as given — this is the spec's
     /// optimistic-concurrency contract, and a conflict surfaces as
     /// [`AppError::CommitConflict`] rather than being retried into a lost update.
+    ///
+    /// Every location the updates carry is confined, exactly as over HTTP: the
+    /// check lives in the backend, where the table's current metadata is already
+    /// loaded, so both surfaces get it from one place. An embedding host is not a
+    /// trusted caller — it is the *server*, and the principal it calls on behalf
+    /// of is not.
     pub async fn commit_table(
         &self,
         table: &TableIdent,
@@ -448,6 +461,16 @@ impl Session {
     /// table sharing the prefix.
     pub async fn drop_table(&self, table: &TableIdent, purge: bool) -> Result<()> {
         self.authorize_table(table, Action::Delete).await?;
+
+        reject_if_protected(
+            self.state
+                .catalog
+                .load_table(table)
+                .await?
+                .metadata()
+                .properties(),
+            &format!("Table '{table}'"),
+        )?;
 
         if purge {
             self.state.catalog.purge_table(table).await?;
@@ -560,6 +583,90 @@ impl Session {
         Ok(self.state.catalog.load_view(view).await?)
     }
 
+    /// Creates a view.
+    ///
+    /// A client-supplied location is confined to the prefix this view's own name
+    /// puts it in, exactly as over HTTP — a view's metadata document sits at
+    /// `<warehouse>/<namespace…>/<name>` beside a table's, and the two kinds
+    /// share one namespace of names precisely so that they cannot collide there.
+    pub async fn create_view(
+        &self,
+        view: &TableIdent,
+        metadata: ViewMetadata,
+    ) -> Result<(String, ViewMetadata)> {
+        validate_table_name(view.name())?;
+
+        self.state
+            .location_bound(view.namespace(), view.name())
+            .await
+            .ensure(metadata.location())?;
+
+        guard::authorize(
+            &self.state,
+            &self.principal,
+            &self.facts,
+            view.namespace(),
+            Target::View(view.name()),
+            Action::Create,
+        )
+        .await?;
+
+        Ok(self.state.catalog.create_view(view, metadata).await?)
+    }
+
+    /// Commits new metadata for a view, if the pointer has not moved.
+    ///
+    /// `expected_metadata_location` is the location [`Self::load_view`] returned
+    /// for the metadata these updates were derived from. It is the
+    /// compare-and-swap witness, and it is a parameter rather than something the
+    /// store re-derives because a view commit is a read-modify-write that spans
+    /// the store boundary: comparing against a later read would confirm a
+    /// concurrent commit instead of detecting it. A host that lost the race gets
+    /// [`AppError::CommitConflict`] and reloads.
+    ///
+    /// This is the same call the HTTP handler makes, with the same guard and the
+    /// same confinement — which is what `Session` promises. Building the new
+    /// metadata is the host's, because in-process there is no wire format to
+    /// apply: it holds a [`ViewMetadata`] and edits it.
+    pub async fn commit_view(
+        &self,
+        view: &TableIdent,
+        expected_metadata_location: &str,
+        metadata: ViewMetadata,
+    ) -> Result<(String, ViewMetadata)> {
+        guard::authorize(
+            &self.state,
+            &self.principal,
+            &self.facts,
+            view.namespace(),
+            Target::View(view.name()),
+            Action::Update,
+        )
+        .await?;
+
+        let (current_location, current) = self.state.catalog.load_view(view).await?;
+        self.state
+            .location_bound(view.namespace(), view.name())
+            .await
+            .ensure_view_commit_metadata(current.location(), &metadata)?;
+
+        // Refused before the store is asked, so a host that built its update
+        // from a stale read is told here rather than by whichever backend it is
+        // running on.
+        if current_location != expected_metadata_location {
+            return Err(AppError::CommitConflict(format!(
+                "View '{view}' was modified since the metadata this commit was built from. \
+                 Reload it and re-apply."
+            )));
+        }
+
+        Ok(self
+            .state
+            .catalog
+            .update_view(view, expected_metadata_location, metadata)
+            .await?)
+    }
+
     /// Drops a view.
     pub async fn drop_view(&self, view: &TableIdent) -> Result<()> {
         guard::authorize(
@@ -571,6 +678,9 @@ impl Session {
             Action::Delete,
         )
         .await?;
+
+        let (_, metadata) = self.state.catalog.load_view(view).await?;
+        reject_if_protected(metadata.properties(), &format!("View '{view}'"))?;
 
         self.state.catalog.drop_view(view).await?;
         Ok(())

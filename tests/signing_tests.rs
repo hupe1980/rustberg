@@ -52,6 +52,17 @@ impl FixedCatalog {
 
 #[async_trait::async_trait]
 impl CatalogStore for FixedCatalog {
+    fn namespace_prefix_for(&self, _: &iceberg::NamespaceIdent) -> Option<String> {
+        None
+    }
+
+    fn capabilities_for(
+        &self,
+        _: Option<&iceberg::NamespaceIdent>,
+    ) -> rustberg::catalog::Capabilities {
+        rustberg::catalog::Capabilities::full()
+    }
+
     async fn list_namespaces(
         &self,
         _: Option<&NamespaceIdent>,
@@ -178,7 +189,12 @@ impl CatalogStore for FixedCatalog {
     async fn create_view(&self, _: &TableIdent, _: ViewMetadata) -> Result<(String, ViewMetadata)> {
         Self::down()
     }
-    async fn update_view(&self, _: &TableIdent, _: ViewMetadata) -> Result<(String, ViewMetadata)> {
+    async fn update_view(
+        &self,
+        _: &TableIdent,
+        _: &str,
+        _: ViewMetadata,
+    ) -> Result<(String, ViewMetadata)> {
         Self::down()
     }
     async fn drop_view(&self, _: &TableIdent) -> Result<()> {
@@ -221,10 +237,6 @@ impl RequestSigner for StubSigner {
         })
     }
 
-    fn supports_location(&self, location: &str) -> bool {
-        location.starts_with("s3://")
-    }
-
     fn allowed_prefixes(&self) -> &[String] {
         &self.prefixes
     }
@@ -244,14 +256,72 @@ struct Fixture {
     app: App,
     writer: String,
     reader: String,
+    /// Where the audit trail for this fixture was written, when one was asked
+    /// for. Read with [`Fixture::records`].
+    audit: Option<std::path::PathBuf>,
+    /// Held so the directory outlives the fixture.
+    _dir: Option<tempfile::TempDir>,
+}
+
+impl Fixture {
+    /// The audit records this fixture has accumulated, in order.
+    fn records(&self) -> Vec<Value> {
+        let path = self.audit.as_ref().expect("fixture has no audit sink");
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+            .collect()
+    }
+
+    /// The storage-access records, which is what the signing tests below assert
+    /// about.
+    fn signatures(&self) -> Vec<Value> {
+        self.records()
+            .into_iter()
+            .filter(|r| r["action"] == "sign_request")
+            .collect()
+    }
 }
 
 /// A catalog serving one table at `s3://wh/db/events`, with signing on.
 async fn fixture() -> Fixture {
-    fixture_with_prefixes(vec![WAREHOUSE.to_string()]).await
+    fixture_with(vec![WAREHOUSE.to_string()], false).await
+}
+
+/// The same, recording its audit trail to a file the test can read.
+async fn audited_fixture() -> Fixture {
+    fixture_with(vec![WAREHOUSE.to_string()], true).await
 }
 
 async fn fixture_with_prefixes(prefixes: Vec<String>) -> Fixture {
+    fixture_with(prefixes, false).await
+}
+
+/// A sink that fails every write, for the fail-closed tests.
+#[derive(Debug)]
+struct BrokenSink;
+
+impl rustberg::auth::AuditSink for BrokenSink {
+    fn write(
+        &self,
+        _: &rustberg::auth::AuditEvent,
+    ) -> std::result::Result<(), rustberg::auth::AuditError> {
+        Err(rustberg::auth::AuditError::Io(std::io::Error::other(
+            "disk full",
+        )))
+    }
+    fn flush(&self) -> std::result::Result<(), rustberg::auth::AuditError> {
+        Ok(())
+    }
+    fn describe(&self) -> String {
+        "broken".into()
+    }
+}
+
+/// The same fixture, with a sink that fails every write and refuses to lose a
+/// record.
+async fn unrecordable_fixture() -> Fixture {
     let (writer_key, writer) = ApiKeyBuilder::new("writer", TENANT)
         .with_role("writer")
         .build();
@@ -265,7 +335,13 @@ async fn fixture_with_prefixes(prefixes: Vec<String>) -> Fixture {
         .with_catalog(Arc::new(FixedCatalog))
         .with_policies(POLICY)
         .with_api_keys(vec![writer_key, reader_key])
-        .with_request_signer(Arc::new(StubSigner { prefixes }))
+        .with_request_signer(Arc::new(StubSigner {
+            prefixes: vec![WAREHOUSE.to_string()],
+        }))
+        .with_auditor(Arc::new(rustberg::auth::Auditor::new(
+            Box::new(BrokenSink),
+            true,
+        )))
         .build_with_api_keys()
         .await
         .expect("build app");
@@ -274,6 +350,47 @@ async fn fixture_with_prefixes(prefixes: Vec<String>) -> Fixture {
         app,
         writer: writer.to_string(),
         reader: reader.to_string(),
+        audit: None,
+        _dir: None,
+    }
+}
+
+async fn fixture_with(prefixes: Vec<String>, audited: bool) -> Fixture {
+    let (writer_key, writer) = ApiKeyBuilder::new("writer", TENANT)
+        .with_role("writer")
+        .build();
+    let (reader_key, reader) = ApiKeyBuilder::new("reader", TENANT)
+        .with_role("reader")
+        .build();
+
+    let mut builder = App::builder()
+        .with_warehouse_location(WAREHOUSE)
+        .with_default_tenant_id(TENANT)
+        .with_catalog(Arc::new(FixedCatalog))
+        .with_policies(POLICY)
+        .with_api_keys(vec![writer_key, reader_key])
+        .with_request_signer(Arc::new(StubSigner { prefixes }));
+
+    let (dir, audit) = if audited {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        builder = builder.with_auditor(Arc::new(rustberg::auth::Auditor::new(
+            Box::new(rustberg::auth::FileSink::open(&path).expect("open sink")),
+            true,
+        )));
+        (Some(dir), Some(path))
+    } else {
+        (None, None)
+    };
+
+    let (app, _keys) = builder.build_with_api_keys().await.expect("build app");
+
+    Fixture {
+        app,
+        writer: writer.to_string(),
+        reader: reader.to_string(),
+        audit,
+        _dir: dir,
     }
 }
 
@@ -570,6 +687,39 @@ async fn an_unresolvable_request_is_refused() {
     }
 }
 
+/// A query parameter sent twice makes "the" value ambiguous, and the ambiguity
+/// runs the wrong way.
+///
+/// This endpoint reads `prefix` once and confines the listing to it. S3 does not
+/// specify which of two `prefix` values it acts on — so a request naming an
+/// allowed prefix and then an empty one passes containment here and may list the
+/// whole bucket there. The parameter that was authorized would not be the
+/// parameter that took effect, so the request is refused instead.
+#[tokio::test]
+async fn a_query_parameter_sent_twice_is_refused() {
+    let f = fixture().await;
+
+    for uri in [
+        // A second `prefix` that widens the listing to the whole bucket.
+        "https://wh.s3.eu-west-1.amazonaws.com/?list-type=2&prefix=db/events/data/&prefix=",
+        // A second `list-type`, which decides what this request even is.
+        "https://wh.s3.eu-west-1.amazonaws.com/?list-type=2&list-type=1&prefix=db/events/data/",
+        // A repeat on an ordinary parameter is refused too: the rule is about
+        // the query string being unambiguous, not about today's parameter list.
+        "https://wh.s3.eu-west-1.amazonaws.com/db/events/data/f.parquet?x-id=GetObject&x-id=PutObject",
+    ] {
+        let (status, body) = call(
+            &f.app,
+            "POST",
+            "/v1/namespaces/db/tables/events/sign",
+            &f.reader,
+            Some(sign_body("GET", uri)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+    }
+}
+
 /// Rustberg signs only for storage it manages. A signer scoped elsewhere refuses
 /// rather than lending the server's authority over data it does not own.
 #[tokio::test]
@@ -652,5 +802,379 @@ async fn load_table_describes_the_signer_only_when_asked() {
     assert_eq!(
         loaded["config"]["s3.signer.endpoint"],
         "v1/namespaces/db/tables/events/sign"
+    );
+}
+
+// ── The operation, not only the location ────────────────────────────────
+
+fn sign_body_with(method: &str, uri: &str, headers: &[(&str, &str)]) -> Value {
+    let map: serde_json::Map<String, Value> = headers
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), json!([value])))
+        .collect();
+    json!({ "region": "eu-west-1", "method": method, "uri": uri, "headers": map })
+}
+
+/// The exfiltration primitive the endpoint would otherwise be. The destination
+/// is inside the caller's own table and passes every containment check; the
+/// source is somebody else's bucket, fetched with *this server's* storage role.
+#[tokio::test]
+async fn a_copy_source_outside_the_table_is_refused() {
+    let f = fixture().await;
+
+    let (status, body) = call(
+        &f.app,
+        "POST",
+        "/v1/namespaces/db/tables/events/sign",
+        &f.writer,
+        Some(sign_body_with(
+            "PUT",
+            "https://wh.s3.eu-west-1.amazonaws.com/db/events/data/stolen.parquet",
+            &[("x-amz-copy-source", "/other-bucket/secrets/private.parquet")],
+        )),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body.contains("other-bucket"),
+        "names what was refused: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_copy_within_the_table_is_signed_as_a_write() {
+    let f = fixture().await;
+
+    let (status, body) = call(
+        &f.app,
+        "POST",
+        "/v1/namespaces/db/tables/events/sign",
+        &f.writer,
+        Some(sign_body_with(
+            "PUT",
+            "https://wh.s3.eu-west-1.amazonaws.com/db/events/data/b.parquet",
+            &[("x-amz-copy-source", "/wh/db/events/data/a.parquet")],
+        )),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A copy is a write, so a reader may not have one signed even entirely inside
+/// the table it may read.
+#[tokio::test]
+async fn a_reader_cannot_have_a_copy_signed() {
+    let f = fixture().await;
+
+    let (status, _) = call(
+        &f.app,
+        "POST",
+        "/v1/namespaces/db/tables/events/sign",
+        &f.reader,
+        Some(sign_body_with(
+            "PUT",
+            "https://wh.s3.eu-west-1.amazonaws.com/db/events/data/b.parquet",
+            &[("x-amz-copy-source", "/wh/db/events/data/a.parquet")],
+        )),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// `?acl` is inside the table location and passes every containment check there
+/// is. It also publishes the object to the internet.
+#[tokio::test]
+async fn a_subresource_that_changes_who_may_read_is_refused() {
+    let f = fixture().await;
+
+    for subresource in ["acl", "tagging", "retention", "legal-hold"] {
+        let (status, body) = call(
+            &f.app,
+            "POST",
+            "/v1/namespaces/db/tables/events/sign",
+            &f.writer,
+            Some(sign_body(
+                "PUT",
+                &format!(
+                    "https://wh.s3.eu-west-1.amazonaws.com/db/events/data/f.parquet?{subresource}"
+                ),
+            )),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "?{subresource}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn a_header_that_grants_access_to_somebody_else_is_refused() {
+    let f = fixture().await;
+
+    let (status, body) = call(
+        &f.app,
+        "POST",
+        "/v1/namespaces/db/tables/events/sign",
+        &f.writer,
+        Some(sign_body_with(
+            "PUT",
+            "https://wh.s3.eu-west-1.amazonaws.com/db/events/data/f.parquet",
+            &[("x-amz-acl", "public-read")],
+        )),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// The traffic an engine actually sends must keep working — a refusal that is
+/// too broad is an outage rather than a control.
+#[tokio::test]
+async fn multipart_upload_and_ordinary_reads_are_still_signed() {
+    let f = fixture().await;
+
+    let base = "https://wh.s3.eu-west-1.amazonaws.com/db/events/data/f.parquet";
+    for (method, uri) in [
+        ("GET", base.to_string()),
+        ("HEAD", base.to_string()),
+        ("PUT", base.to_string()),
+        ("POST", format!("{base}?uploads")),
+        ("PUT", format!("{base}?partNumber=1&uploadId=abc")),
+        ("POST", format!("{base}?uploadId=abc")),
+        ("DELETE", format!("{base}?uploadId=abc")),
+        ("GET", format!("{base}?versionId=v1&x-id=GetObject")),
+    ] {
+        let (status, body) = call(
+            &f.app,
+            "POST",
+            "/v1/namespaces/db/tables/events/sign",
+            &f.writer,
+            Some(sign_body(method, &uri)),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{method} {uri}: {body}");
+    }
+}
+
+// ── The audit trail ─────────────────────────────────────────────────────
+//
+// Signing is where a deployment that vends no credentials puts its whole
+// storage-access story, so the trail has to carry it. Without these records a
+// signed `GET` of one file and a signed `DeleteObjects` over every file in the
+// table are indistinguishable.
+
+/// The record says which objects a signature covered, not merely that one was
+/// minted for the table.
+#[tokio::test]
+async fn a_signature_is_recorded_with_the_objects_it_covers() {
+    let f = audited_fixture().await;
+
+    let (status, body) = call(
+        &f.app,
+        "POST",
+        "/v1/namespaces/db/tables/events/sign",
+        &f.reader,
+        Some(sign_body(
+            "GET",
+            "https://wh.s3.eu-west-1.amazonaws.com/db/events/data/f.parquet",
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let signatures = f.signatures();
+    assert_eq!(signatures.len(), 1, "{signatures:?}");
+    let record = &signatures[0];
+
+    assert_eq!(record["category"], "storage_access");
+    assert_eq!(record["outcome"], "success");
+    assert_eq!(record["operation"], "read");
+    assert_eq!(record["resource_id"], "acme/db/events");
+    assert!(record["principal_id"].is_string());
+    assert_eq!(record["tenant_id"], "acme");
+    assert_eq!(
+        record["details"]["locations"],
+        "s3://wh/db/events/data/f.parquet"
+    );
+}
+
+/// A write signature and a read signature must be distinguishable in the trail.
+/// They are the difference between "read this file" and "delete it".
+#[tokio::test]
+async fn a_write_signature_is_recorded_as_a_write() {
+    let f = audited_fixture().await;
+
+    let (status, body) = call(
+        &f.app,
+        "POST",
+        "/v1/namespaces/db/tables/events/sign",
+        &f.writer,
+        Some(sign_body(
+            "PUT",
+            "https://wh.s3.eu-west-1.amazonaws.com/db/events/data/f.parquet",
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let signatures = f.signatures();
+    assert_eq!(signatures.len(), 1, "{signatures:?}");
+    assert_eq!(signatures[0]["operation"], "write");
+
+    // And the decision that permitted the write is in the trail too, rather than
+    // being asked speculatively and dropped.
+    let updates: Vec<Value> = f
+        .records()
+        .into_iter()
+        .filter(|r| r["action"] == "decision" && r["operation"] == "Update")
+        .collect();
+    assert_eq!(
+        updates.len(),
+        1,
+        "the Update decision behind a write signature was not recorded: {updates:?}"
+    );
+    assert_eq!(updates[0]["outcome"], "success");
+}
+
+/// A request that reached outside its table is the single most interesting
+/// thing this endpoint sees, and it is recorded rather than only returned.
+#[tokio::test]
+async fn a_refused_signature_is_recorded_with_what_it_reached_for() {
+    let f = audited_fixture().await;
+
+    let (status, _) = call(
+        &f.app,
+        "POST",
+        "/v1/namespaces/db/tables/events/sign",
+        &f.reader,
+        Some(sign_body(
+            "GET",
+            "https://wh.s3.eu-west-1.amazonaws.com/db/other/secrets.parquet",
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let signatures = f.signatures();
+    assert_eq!(signatures.len(), 1, "{signatures:?}");
+    assert_eq!(signatures[0]["outcome"], "denied");
+    assert_eq!(
+        signatures[0]["details"]["locations"], "s3://wh/db/other/secrets.parquet",
+        "the trail must name what was reached for, not only that something was"
+    );
+}
+
+/// A caller permitted to read but not write is refused a write signature, and
+/// the refusal is recorded — as a denied `Update` decision and as a denied
+/// signature, which are two different facts.
+#[tokio::test]
+async fn a_reader_refused_a_write_signature_is_recorded_twice() {
+    let f = audited_fixture().await;
+
+    let (status, _) = call(
+        &f.app,
+        "POST",
+        "/v1/namespaces/db/tables/events/sign",
+        &f.reader,
+        Some(sign_body(
+            "DELETE",
+            "https://wh.s3.eu-west-1.amazonaws.com/db/events/data/f.parquet",
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let records = f.records();
+    assert!(
+        records.iter().any(|r| r["action"] == "decision"
+            && r["operation"] == "Update"
+            && r["outcome"] == "denied"),
+        "the refused Update decision is missing: {records:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r["action"] == "sign_request" && r["outcome"] == "denied"),
+        "the refused signature is missing: {records:?}"
+    );
+}
+
+/// A signature that writes and cannot be recorded is not minted.
+///
+/// This is the fail-closed rule applied to storage access: handing an engine the
+/// authority to overwrite a data file is a change to what the world can do with
+/// the warehouse, and losing that record while keeping the grant is the same
+/// trade as losing a commit record and keeping the commit.
+#[tokio::test]
+async fn a_write_signature_is_refused_when_it_cannot_be_recorded() {
+    let f = unrecordable_fixture().await;
+
+    let (status, body) = call(
+        &f.app,
+        "POST",
+        "/v1/namespaces/db/tables/events/sign",
+        &f.writer,
+        Some(sign_body(
+            "PUT",
+            "https://wh.s3.eu-west-1.amazonaws.com/db/events/data/f.parquet",
+        )),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+}
+
+/// A *read* signature is not, for the same reason a read decision is not:
+/// refusing every object read because a disk filled turns an observability
+/// problem into an outage, and a lost read record is not a lost grant of write
+/// access.
+#[tokio::test]
+async fn a_read_signature_still_serves_when_it_cannot_be_recorded() {
+    let f = unrecordable_fixture().await;
+
+    let (status, body) = call(
+        &f.app,
+        "POST",
+        "/v1/namespaces/db/tables/events/sign",
+        &f.reader,
+        Some(sign_body(
+            "GET",
+            "https://wh.s3.eu-west-1.amazonaws.com/db/events/data/f.parquet",
+        )),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// And a *refused* signature answers the policy question, not an availability
+/// one — even on a sink that cannot record the refusal.
+///
+/// The fail-closed rule is about an unrecorded grant. A refusal granted nothing,
+/// so there is nothing unrecorded to refuse, and a `503` here would tell the
+/// caller its request failed when in fact its policy said no.
+#[tokio::test]
+async fn a_refusal_is_still_a_refusal_when_it_cannot_be_recorded() {
+    let f = unrecordable_fixture().await;
+
+    let (status, body) = call(
+        &f.app,
+        "POST",
+        "/v1/namespaces/db/tables/events/sign",
+        &f.reader,
+        Some(sign_body(
+            "DELETE",
+            "https://wh.s3.eu-west-1.amazonaws.com/db/events/data/f.parquet",
+        )),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a policy denial must not surface as an outage: {body}"
     );
 }

@@ -1,7 +1,35 @@
-//! Health and readiness check endpoints.
+//! `/health` and `/ready`, for container orchestration and load balancers.
 //!
-//! Provides `/health` and `/ready` endpoints for container orchestration
-//! and load balancer health checks.
+//! # Two questions, not one
+//!
+//! `/health` is *liveness*: is this process running? It touches nothing, because
+//! a liveness probe that fails on a database blip restarts a pod that was fine
+//! and makes an outage worse.
+//!
+//! `/ready` is *readiness*: can this replica serve? It probes the catalog and
+//! the storage backend, because a replica that cannot reach either should leave
+//! the load-balancer pool rather than answer `503` to real traffic.
+//!
+//! # Only what is checked is reported
+//!
+//! `/ready` names the catalog and the storage backend, and nothing else. A
+//! component that could only ever read `ready` — an authenticator is a value that
+//! exists or the process did not start — is the same failure as an
+//! over-advertised capability: an operator reading five green components
+//! believes five things were checked. Nor is there an honest probe to add for
+//! them, since "can we reach STS" is a credential exchange this endpoint must not
+//! be performing unauthenticated.
+//!
+//! # The probe is cached, because this route carries no credential
+//!
+//! `/health` and `/ready` sit outside the authentication layer, which also puts
+//! them outside rate limiting — that lives in the auth middleware. An uncached
+//! `/ready` therefore turns one unauthenticated HTTP request into a Postgres
+//! query and an object-store round trip, at whatever rate a stranger chooses: an
+//! amplifier aimed at the two dependencies the endpoint exists to report on.
+//!
+//! Caching for a couple of seconds costs a kubelet nothing and turns that into a
+//! fixed background rate no client can raise.
 
 use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use serde::{Deserialize, Serialize};
@@ -62,6 +90,17 @@ impl HealthStatus {
 // Readiness Status
 // ============================================================================
 
+/// How long one readiness probe may take before its component is degraded.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a readiness result is reused.
+///
+/// See the module docs: `/ready` carries no credential and is therefore outside
+/// rate limiting, so an uncached probe is an unauthenticated amplifier onto the
+/// catalog and the object store. A kubelet probes every few seconds, so two
+/// seconds of staleness costs its accuracy nothing.
+const PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Readiness check response with detailed component status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadinessStatus {
@@ -76,18 +115,15 @@ pub struct ReadinessStatus {
 }
 
 /// Individual component readiness states.
+///
+/// Exactly the components [`ReadinessStatus::check`] probes. See the module docs
+/// for why there are two of them and not five.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadinessComponents {
     /// Catalog backend connectivity.
     pub catalog: ComponentStatus,
     /// Storage backend (S3/GCS/Azure/local) connectivity.
     pub storage: ComponentStatus,
-    /// Authentication system status.
-    pub authentication: ComponentStatus,
-    /// Authorization system status.
-    pub authorization: ComponentStatus,
-    /// Storage credential provider status.
-    pub credentials: ComponentStatus,
 }
 
 /// Status of an individual component.
@@ -147,21 +183,25 @@ impl ComponentStatus {
 impl ReadinessStatus {
     /// Checks all components and returns overall readiness.
     ///
-    /// Performs actual health checks against each component:
-    /// - **Catalog**: Attempts to list namespaces (validates backend connectivity)
-    /// - **Authentication**: Verifies the authenticator is operational
-    /// - **Authorization**: Verifies the authorizer is operational
-    /// - **Credentials**: Checks if credential provider is configured
+    /// Probes the two components that can actually be unreachable:
+    ///
+    /// - **Catalog** — lists one root namespace, which exercises the registry.
+    /// - **Storage** — the backend's own reachability check.
+    ///
+    /// Both are bounded by a timeout. Everything else a replica needs is a value
+    /// that exists or the process did not start; see the module docs for why
+    /// those are not reported as components.
+    ///
+    /// Callers should prefer [`Self::cached`], which is what the handler uses.
     pub async fn check(state: &AppState) -> Self {
-        use tokio::time::{Duration, timeout};
+        use tokio::time::timeout;
 
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        // Health check timeout - if any check takes longer than this, it's degraded
-        let check_timeout = Duration::from_secs(5);
+        let check_timeout = PROBE_TIMEOUT;
 
         // Check catalog connectivity by attempting to list root namespaces
         let catalog = match timeout(
@@ -211,35 +251,11 @@ impl ReadinessStatus {
             }
         };
 
-        // Authentication is considered ready if the authenticator trait is present
-        // In practice, we don't have a separate health check method on the trait
-        let authentication = ComponentStatus::ready();
+        let components = ReadinessComponents { catalog, storage };
 
-        // Authorization is considered ready if the authorizer trait is present
-        let authorization = ComponentStatus::ready();
-
-        // Credentials provider check - we consider it ready if present
-        // A more thorough check could verify AWS STS connectivity
-        let credentials = ComponentStatus::ready();
-
-        let components = ReadinessComponents {
-            catalog,
-            storage,
-            authentication,
-            authorization,
-            credentials,
-        };
-
-        // Overall status is ready if all components are ready (not degraded or unavailable)
-        let all_ready = [
-            &components.catalog,
-            &components.storage,
-            &components.authentication,
-            &components.authorization,
-            &components.credentials,
-        ]
-        .iter()
-        .all(|c| c.status == "ready");
+        let all_ready = [&components.catalog, &components.storage]
+            .iter()
+            .all(|c| c.status == "ready");
 
         Self {
             status: if all_ready {
@@ -251,6 +267,34 @@ impl ReadinessStatus {
             timestamp,
             components,
         }
+    }
+
+    /// The readiness of this replica, probed at most once per `PROBE_TTL`.
+    ///
+    /// What the handler calls. Concurrent callers arriving on a cold or stale
+    /// entry take the lock in turn and the later ones find it fresh, so a burst
+    /// of probes is one round trip rather than one each — which is the whole
+    /// point, since the burst is the thing an unauthenticated caller controls.
+    pub async fn cached(state: &AppState) -> Self {
+        use tokio::sync::Mutex;
+        use tokio::time::Instant;
+
+        // Keyed by nothing: one process, one readiness. `tokio::sync::Mutex`
+        // rather than a synchronous one because the probe is awaited while held.
+        static CACHE: std::sync::OnceLock<Mutex<Option<(Instant, ReadinessStatus)>>> =
+            std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(None));
+
+        let mut slot = cache.lock().await;
+        if let Some((probed_at, status)) = slot.as_ref()
+            && probed_at.elapsed() < PROBE_TTL
+        {
+            return status.clone();
+        }
+
+        let status = Self::check(state).await;
+        *slot = Some((Instant::now(), status.clone()));
+        status
     }
 }
 
@@ -283,13 +327,12 @@ pub async fn health_handler() -> impl IntoResponse {
 
 /// Readiness check handler.
 ///
-/// Returns 200 OK if the service is ready to handle requests, checking:
-/// - Catalog backend connectivity
-/// - Authentication system availability
-/// - Authorization system availability
-/// - Storage credential provider status
+/// Returns 200 OK if this replica can serve, having probed the catalog backend
+/// and the storage backend — the two things that can actually be unreachable.
+/// Returns 503 Service Unavailable if either is not ready.
 ///
-/// Returns 503 Service Unavailable if any component is not ready.
+/// The probe is cached for a couple of seconds; see the module docs for why an
+/// unauthenticated route must not perform I/O at a rate a stranger picks.
 ///
 /// Example:
 /// ```bash
@@ -304,14 +347,12 @@ pub async fn health_handler() -> impl IntoResponse {
 ///   "timestamp": 1704067200,
 ///   "components": {
 ///     "catalog": { "status": "ready" },
-///     "authentication": { "status": "ready" },
-///     "authorization": { "status": "ready" },
-///     "credentials": { "status": "ready" }
+///     "storage": { "status": "ready", "message": "s3:12ms" }
 ///   }
 /// }
 /// ```
 pub async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let status = ReadinessStatus::check(&state).await;
+    let status = ReadinessStatus::cached(&state).await;
 
     let status_code = if status.status == "ready" {
         StatusCode::OK
@@ -412,12 +453,15 @@ mod tests {
             .unwrap();
 
         let state = AppState {
+            location_scope: crate::location::LocationScope::default(),
             authenticator: Arc::new(AllowAllAuthenticator),
             authorizer: Arc::new(AllowAllAuthorizer),
             catalog: Arc::new(catalog),
             credential_provider: Arc::new(NoopCredentialProvider),
             request_signer: Arc::new(crate::credentials::NoopRequestSigner),
             signing: crate::catalog::v1::sign::SigningEndpointConfig::default(),
+            vending: false,
+            remote_ip: crate::remote_ip::RemoteIp::direct(),
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::default())),
             idempotency_cache: Arc::new(IdempotencyCache::new(Duration::from_secs(3600))),
             metrics: Arc::new(crate::observability::MetricsRegistry::new()),
@@ -432,8 +476,25 @@ mod tests {
         let status = ReadinessStatus::check(&state).await;
         assert_eq!(status.status, "ready");
         assert_eq!(status.components.catalog.status, "ready");
-        assert_eq!(status.components.authentication.status, "ready");
-        assert_eq!(status.components.authorization.status, "ready");
-        assert_eq!(status.components.credentials.status, "ready");
+        assert_eq!(status.components.storage.status, "ready");
+    }
+
+    /// Everything in the readiness document must be something that was probed.
+    /// A component that could only ever read `ready` tells an operator something
+    /// was checked when nothing was.
+    #[test]
+    fn the_readiness_document_reports_only_probed_components() {
+        let json = serde_json::to_value(ReadinessComponents {
+            catalog: ComponentStatus::ready(),
+            storage: ComponentStatus::ready(),
+        })
+        .expect("serialises");
+
+        let reported: Vec<&String> = json
+            .as_object()
+            .expect("an object")
+            .keys()
+            .collect::<Vec<_>>();
+        assert_eq!(reported, vec!["catalog", "storage"]);
     }
 }

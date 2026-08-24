@@ -220,6 +220,39 @@ impl StorageCredentialRequest {
     }
 }
 
+/// How long to wait for a cloud provider's token endpoint to accept a
+/// connection.
+const EXCHANGE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long to wait for it to answer.
+///
+/// Comfortably under the server's own 30-second request timeout, for the same
+/// reason a federated mount's client is ([`catalog::rest`]): a stalled exchange
+/// has to surface as an error naming the exchange, not as a request timeout
+/// naming nothing. `reqwest`'s default is *no* timeout, so a token endpoint that
+/// accepts a connection and never answers would otherwise hold a `loadTable`
+/// open until the outer layer gave up on it.
+///
+/// [`catalog::rest`]: crate::catalog
+const EXCHANGE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The HTTP client every credential exchange uses.
+///
+/// One constructor rather than a `Client::new()` per provider, because the two
+/// that need it are on the `loadTable` path and a client with no timeout there
+/// is not a detail either of them would have thought to configure.
+#[must_use]
+pub fn exchange_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(EXCHANGE_CONNECT_TIMEOUT)
+        .timeout(EXCHANGE_REQUEST_TIMEOUT)
+        .build()
+        // Falls back rather than failing: the builder errors only when the TLS
+        // backend cannot be initialised, and a provider that cannot vend is
+        // better reported by the exchange than by a panic at construction.
+        .unwrap_or_default()
+}
+
 /// Trait for storage credential providers.
 ///
 /// Implementations vend temporary credentials for accessing data in cloud storage.

@@ -15,7 +15,7 @@ labelled as an unmeasured target. Nothing is extrapolated from an instance type.
 ### The `benchmark` subcommand
 
 ```bash
-rustberg benchmark --iterations 1000
+rustberg bench --iterations 1000
 ```
 
 It covers the parts of a request that are Rustberg's own work rather than the

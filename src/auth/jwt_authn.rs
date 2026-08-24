@@ -16,7 +16,13 @@ struct Jwks {
     keys: Vec<Jwk>,
 }
 
-/// Individual JSON Web Key
+/// Individual JSON Web Key.
+///
+/// Three key types are read, because between them they cover what identity
+/// providers publish: `RSA` (RS256/384/512, PS256/384/512), `EC` (ES256/ES384)
+/// and `OKP` (Ed25519). A provider rotating onto a new key type announces it in a
+/// changelog nobody's catalog reads, so a reader that handled only RSA would go
+/// down on a routine rotation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Jwk {
     #[serde(rename = "kid")]
@@ -27,8 +33,73 @@ struct Jwk {
     algorithm: Option<String>,
     #[serde(rename = "use")]
     key_use: Option<String>,
+    /// RSA modulus.
     n: Option<String>,
+    /// RSA public exponent.
     e: Option<String>,
+    /// EC curve, or the OKP curve for Ed25519.
+    crv: Option<String>,
+    /// EC x coordinate; for OKP, the whole public key.
+    x: Option<String>,
+    /// EC y coordinate.
+    y: Option<String>,
+}
+
+impl Jwk {
+    /// The decoding key this JWK carries.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::InvalidToken`] naming the key type or the missing component.
+    /// A key this cannot read is a key no token signed with may be accepted, so
+    /// there is no fallback here by design.
+    fn decoding_key(&self) -> Result<DecodingKey, AuthError> {
+        let missing = |component: &str| {
+            AuthError::InvalidToken(format!(
+                "JWKS key '{}' is a {} key with no '{component}'",
+                self.key_id, self.key_type
+            ))
+        };
+
+        let key = match self.key_type.as_str() {
+            "RSA" => DecodingKey::from_rsa_components(
+                self.n.as_deref().ok_or_else(|| missing("n"))?,
+                self.e.as_deref().ok_or_else(|| missing("e"))?,
+            ),
+            "EC" => DecodingKey::from_ec_components(
+                self.x.as_deref().ok_or_else(|| missing("x"))?,
+                self.y.as_deref().ok_or_else(|| missing("y"))?,
+            ),
+            // RFC 8037. `crv` is checked because `OKP` also covers X25519,
+            // which is a key-agreement key and signs nothing.
+            "OKP" if self.crv.as_deref() == Some("Ed25519") => {
+                DecodingKey::from_ed_components(self.x.as_deref().ok_or_else(|| missing("x"))?)
+            }
+            other => {
+                return Err(AuthError::InvalidToken(format!(
+                    "JWKS key '{}' has key type '{other}', which this catalog cannot verify \
+                     signatures with. RSA, EC (P-256/P-384) and OKP (Ed25519) are supported.",
+                    self.key_id
+                )));
+            }
+        };
+
+        key.map_err(|e| {
+            AuthError::InvalidToken(format!("JWKS key '{}' is malformed: {e}", self.key_id))
+        })
+    }
+
+    /// Whether this key may be used to verify a signature.
+    ///
+    /// A JWKS may publish encryption keys alongside signing keys, and RFC 7517
+    /// says `use` and `key_ops` are the fields that say which is which. Selecting
+    /// an encryption key by `kid` alone and verifying against it is a category
+    /// error the library would report as a signature mismatch, naming nothing.
+    fn is_signing_key(&self) -> bool {
+        self.key_use
+            .as_deref()
+            .is_none_or(|purpose| purpose == "sig")
+    }
 }
 
 /// The claims of a validated token, kept as JSON.
@@ -142,13 +213,42 @@ pub struct JwtConfig {
     /// OIDC issuer URL (e.g., "<https://accounts.google.com>")
     pub issuer: String,
 
-    /// Expected audience (e.g., "rustberg-api")
-    pub audience: String,
+    /// Audiences a token may name.
+    ///
+    /// A token is accepted when its `aud` matches **any** of these. More than
+    /// one is ordinary rather than exotic: an identity provider issues one
+    /// audience per client application, and a catalog is reached from Spark,
+    /// Trino and a notebook — three registered clients, three audiences, one
+    /// catalog. A single-valued field forced those deployments to either share
+    /// one client registration between every engine or run a catalog each.
+    ///
+    /// Never empty: [`JwtAuthenticator::new`] refuses that, because
+    /// `jsonwebtoken` reads an empty audience list as "do not check the
+    /// audience", and an unchecked `aud` accepts any token the same issuer
+    /// minted for any other service.
+    pub audiences: Vec<String>,
 
-    /// JWKS endpoint URL (e.g., "<https://accounts.google.com/.well-known/jwks.json>")
-    pub jwks_url: String,
+    /// JWKS endpoint URL.
+    ///
+    /// `None` discovers it from the issuer's OpenID Provider Metadata document.
+    /// Setting it explicitly skips discovery, for a provider with a non-standard
+    /// document layout or a deployment where that document is unreachable.
+    pub jwks_url: Option<String>,
 
-    /// Default tenant ID if not in JWT claims
+    /// Tenant for a token whose `tenant_claim` is absent.
+    ///
+    /// A default *tenant* is safe in a way a default *role* is not, which is why
+    /// one exists and the other does not. It never
+    /// places a caller in somebody else's tenant: it names one tenant, which is
+    /// a resource tree like any other and which a policy must grant into
+    /// explicitly. A single-tenant deployment wants exactly this; a
+    /// multi-tenant one sets `tenant_claim` and every token carries it.
+    ///
+    /// A default *role*, by contrast, would be an assertion the identity
+    /// provider never made: Cedar reads roles as group membership, so
+    /// synthesising one makes `permit(principal in Group::"user", …)` — which
+    /// reads as a policy about ordinary users — match every caller. An absent
+    /// roles claim therefore yields no groups at all.
     pub default_tenant_id: String,
 
     /// Claim name for tenant ID (default: "tenant_id")
@@ -160,7 +260,14 @@ pub struct JwtConfig {
     /// JWKS cache TTL (default: 1 hour)
     pub jwks_cache_ttl: Duration,
 
-    /// Allowed algorithms (default: RS256 only)
+    /// Signature algorithms this catalog accepts.
+    ///
+    /// The default is the three asymmetric families in wide use — RS256, ES256
+    /// and EdDSA — and deliberately excludes every `HS*`. An HMAC algorithm
+    /// verifies with the same secret it signs with, so accepting one over a JWKS
+    /// is the classic confusion: the public modulus a provider publishes becomes
+    /// a shared secret anyone can read and forge with. There is no configuration
+    /// that turns that on, because there is no deployment it is right for.
     pub allowed_algorithms: Vec<Algorithm>,
 }
 
@@ -168,13 +275,13 @@ impl Default for JwtConfig {
     fn default() -> Self {
         Self {
             issuer: String::new(),
-            audience: String::new(),
-            jwks_url: String::new(),
+            audiences: Vec::new(),
+            jwks_url: None,
             default_tenant_id: "default".to_string(),
             tenant_claim: "tenant_id".to_string(),
             roles_claim: "roles".to_string(),
             jwks_cache_ttl: Duration::from_secs(3600),
-            allowed_algorithms: vec![Algorithm::RS256],
+            allowed_algorithms: vec![Algorithm::RS256, Algorithm::ES256, Algorithm::EdDSA],
         }
     }
 }
@@ -188,6 +295,8 @@ struct CachedJwks {
 /// JWT authenticator with JWKS caching
 pub struct JwtAuthenticator {
     config: JwtConfig,
+    /// Where the keys are, once known. Either configured or discovered.
+    jwks_url: RwLock<Option<String>>,
     jwks_cache: RwLock<Option<CachedJwks>>,
     decoding_keys: DashMap<String, DecodingKey>,
     http_client: reqwest::Client,
@@ -206,36 +315,194 @@ impl std::fmt::Debug for JwtAuthenticator {
 }
 
 impl JwtAuthenticator {
-    /// Create a new JWT authenticator
+    /// Create a new JWT authenticator.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Configuration`] for a missing issuer or audience, an
+    /// algorithm list containing an HMAC family, or an HTTP client that cannot
+    /// be built. Each is a startup failure rather than a runtime one: an
+    /// authenticator that cannot check a claim must never be the thing standing
+    /// between a caller and the catalog.
+    ///
+    /// The JWKS URL is *not* required here. When it is absent it is discovered
+    /// from the issuer at the first token, so a provider that is unreachable at
+    /// boot — which, in Kubernetes, is most of them — does not prevent the pod
+    /// from starting.
     pub fn new(config: JwtConfig) -> Result<Self, AuthError> {
         if config.issuer.is_empty() {
             return Err(AuthError::Configuration(
                 "JWT issuer is required".to_string(),
             ));
         }
-        if config.audience.is_empty() {
+        // Empty means "check nothing" to `jsonwebtoken`, which would accept any
+        // token this issuer minted for any other service.
+        if config.audiences.iter().all(|a| a.trim().is_empty()) {
             return Err(AuthError::Configuration(
-                "JWT audience is required".to_string(),
+                "At least one JWT audience is required. An empty audience list would accept \
+                 every token this issuer has minted, including ones addressed to other \
+                 services."
+                    .to_string(),
             ));
         }
-        if config.jwks_url.is_empty() {
-            return Err(AuthError::Configuration("JWKS URL is required".to_string()));
+        if config.allowed_algorithms.is_empty() {
+            return Err(AuthError::Configuration(
+                "At least one JWT signature algorithm must be allowed".to_string(),
+            ));
+        }
+        // See `JwtConfig::allowed_algorithms`. Refused rather than filtered out:
+        // an operator who wrote `HS256` believes something about this deployment
+        // that is not true, and silently ignoring it leaves them believing it.
+        if let Some(symmetric) = config
+            .allowed_algorithms
+            .iter()
+            .find(|alg| matches!(alg, Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512))
+        {
+            return Err(AuthError::Configuration(format!(
+                "{symmetric:?} is a shared-secret algorithm and cannot be used with keys from a \
+                 JWKS: the key an identity provider publishes is public, so anyone who can read \
+                 it could mint tokens this catalog would accept."
+            )));
         }
 
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
+            // A JWKS document does not legitimately redirect across hosts, and
+            // following one would fetch signing keys from wherever the response
+            // pointed — the same rule the federated `rest` mount applies to a
+            // catalog it does not own.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| {
                 AuthError::Configuration(format!("Failed to create HTTP client: {}", e))
             })?;
 
         Ok(Self {
+            jwks_url: RwLock::new(config.jwks_url.clone().filter(|u| !u.trim().is_empty())),
             config,
             jwks_cache: RwLock::new(None),
             decoding_keys: DashMap::new(),
             http_client,
             last_forced_refetch: RwLock::new(None),
         })
+    }
+
+    /// Largest JWKS or discovery document read, in bytes.
+    ///
+    /// The identity provider is trusted to say who a caller is; it is not
+    /// trusted to bound this server's memory. A body read to the end is a body
+    /// whose size the sender chooses.
+    const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
+
+    /// Where this issuer publishes its signing keys.
+    ///
+    /// Resolves once and is then remembered. `jwks_url` in configuration wins;
+    /// otherwise the issuer's OpenID Provider Metadata document
+    /// (`{issuer}/.well-known/openid-configuration`, RFC 8414 §3) is fetched and
+    /// its `jwks_uri` used.
+    ///
+    /// Discovery is the reason an operator can configure an identity provider by
+    /// naming it once. Every provider moves this URL — Google, Entra, Okta,
+    /// Keycloak and Auth0 all publish different paths, and Keycloak's changes
+    /// with the realm — so a required `jwks_url` made the most common
+    /// configuration in the file the one most likely to be wrong.
+    ///
+    /// # The document's own issuer is checked
+    ///
+    /// A discovery document names the issuer it describes, and OpenID Connect
+    /// Discovery requires it to equal the issuer that was asked. Checking it is
+    /// what stops a redirect or a misconfigured URL from silently pointing this
+    /// catalog at somebody else's keys — at which case every token that provider
+    /// signs would authenticate here.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::External`] when the document cannot be fetched, read, or
+    /// does not describe the configured issuer.
+    async fn discover_jwks_url(&self) -> Result<String, AuthError> {
+        if let Some(url) = self.jwks_url.read().clone() {
+            return Ok(url);
+        }
+
+        let url = format!(
+            "{}/.well-known/openid-configuration",
+            self.config.issuer.trim_end_matches('/')
+        );
+
+        #[derive(Deserialize)]
+        struct ProviderMetadata {
+            issuer: String,
+            jwks_uri: String,
+        }
+
+        let metadata: ProviderMetadata = self.fetch_json(&url, "OIDC discovery document").await?;
+
+        // Trailing slashes are the one difference providers are inconsistent
+        // about and that nothing turns on.
+        if metadata.issuer.trim_end_matches('/') != self.config.issuer.trim_end_matches('/') {
+            return Err(AuthError::External(format!(
+                "The discovery document at {url} describes issuer '{}', not the configured \
+                 '{}'. Refusing to take signing keys from it: a document naming another \
+                 issuer would make every token that issuer signs valid here.",
+                metadata.issuer, self.config.issuer
+            )));
+        }
+
+        *self.jwks_url.write() = Some(metadata.jwks_uri.clone());
+        tracing::info!(
+            issuer = %self.config.issuer,
+            jwks_uri = %metadata.jwks_uri,
+            "Discovered the identity provider's signing keys"
+        );
+        Ok(metadata.jwks_uri)
+    }
+
+    /// Fetches a JSON document, refusing one larger than
+    /// [`Self::MAX_DOCUMENT_BYTES`].
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::External`] for a transport failure, a non-success status, a
+    /// body past the ceiling, or a body that is not the expected shape.
+    async fn fetch_json<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        what: &str,
+    ) -> Result<T, AuthError> {
+        use futures::StreamExt;
+
+        let response = self
+            .http_client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| AuthError::External(format!("Failed to fetch the {what}: {e}")))?;
+
+        if !response.status().is_success() {
+            return Err(AuthError::External(format!(
+                "The {what} at {url} answered {}",
+                response.status()
+            )));
+        }
+
+        // Read with a ceiling rather than to the end of the stream: a provider
+        // answering with an endless body would otherwise take this server down.
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .map_err(|e| AuthError::External(format!("Failed to read the {what}: {e}")))?;
+            if body.len() + chunk.len() > Self::MAX_DOCUMENT_BYTES {
+                return Err(AuthError::External(format!(
+                    "The {what} at {url} is larger than {} bytes and was not read.",
+                    Self::MAX_DOCUMENT_BYTES
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        serde_json::from_slice(&body)
+            .map_err(|e| AuthError::External(format!("Failed to parse the {what}: {e}")))
     }
 
     /// Shortest gap between two refetches provoked by an unknown key id.
@@ -257,28 +524,10 @@ impl JwtAuthenticator {
         }
     }
 
-    /// Fetch JWKS from the OIDC provider
+    /// Fetch JWKS from the OIDC provider.
     async fn fetch_jwks(&self) -> Result<Jwks, AuthError> {
-        let response = self
-            .http_client
-            .get(&self.config.jwks_url)
-            .send()
-            .await
-            .map_err(|e| AuthError::External(format!("Failed to fetch JWKS: {}", e)))?;
-
-        if !response.status().is_success() {
-            return Err(AuthError::External(format!(
-                "JWKS endpoint returned status {}",
-                response.status()
-            )));
-        }
-
-        let jwks: Jwks = response
-            .json()
-            .await
-            .map_err(|e| AuthError::External(format!("Failed to parse JWKS: {}", e)))?;
-
-        Ok(jwks)
+        let url = self.discover_jwks_url().await?;
+        self.fetch_json(&url, "JWKS").await
     }
 
     /// Get JWKS with caching.
@@ -361,28 +610,10 @@ impl JwtAuthenticator {
         let jwk = jwks
             .keys
             .iter()
-            .find(|k| k.key_id == kid)
+            .find(|k| k.key_id == kid && k.is_signing_key())
             .ok_or_else(|| AuthError::InvalidToken("Key ID not found in JWKS".to_string()))?;
 
-        // Only support RSA keys for now
-        if jwk.key_type != "RSA" {
-            return Err(AuthError::InvalidToken(format!(
-                "Unsupported key type: {}",
-                jwk.key_type
-            )));
-        }
-
-        let n = jwk
-            .n
-            .as_ref()
-            .ok_or_else(|| AuthError::InvalidToken("Missing RSA modulus".to_string()))?;
-        let e = jwk
-            .e
-            .as_ref()
-            .ok_or_else(|| AuthError::InvalidToken("Missing RSA exponent".to_string()))?;
-
-        let decoding_key = DecodingKey::from_rsa_components(n, e)
-            .map_err(|e| AuthError::InvalidToken(format!("Invalid RSA key: {}", e)))?;
+        let decoding_key = jwk.decoding_key()?;
 
         // Cache the decoding key
         self.decoding_keys
@@ -414,22 +645,46 @@ impl JwtAuthenticator {
             .kid
             .ok_or_else(|| AuthError::InvalidToken("Missing key ID in token".to_string()))?;
 
-        // Check algorithm is allowed
-        let alg = header.alg;
-        if !self.config.allowed_algorithms.contains(&alg) {
+        // The header's `alg` selects the key, and decides nothing else.
+        //
+        // Reading it and then building `Validation::new(header.alg)` is the
+        // shape of every JWT algorithm-confusion bug ever written: it lets the
+        // token nominate how it will be verified. It is checked against the
+        // configured list here so an unexpected algorithm is refused with a
+        // message naming it, and the validation below is built from the
+        // *configuration* regardless, so even if this check were removed the
+        // token could still only be verified as something the operator allowed.
+        if !self.config.allowed_algorithms.contains(&header.alg) {
             return Err(AuthError::InvalidToken(format!(
-                "Algorithm {:?} not allowed",
-                alg
+                "Token is signed with {:?}, which this catalog does not accept. Allowed: {:?}.",
+                header.alg, self.config.allowed_algorithms
             )));
         }
 
         // Get decoding key
         let decoding_key = self.get_decoding_key(&kid).await?;
 
-        // Set up validation
-        let mut validation = Validation::new(alg);
+        // Set up validation.
+        //
+        // `required_spec_claims` is set explicitly rather than left at its
+        // default of `{exp}`. Setting an issuer and an audience makes those
+        // claims *checked when present*; it does not make them mandatory, so a
+        // token omitting `aud` entirely would pass an audience check it never
+        // took part in. `sub` is required for the same reason: it is the
+        // principal id, and a token without one would be authenticated as the
+        // empty string.
+        //
+        // `validate_nbf` is off by default, so a token issued for later use is
+        // accepted before it is valid. Turning it on costs nothing and closes
+        // the gap between `nbf` and `exp`.
+        let mut validation = Validation {
+            algorithms: self.config.allowed_algorithms.clone(),
+            ..Validation::default()
+        };
         validation.set_issuer(&[&self.config.issuer]);
-        validation.set_audience(&[&self.config.audience]);
+        validation.set_audience(&self.config.audiences);
+        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+        validation.validate_nbf = true;
 
         // Decode and validate token
         let token_data = decode::<Claims>(token, &decoding_key, &validation)
@@ -456,6 +711,23 @@ impl JwtAuthenticator {
             .string_at(&self.config.tenant_claim)
             .unwrap_or_else(|| self.config.default_tenant_id.clone());
 
+        // A signed token is not a validated one.
+        //
+        // The tenant id becomes the *first segment* of every Cedar entity id the
+        // authorizer builds, so it is a path segment joined with `␟` exactly like
+        // a namespace level — and every other input to that id was validated on
+        // the way in through a request path. This one arrives through a claim,
+        // where nothing had looked at it. A tenant called `acme␟analytics` builds
+        // the same entity ids as tenant `acme`'s namespace `analytics`, so a
+        // policy written for one would silently cover the other.
+        //
+        // The subject is checked by the weaker rule: it is never joined into a
+        // path, but it is written into every audit record and log line.
+        crate::names::validate_tenant_id(&tenant_id)
+            .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
+        crate::names::validate_principal_id(&claims.sub)
+            .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
+
         // `name` then `email` then `sub`: a display name is cosmetic, and the
         // subject is the one claim guaranteed present.
         let name = claims
@@ -463,7 +735,14 @@ impl JwtAuthenticator {
             .or_else(|| claims.string_at("email"))
             .unwrap_or_else(|| claims.sub.clone());
 
-        let roles = claims.strings_at(&self.config.roles_claim);
+        // A role is the third thing a token supplies that becomes a Cedar entity
+        // id — `Group::"analysts"` — so it is held to the same rendering rule as
+        // the tenant and the subject above. Unlike those two it is *dropped*
+        // rather than failing the credential: see `names::unusable_role_char`.
+        let roles = crate::names::usable_roles(
+            claims.strings_at(&self.config.roles_claim),
+            &self.config.roles_claim,
+        );
         if roles.is_empty() {
             tracing::debug!(
                 subject = %claims.sub,
@@ -532,8 +811,8 @@ mod tests {
     fn config() -> JwtConfig {
         JwtConfig {
             issuer: "https://issuer.example.com".to_string(),
-            audience: "rustberg-api".to_string(),
-            jwks_url: "https://issuer.example.com/.well-known/jwks.json".to_string(),
+            audiences: vec!["rustberg-api".to_string()],
+            jwks_url: Some("https://issuer.example.com/.well-known/jwks.json".to_string()),
             default_tenant_id: "default".to_string(),
             ..Default::default()
         }
@@ -552,13 +831,12 @@ mod tests {
     // ── Configuration ─────────────────────────────────────────────────────
 
     #[test]
-    fn an_authenticator_needs_issuer_audience_and_jwks() {
-        for missing in ["issuer", "audience", "jwks_url"] {
+    fn an_authenticator_needs_an_issuer_and_an_audience() {
+        for missing in ["issuer", "audiences"] {
             let mut cfg = config();
             match missing {
                 "issuer" => cfg.issuer.clear(),
-                "audience" => cfg.audience.clear(),
-                _ => cfg.jwks_url.clear(),
+                _ => cfg.audiences.clear(),
             }
             assert!(
                 matches!(
@@ -568,6 +846,112 @@ mod tests {
                 "{missing} must be required"
             );
         }
+    }
+
+    /// The JWKS URL is discovered from the issuer when it is not configured, so
+    /// a deployment naming only its provider must still build.
+    #[test]
+    fn the_jwks_url_is_optional_because_it_is_discoverable() {
+        let cfg = JwtConfig {
+            jwks_url: None,
+            ..config()
+        };
+        assert!(JwtAuthenticator::new(cfg).is_ok());
+    }
+
+    /// A JWKS publishes *public* keys, so accepting an HMAC algorithm would make
+    /// the published key a shared secret anyone could forge with.
+    #[test]
+    fn a_shared_secret_algorithm_is_refused_at_startup() {
+        for alg in [Algorithm::HS256, Algorithm::HS384, Algorithm::HS512] {
+            let cfg = JwtConfig {
+                allowed_algorithms: vec![Algorithm::RS256, alg],
+                ..config()
+            };
+            let err = JwtAuthenticator::new(cfg).unwrap_err();
+            assert!(
+                matches!(err, AuthError::Configuration(_)),
+                "{alg:?} must be refused: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_algorithm_list_is_refused() {
+        let cfg = JwtConfig {
+            allowed_algorithms: Vec::new(),
+            ..config()
+        };
+        assert!(JwtAuthenticator::new(cfg).is_err());
+    }
+
+    // ── JWKS keys ─────────────────────────────────────────────────────────
+
+    fn jwk(json: serde_json::Value) -> Jwk {
+        serde_json::from_value(json).expect("a JWK")
+    }
+
+    /// A provider rotating onto ES256 or Ed25519 must not take this
+    /// authenticator down.
+    #[test]
+    fn every_asymmetric_key_type_a_provider_publishes_is_read() {
+        // P-256 test vector coordinates, base64url, from RFC 7515 Appendix A.3.
+        assert!(
+            jwk(serde_json::json!({
+                "kid": "ec", "kty": "EC", "crv": "P-256",
+                "x": "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+                "y": "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"
+            }))
+            .decoding_key()
+            .is_ok(),
+            "EC P-256"
+        );
+
+        assert!(
+            jwk(serde_json::json!({
+                "kid": "ed", "kty": "OKP", "crv": "Ed25519",
+                "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"
+            }))
+            .decoding_key()
+            .is_ok(),
+            "Ed25519"
+        );
+    }
+
+    /// X25519 is a key-agreement key. It signs nothing, and reading it as a
+    /// verification key would be a category error the library reports only as a
+    /// signature mismatch.
+    #[test]
+    fn a_key_that_cannot_verify_a_signature_is_refused() {
+        assert!(
+            jwk(serde_json::json!({
+                "kid": "x", "kty": "OKP", "crv": "X25519", "x": "aaaa"
+            }))
+            .decoding_key()
+            .is_err()
+        );
+        assert!(
+            jwk(serde_json::json!({ "kid": "o", "kty": "oct", "k": "c2VjcmV0" }))
+                .decoding_key()
+                .is_err(),
+            "a symmetric key in a JWKS is not a verification key"
+        );
+    }
+
+    /// A JWKS may carry encryption keys beside signing keys, and `use` is what
+    /// distinguishes them.
+    #[test]
+    fn only_signing_keys_are_selected() {
+        assert!(
+            jwk(serde_json::json!({ "kid": "a", "kty": "RSA", "use": "sig" })).is_signing_key()
+        );
+        assert!(
+            jwk(serde_json::json!({ "kid": "a", "kty": "RSA" })).is_signing_key(),
+            "an absent `use` means unrestricted, per RFC 7517"
+        );
+        assert!(
+            !jwk(serde_json::json!({ "kid": "a", "kty": "RSA", "use": "enc" })).is_signing_key()
+        );
     }
 
     // ── The Authorization header ──────────────────────────────────────────

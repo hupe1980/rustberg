@@ -53,10 +53,7 @@ pub use authz::{
 };
 
 // Re-export audit logging
-pub use audit::{
-    AuditAction, AuditCategory, AuditEvent, AuditOutcome, AuditSeverity, log_auth_failure,
-    log_auth_success, log_rate_limit,
-};
+pub use audit::{AuditAction, AuditCategory, AuditEvent, AuditOutcome, AuditSeverity};
 pub use audit_sink::{AuditError, AuditSink, Auditor, FileSink, NullSink, StdoutSink};
 
 // Re-export Cedar policy-based authorization
@@ -65,7 +62,8 @@ pub use error::{AuthError, AuthErrorBody, AuthErrorResponse, Result as AuthResul
 
 // Re-export middleware
 pub use middleware::{
-    AuthState, AuthenticatedPrincipal, OptionalPrincipal, RequestFacts, auth_middleware,
+    AuthState, AuthenticatedPrincipal, MAX_REQUEST_ID_LEN, OptionalPrincipal, REQUEST_ID_HEADER,
+    RequestFacts, auth_middleware, is_usable_request_id, strip_unusable_request_id,
 };
 
 // Re-export principal types

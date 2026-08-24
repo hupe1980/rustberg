@@ -95,10 +95,13 @@ pub trait RequestSigner: Send + Sync + Debug {
     /// signable, or the server's own credentials could not be used.
     async fn sign(&self, request: SignRequest<'_>) -> Result<SignedRequest, SigningError>;
 
-    /// Whether this signer serves the storage service `location` lives in.
-    fn supports_location(&self, location: &str) -> bool;
-
     /// Storage locations this signer will sign for, as prefixes.
+    ///
+    /// The *only* scope question a signer answers. A second one — "does this
+    /// signer serve this storage service?" — would be redundant: the prefix list
+    /// already carries the scheme, so a signer built for S3 and asked about a
+    /// `gs://` table fails containment. Two overlapping answers to one question
+    /// is one more than can be kept consistent.
     ///
     /// The same rule vending follows: an empty list signs for nothing. A signer
     /// that signed for any location its own credentials could reach would be the
@@ -122,10 +125,6 @@ impl RequestSigner for NoopRequestSigner {
         Err(SigningError::NotConfigured)
     }
 
-    fn supports_location(&self, _location: &str) -> bool {
-        false
-    }
-
     fn allowed_prefixes(&self) -> &[String] {
         &[]
     }
@@ -142,7 +141,7 @@ mod sigv4 {
     use aws_credential_types::provider::ProvideCredentials;
     use aws_sigv4::http_request::{
         PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SigningSettings,
-        sign as aws_sign,
+        UriPathNormalizationMode, sign as aws_sign,
     };
     use aws_sigv4::sign::v4;
     use std::time::SystemTime;
@@ -252,6 +251,18 @@ mod sigv4 {
             // path is already percent-encoded by the client, and encoding it a
             // second time would sign a different key than the one requested.
             settings.percent_encoding_mode = PercentEncodingMode::Single;
+            // Off, for the same reason and with the same consequence for getting
+            // it wrong. SigV4 normalizes `.` and `..` out of the path before
+            // canonicalising it — for every service except S3, where the path
+            // *is* the object key and `a/./b` and `a/b` are two different
+            // objects. The default is on, and the AWS SDK's own S3 client turns
+            // it off; leaving it on signs a canonical request over a key S3 will
+            // not compute, and the only symptom is `SignatureDoesNotMatch`.
+            //
+            // It also has to agree with `catalog::v1::sign`, which resolves the
+            // URI through a URL parser that *does* normalize, and then signs
+            // that normalized form. One canonical spelling, checked and signed.
+            settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
             settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
 
             let params = v4::SigningParams::builder()
@@ -313,11 +324,6 @@ mod sigv4 {
             })
         }
 
-        fn supports_location(&self, location: &str) -> bool {
-            let scheme = location.split_once("://").map(|(s, _)| s);
-            matches!(scheme, Some("s3" | "s3a" | "s3n"))
-        }
-
         fn allowed_prefixes(&self) -> &[String] {
             &self.allowed_prefixes
         }
@@ -334,7 +340,6 @@ mod tests {
     #[tokio::test]
     async fn the_default_signer_signs_nothing() {
         let signer = NoopRequestSigner;
-        assert!(!signer.supports_location("s3://bucket/wh"));
         assert!(signer.allowed_prefixes().is_empty());
 
         let headers = HeaderMultiMap::new();

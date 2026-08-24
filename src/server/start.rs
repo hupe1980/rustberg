@@ -17,7 +17,25 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub tls: Option<TlsConfig>,
+    /// How long to keep serving after `SIGTERM` before draining.
+    ///
+    /// Zero begins the drain immediately, which is right wherever nothing routes
+    /// to this process but whoever started it. Behind a load balancer, taking an
+    /// instance out of rotation takes time to propagate and requests arriving in
+    /// that window would be refused, so a few seconds covers it. Applies to
+    /// `SIGTERM` only, never to `Ctrl+C`.
+    pub shutdown_delay: std::time::Duration,
 }
+
+/// How long a drain waits for in-flight requests before closing the rest.
+///
+/// Both transports, because where TLS is terminated is not something a
+/// deployment should have to know to predict how it drains — and the plaintext
+/// path is the one behind a proxy.
+///
+/// Comfortably over the request timeout, so a request that is going to finish
+/// has.
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// TLS configuration for HTTPS.
 #[derive(Debug, Clone)]
@@ -40,7 +58,15 @@ impl ServerConfig {
             host: "0.0.0.0".to_string(),
             port: 8000,
             tls: None,
+            shutdown_delay: std::time::Duration::ZERO,
         }
+    }
+
+    /// Sets how long to keep serving after `SIGTERM` before draining.
+    #[must_use]
+    pub fn with_shutdown_delay(mut self, delay: std::time::Duration) -> Self {
+        self.shutdown_delay = delay;
+        self
     }
 
     /// Creates a default HTTPS server config (`0.0.0.0:8443`)
@@ -52,6 +78,7 @@ impl ServerConfig {
                 cert_path: cert_path.into(),
                 key_path: key_path.into(),
             }),
+            shutdown_delay: std::time::Duration::ZERO,
         }
     }
 
@@ -104,7 +131,7 @@ async fn start_server_http(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(handle_shutdown_signal())
+    .with_graceful_shutdown(wait_for_shutdown(config.shutdown_delay))
     .await?;
 
     info!("🛑 Server has shut down gracefully");
@@ -142,10 +169,11 @@ async fn start_server_tls(
     let shutdown_handle = handle.clone();
 
     // Spawn shutdown listener
+    let delay = config.shutdown_delay;
     tokio::spawn(async move {
-        handle_shutdown_signal().await;
+        wait_for_shutdown(delay).await;
         info!("Initiating graceful shutdown...");
-        shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
+        shutdown_handle.graceful_shutdown(Some(DRAIN_TIMEOUT));
     });
 
     axum_server::bind_rustls(addr, rustls_config)
@@ -159,7 +187,46 @@ async fn start_server_tls(
 }
 
 /// Waits for shutdown signals (`Ctrl+C` or `SIGTERM`).
-async fn handle_shutdown_signal() {
+/// Waits for a shutdown signal, then holds the door open for `delay`.
+///
+/// # Why the wait is here and not in a `preStop` hook
+///
+/// Kubernetes removes a pod from its Service's endpoints and sends it `SIGTERM`
+/// concurrently, and the removal has to reach every kube-proxy and ingress
+/// before they stop routing to it. A server that stops accepting the instant it
+/// is signalled refuses whatever arrives in that window, which clients see as
+/// connection errors on every rolling update.
+///
+/// The usual answer is a `preStop` hook that sleeps, and it cannot work here:
+/// the runtime image is distroless, so there is no shell to run `sleep` in.
+/// In-process is better regardless — it does not depend on the orchestrator, and
+/// it is one number rather than two that have to be kept in step.
+///
+/// **`SIGTERM` only.** `Ctrl+C` is a person who wants this to stop now, not an
+/// orchestrator taking it out of rotation, and making them wait through a drain
+/// that protects nothing is the wrong trade.
+async fn wait_for_shutdown(delay: std::time::Duration) {
+    let signal = handle_shutdown_signal().await;
+
+    if signal == Signal::Terminate && !delay.is_zero() {
+        info!(
+            seconds = delay.as_secs(),
+            "SIGTERM received; still serving while this instance is taken out of rotation"
+        );
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// Which signal asked for the shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Signal {
+    /// An orchestrator taking this instance out of rotation.
+    Terminate,
+    /// A person at a terminal.
+    Interrupt,
+}
+
+async fn handle_shutdown_signal() -> Signal {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -170,9 +237,11 @@ async fn handle_shutdown_signal() {
         tokio::select! {
             _ = signal::ctrl_c() => {
                 info!("Received Ctrl+C signal");
+                Signal::Interrupt
             },
             _ = terminate.recv() => {
                 info!("Received SIGTERM signal");
+                Signal::Terminate
             },
         }
     }
@@ -185,6 +254,7 @@ async fn handle_shutdown_signal() {
         } else {
             info!("Received Ctrl+C");
         }
+        Signal::Interrupt
     }
 }
 

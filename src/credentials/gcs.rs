@@ -153,6 +153,33 @@ impl std::fmt::Debug for GcsCredentialProvider {
     }
 }
 
+/// Escapes a value going inside a single-quoted CEL string literal.
+///
+/// # Why this is the difference between a scoped token and a whole bucket
+///
+/// The availability condition below is a **CEL expression**, assembled as text,
+/// and the prefix spliced into it ends with the table's *name*. A name may be
+/// any Unicode outside general category `C`
+/// (`names`), which includes the apostrophe that closes the
+/// literal.
+///
+/// A table named `x') || true || ('` therefore produces
+///
+/// ```text
+/// resource.name.startsWith('…/objects/db/x') || true || ('/')
+/// ```
+///
+/// which is `true` for every object in the bucket. The boundary that exists to
+/// narrow the token would hand out the whole bucket instead, to anyone able to
+/// create a table — and the downscoping exchange would report success.
+///
+/// CEL string literals take C-style escapes, so a backslash and an apostrophe
+/// are all that has to be neutralised. The backslash goes first, or the one this
+/// inserts would be escaped again.
+fn escape_cel_literal(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
 impl GcsCredentialProvider {
     /// Creates a new GCS credential provider.
     ///
@@ -214,7 +241,7 @@ impl GcsCredentialProvider {
             config,
             credentials: Arc::new(credentials),
             cached_token: Arc::new(RwLock::new(None)),
-            http: reqwest::Client::new(),
+            http: super::provider::exchange_client(),
         })
     }
 
@@ -303,6 +330,11 @@ impl GcsCredentialProvider {
         let condition = if key_prefix.is_empty() {
             None
         } else {
+            // Escaped: the value is spliced into a CEL *string literal*, and the
+            // last segment of it is a table name a caller chose. See
+            // `escape_cel_literal`.
+            let bucket = escape_cel_literal(bucket);
+            let key_prefix = escape_cel_literal(key_prefix);
             Some(serde_json::json!({
                 "title": "table-prefix",
                 "expression": format!(
@@ -538,9 +570,42 @@ mod tests {
         );
     }
 
-    /// A read-only request must not carry an object-write role. An earlier
-    /// version returned the raw service-account token, so `write_access` was
-    /// discarded entirely.
+    /// The apostrophe closes the CEL string literal the prefix lives in. A table
+    /// named `x') || true || ('` would make the condition evaluate to `true` for
+    /// every object, so the boundary that exists to narrow the token would hand
+    /// out the whole bucket — and the exchange would report success.
+    #[test]
+    fn a_quote_in_a_table_name_cannot_escape_the_cel_literal() {
+        let boundary =
+            GcsCredentialProvider::access_boundary("bucket", "wh/db/x') || true || ('", false);
+        let expr = boundary["accessBoundary"]["accessBoundaryRules"][0]
+            ["availabilityCondition"]["expression"]
+            .as_str()
+            .expect("an expression");
+
+        // The injected text is still *there* — it is part of the table's name.
+        // What matters is that it is inside the string literal rather than
+        // beside it, which is decided by the quotes around it being escaped.
+        assert!(
+            expr.contains(r"x\') || true || (\'"),
+            "the name must appear escaped, inside the literal: {expr}"
+        );
+        assert_eq!(
+            expr.matches('\'').count() - expr.matches(r"\'").count(),
+            2,
+            "exactly one string literal, opened once and closed once: {expr}"
+        );
+    }
+
+    #[test]
+    fn a_backslash_is_escaped_before_the_one_escaping_adds() {
+        assert_eq!(escape_cel_literal(r"a\b"), r"a\\b");
+        assert_eq!(escape_cel_literal("a'b"), r"a\'b");
+        assert_eq!(escape_cel_literal("plain/key"), "plain/key");
+    }
+
+    /// A read-only request must not carry an object-write role. Returning the
+    /// raw service-account token instead would discard `write_access` entirely.
     #[test]
     fn read_only_request_gets_viewer_role() {
         let b = GcsCredentialProvider::access_boundary("bucket", "wh/db/t", false);

@@ -210,7 +210,7 @@ pub async fn update_policies(
     )
     .await?;
 
-    let revision = apply(&state, &principal, payload.source, payload.note).await?;
+    let revision = apply(&state, &principal, &request, payload.source, payload.note).await?;
     // The write just installed it here, so what is in force is what was written.
     let sequence = revision.sequence;
     Ok(AxumJson(PolicyResponse::new(revision, sequence)))
@@ -251,7 +251,7 @@ pub async fn rollback_policies(
     // Appended as a new revision rather than rewinding the log. The history
     // then says a rollback happened *and* what it restored, and no existing
     // `policy_set_version` stops resolving.
-    let revision = apply(&state, &principal, target.source, Some(note)).await?;
+    let revision = apply(&state, &principal, &request, target.source, Some(note)).await?;
     let sequence = revision.sequence;
     Ok(AxumJson(PolicyResponse::new(revision, sequence)))
 }
@@ -289,6 +289,7 @@ pub async fn policy_history(
 async fn apply(
     state: &AppState,
     principal: &Principal,
+    request: &crate::auth::RequestContext,
     source: String,
     note: Option<String>,
 ) -> Result<PolicyRevision> {
@@ -312,11 +313,19 @@ async fn apply(
     //    Deliberate lockout is still possible — grant someone else `Manage`
     //    first, or edit the seed file and restart. What is refused is doing it
     //    by accident.
+    //    Asked with *this* request's context, not a bare one. A grant may be
+    //    conditioned on `context.source_ip` — "policy is administered from
+    //    inside the VPC" is an ordinary rule — and a context-free check
+    //    evaluates that to false, refusing a policy set whose author can plainly
+    //    use it. Carrying the request asks the question that actually matters:
+    //    under the new rules, would the call being made right now still be
+    //    permitted?
     let self_check = crate::auth::AuthzContext::new(
         principal.clone(),
         Resource::policy_set(principal.tenant_id()),
         Action::Manage,
-    );
+    )
+    .with_request(request.clone());
     if !crate::auth::Authorizer::permits(&candidate, &self_check).await {
         return Err(AppError::BadRequest(
             "Refused: under the submitted policy set you would no longer be permitted to \
@@ -333,19 +342,43 @@ async fn apply(
         .append(&source, principal.id(), note.as_deref())
         .await?;
 
-    // 4. Installed. Requests already in flight finish against the previous set.
-    admin.authorizer.swap(candidate, revision.sequence);
-
-    // 5. Audited as its own event: a policy change is the most consequential
-    //    thing anyone can do here, and it is not an authorization decision, so
-    //    the decision records would not otherwise capture it.
+    // 4. Audited, and audited *before* the swap so that failing is honest.
+    //
+    //    The guard already recorded the `Manage` decision, fail-closed like
+    //    every mutation. What that record cannot carry is which revision the
+    //    decision produced — and without the sequence and the content hash, an
+    //    audit record from next month naming a `policy_set_version` cannot be
+    //    traced back to who installed it. That is the join the whole trail
+    //    depends on, so losing it fails the request rather than the record.
+    //
+    //    Recording after the swap would make failing a lie: the rules would
+    //    already be in force. Here the revision is durable but not enforced,
+    //    which is a state `GET /management/v1/policies` already reports — it
+    //    names the revision this replica enforces and the store's latest beside
+    //    it, and they simply differ.
     let event =
         crate::auth::AuditEvent::decision("Manage", "policy_set", principal.tenant_id(), true)
             .with_principal_id(principal.id())
             .with_tenant_id(principal.tenant_id())
+            // Carried like every other record. This is the one an investigation
+            // arrives at last — "who installed the rules that permitted that" —
+            // so it is the worst one to be unable to join to an address and a
+            // request id.
+            .with_optional_client_ip(request.source_ip)
+            .with_optional_request_id(request.request_id.as_deref())
             .with_detail("policy_sequence", revision.sequence.to_string())
             .with_detail("policy_version", revision.version.clone());
-    state.auditor.record_lossy(&event);
+    state.auditor.record(&event).map_err(|_| {
+        AppError::ServiceUnavailable(
+            "The audit trail is unavailable, so this policy set was recorded but not put \
+             into force. Retry once auditing is working; the revision is already in the \
+             history."
+                .to_string(),
+        )
+    })?;
+
+    // 5. Installed. Requests already in flight finish against the previous set.
+    admin.authorizer.swap(candidate, revision.sequence);
 
     tracing::info!(
         sequence = revision.sequence,

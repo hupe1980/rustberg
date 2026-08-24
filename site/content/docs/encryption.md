@@ -9,7 +9,7 @@ Rustberg encrypts one thing:
 
 | What | How |
 |------|-----|
-| Everything in transit | TLS 1.3 |
+| Everything in transit | TLS 1.2 and 1.3, via rustls |
 
 That is the whole surface, and the boundary is deliberate — see below for what is
 deliberately *not* covered here.
@@ -50,7 +50,9 @@ removes all three.
 
 Rustberg is rustls-only. There is no OpenSSL or native-tls anywhere in the
 dependency tree, in any feature combination — which is what lets the binary
-cross-compile statically.
+cross-compile statically. That is a checked claim, not an intention: `openssl`,
+`openssl-sys` and `native-tls` are on `cargo deny`'s ban list, and CI runs it
+with `--all-features` so the resolution covers the optional dependencies too.
 
 ```toml
 [tls]
@@ -72,7 +74,7 @@ terminates TLS itself.
 
 | Threat | Mitigation |
 |--------|------------|
-| Network eavesdropping | TLS 1.3 |
+| Network eavesdropping | TLS 1.2 and 1.3 |
 | Stolen config file | The file holds no secret; keys come from the environment |
 | Stolen warehouse objects | Object-store encryption (SSE-KMS/CMEK) — configured on the bucket |
 | Unauthorised column access | Parquet modular encryption — a table-level concern |

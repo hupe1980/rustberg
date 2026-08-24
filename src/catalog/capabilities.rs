@@ -108,6 +108,26 @@ impl Capabilities {
         }
     }
 
+    /// Everything readable, on storage **this** server manages.
+    ///
+    /// The preset for a *native* mount marked `read_only`, and it differs from
+    /// [`read_only`](Self::read_only) in one field for one reason: scan planning
+    /// is a read, and a native mount's manifests sit in a warehouse this server
+    /// declared and can open. Sharing the remote preset made `read_only = true`
+    /// on a local catalog switch planning off — a capability reported false for
+    /// a reason that mount does not have, which is the same lie as reporting one
+    /// true.
+    ///
+    /// The two presets exist because "will not change your catalog" and "is
+    /// somebody else's catalog" are different statements that happened to agree
+    /// on every field but this one.
+    pub const fn read_only_native() -> Self {
+        Self {
+            scan_planning: true,
+            ..Self::read_only()
+        }
+    }
+
     /// The capabilities present in **both**.
     ///
     /// Used to fold many mounts into the single list `GET /v1/config` publishes.
@@ -239,6 +259,22 @@ mod tests {
         let none = Capabilities::read_only_without_views();
         assert!(!none.views);
         assert!(!none.write);
+    }
+
+    /// A read-only *native* mount still plans. The refusal in
+    /// [`Capabilities::read_only`] is about storage this server does not manage,
+    /// which is a property of a remote mount and not of the read-only flag.
+    #[test]
+    fn a_read_only_native_mount_can_still_plan() {
+        let native = Capabilities::read_only_native();
+        assert!(native.scan_planning, "its manifests are reachable");
+        assert!(!native.write, "and it is still read-only");
+        assert!(native.views, "reading a view is a read");
+
+        assert!(
+            !Capabilities::read_only().scan_planning,
+            "the remote preset is the one that cannot plan"
+        );
     }
 
     /// The rule the config response depends on: one mount lacking a capability

@@ -20,28 +20,37 @@
 //! other is a request. An operator who cannot tell them apart believes they have
 //! the first while running the second, so Rustberg says which it is.
 //!
-//! # Why this is useful before filters are enforced at all
+//! # Why this fires at table load
 //!
-//! Rustberg does not apply row filters today — an annotated table is refused a
-//! storage credential instead. That makes this warning *more* valuable, not
-//! less: it tells an operator which of their filters were never going to become
-//! architectural enforcement, while the policy set is still small enough to
-//! change.
+//! Rustberg *does* apply row filters — a scan plan is built from the client's
+//! filter conjoined with what policy permits, and the residual on every task
+//! carries both halves. But a plan is advice to a cooperating engine. What makes
+//! a filter architectural is that the files it excludes are never named, and
+//! that only happens when the boundary is partition-aligned.
 //!
-//! # On the column extractor
+//! So the warning fires where the filter and the partition spec are both in
+//! hand, names the table and the columns, and says which of the two kinds of
+//! enforcement this deployment actually has.
 //!
-//! Filters are opaque predicate strings; Rustberg does not parse SQL and should
-//! not pretend to. [`referenced_columns`] is a deliberately conservative
-//! identifier scan: it strips string literals, then keeps bare identifiers that
-//! are not keywords, numbers, or function calls. It over-reports rather than
-//! under-reports, and over-reporting only ever produces a warning that names one
-//! column too many — the failure that costs an operator a moment's reading,
-//! rather than the one that leaves them believing a filter holds when it does
-//! not.
+//! # On reading columns out of a filter
+//!
+//! A row filter is an Iceberg JSON predicate, so
+//! [`crate::predicate::referenced_columns`] reads the columns **exactly**: the
+//! grammar says where a column reference can appear, and nothing has to be
+//! guessed. That is what a filter written as JSON buys over one written as an
+//! opaque SQL string, where an identifier scan would have to over-report.
+//!
+//! # Case is compared exactly, on both sides
+//!
+//! Iceberg binds column names case-sensitively by default, and so does the
+//! planner here. Folding either side to lowercase would make a filter on
+//! `region` look aligned with a partition source called `Region` — the dangerous
+//! direction, reporting architectural enforcement for a filter the binder will
+//! not bind at all.
 
 use std::collections::BTreeSet;
 
-use iceberg::spec::TableMetadata;
+use iceberg::spec::{TableMetadata, Transform};
 
 /// Column names a filter references.
 ///
@@ -52,12 +61,25 @@ pub fn referenced_columns(filter: &serde_json::Value) -> BTreeSet<String> {
     crate::predicate::referenced_columns(filter)
 }
 
-/// Names of the columns `metadata`'s current partition spec partitions on.
+/// Columns a filter can be enforced on by withholding files.
 ///
-/// Source column names, not partition field names: a spec may partition on
-/// `days(ts)` under the name `ts_day`, and a filter referencing `ts` is aligned
-/// with it. Comparing partition *field* names would call that misaligned and
-/// warn about a filter that is in fact enforceable.
+/// **Identity transforms only.** Every other transform is lossy — `days(ts)`
+/// puts a whole day in one file, `bucket(16, id)` a sixteenth of all ids — so a
+/// filter on the source column selects files whose other rows are forbidden, and
+/// the file still has to be delivered with the predicate attached. Counting
+/// those as aligned reports cooperative enforcement as architectural, which is
+/// the confusion this module exists to prevent.
+///
+/// Conservative rather than exact: `ts >= '2024-01-01' AND ts < '2024-01-02'`
+/// against `days(ts)` *is* enforceable and is reported as unaligned anyway,
+/// because deciding that needs a predicate model over transforms `iceberg-rust`
+/// does not carry. The error runs in the safe direction.
+///
+/// **Source names, and full ones.** A spec may name an identity field `reg`
+/// while the filter says `region`, so the source column is what is compared —
+/// via `Schema::name_by_field_id`, which gives the dotted path. `NestedField::
+/// name` is the leaf only, and would match a partition on `user.region` against
+/// an unrelated top-level `region` while missing the filter that named it.
 pub fn partition_source_columns(metadata: &TableMetadata) -> BTreeSet<String> {
     let schema = metadata.current_schema();
 
@@ -65,8 +87,43 @@ pub fn partition_source_columns(metadata: &TableMetadata) -> BTreeSet<String> {
         .default_partition_spec()
         .fields()
         .iter()
-        .filter_map(|field| schema.field_by_id(field.source_id))
-        .map(|field| field.name.to_ascii_lowercase())
+        .filter(|field| field.transform == Transform::Identity)
+        .filter_map(|field| schema.name_by_field_id(field.source_id))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every column any partition spec the table has ever had puts in a file's
+/// partition tuple, whatever the transform.
+///
+/// Three deliberate differences from [`partition_source_columns`], because the
+/// two answer opposite questions. That one asks *what can a filter be enforced
+/// on*, so it is narrow: only an identity transform separates rows by value, and
+/// only the spec new files are written under matters for a filter about the
+/// future.
+///
+/// This one asks *what does a plan disclose*, so it is wide:
+///
+/// - **Every transform counts.** `bucket(16, id)` is a lossy function of `id`,
+///   but a tuple carrying bucket 7 still narrows `id` to a sixteenth of its
+///   range, and `days(ts)` names the day. A mask over the source column is not
+///   honoured by publishing a function of it.
+/// - **Every spec counts, not just the default.** A snapshot holds files written
+///   under specs the table has since evolved away from, and each of those files
+///   carries the tuple of the spec it was written under.
+/// - **A source id with no name in the current schema still counts**, under the
+///   id, since a plan for those files discloses the value either way.
+pub fn all_partition_source_columns(metadata: &TableMetadata) -> BTreeSet<String> {
+    let schema = metadata.current_schema();
+
+    metadata
+        .partition_specs_iter()
+        .flat_map(|spec| spec.fields())
+        .map(|field| {
+            schema
+                .name_by_field_id(field.source_id)
+                .map_or_else(|| format!("#{}", field.source_id), str::to_string)
+        })
         .collect()
 }
 
@@ -194,6 +251,9 @@ pub fn warn_if_cooperative(
         return;
     }
 
+    // A local cache key, not a namespace path — the same byte for the same
+    // reason (neither field can contain one), and deliberately not
+    // `names::PART_SEPARATOR`, which answers a different question.
     let key = format!("{}\u{1F}{table}", policy_set_version.unwrap_or("-"));
     if reported().get(&key).is_some() {
         return;
@@ -205,11 +265,12 @@ pub fn warn_if_cooperative(
         table = %table,
         columns = ?columns,
         policy_set_version = policy_set_version.unwrap_or("-"),
-        "Row filter references non-partition columns, so it cannot be enforced by \
-         withholding files. A scan plan applies it and returns it as the residual, so a \
-         cooperating engine honours it — but an engine using its own storage credentials \
-         reads the table unfiltered. Partition on the security boundary to make this \
-         enforcement architectural."
+        "Row filter references columns this table does not partition on by identity, so \
+         it cannot be enforced by withholding files — a transformed partition puts \
+         permitted and forbidden rows in the same file. A scan plan applies the filter \
+         and returns it as the residual, so a cooperating engine honours it, but an \
+         engine using its own storage credentials reads the table unfiltered. Partition \
+         on the security boundary to make this enforcement architectural."
     );
 }
 
@@ -220,13 +281,21 @@ mod alignment_tests {
         NestedField, PrimitiveType, Schema, SortOrder, TableMetadataBuilder, Transform, Type,
         UnboundPartitionSpec,
     };
+    use serde_json::json;
 
-    /// Table metadata partitioned on `region`, with `email` left unpartitioned.
+    /// Table metadata partitioned on `region` with an identity transform, and
+    /// `email` left unpartitioned.
     fn metadata(partition_on: Option<&str>) -> TableMetadata {
+        metadata_with(partition_on, Transform::Identity)
+    }
+
+    /// The same, with the partition transform named explicitly.
+    fn metadata_with(partition_on: Option<&str>, transform: Transform) -> TableMetadata {
         let schema = Schema::builder()
             .with_fields(vec![
                 NestedField::required(1, "region", Type::Primitive(PrimitiveType::String)).into(),
                 NestedField::optional(2, "email", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(3, "ts", Type::Primitive(PrimitiveType::Timestamp)).into(),
             ])
             .build()
             .expect("schema builds");
@@ -241,7 +310,7 @@ mod alignment_tests {
                     .expect("partition column is in the schema")
                     .id;
                 UnboundPartitionSpec::builder()
-                    .add_partition_field(source_id, format!("{name}_p"), Transform::Identity)
+                    .add_partition_field(source_id, format!("{name}_p"), transform)
                     .expect("partition field is valid")
                     .build()
             }
@@ -260,6 +329,105 @@ mod alignment_tests {
         .build()
         .expect("metadata builds")
         .metadata
+    }
+
+    /// A lossy transform puts permitted and forbidden rows in the same file, so
+    /// withholding files does not withhold rows and the enforcement is
+    /// cooperative — which is exactly what the warning has to say.
+    #[test]
+    fn a_transformed_partition_is_not_an_enforcement_boundary() {
+        for (column, transform) in [
+            ("region", Transform::Bucket(16)),
+            ("region", Transform::Truncate(4)),
+            ("region", Transform::Void),
+            ("ts", Transform::Day),
+            ("ts", Transform::Hour),
+            ("ts", Transform::Month),
+            ("ts", Transform::Year),
+        ] {
+            let metadata = metadata_with(Some(column), transform);
+            assert!(
+                partition_source_columns(&metadata).is_empty(),
+                "{transform:?} does not separate rows by column value"
+            );
+
+            let filter = json!({ "type": "eq", "term": column, "value": "EU" });
+            assert_eq!(
+                unaligned_columns(&filter, &metadata)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                vec![column.to_string()],
+                "{transform:?} must be reported as cooperative"
+            );
+        }
+    }
+
+    /// Table metadata partitioned on a *nested* column by identity.
+    fn metadata_nested() -> TableMetadata {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(
+                    1,
+                    "user",
+                    Type::Struct(iceberg::spec::StructType::new(vec![
+                        NestedField::required(2, "region", Type::Primitive(PrimitiveType::String))
+                            .into(),
+                    ])),
+                )
+                .into(),
+                NestedField::optional(3, "region", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .expect("schema builds");
+
+        let spec = UnboundPartitionSpec::builder()
+            .add_partition_field(2, "user_region".to_string(), Transform::Identity)
+            .expect("partition field is valid")
+            .build();
+
+        TableMetadataBuilder::new(
+            schema,
+            spec,
+            SortOrder::unsorted_order(),
+            "memory://wh/db/t".to_string(),
+            iceberg::spec::FormatVersion::V2,
+            std::collections::HashMap::new(),
+        )
+        .expect("metadata builds")
+        .build()
+        .expect("metadata builds")
+        .metadata
+    }
+
+    /// A nested partition column must be compared by its **full** name. The leaf
+    /// name is what `NestedField::name` carries, and using it matches a filter on
+    /// an unrelated top-level column of the same name while missing the filter
+    /// that actually named the nested one.
+    #[test]
+    fn a_nested_partition_column_is_compared_by_its_full_name() {
+        let metadata = metadata_nested();
+
+        assert_eq!(
+            partition_source_columns(&metadata)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["user.region".to_string()],
+        );
+
+        let on_nested = json!({ "type": "eq", "term": "user.region", "value": "EU" });
+        assert!(
+            unaligned_columns(&on_nested, &metadata).is_empty(),
+            "the partitioned column is aligned"
+        );
+
+        let on_top_level = json!({ "type": "eq", "term": "region", "value": "EU" });
+        assert_eq!(
+            unaligned_columns(&on_top_level, &metadata)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["region".to_string()],
+            "a different column that shares the leaf name is not aligned"
+        );
     }
 
     /// The source column is what matters, not the partition field's name: a
@@ -290,6 +458,24 @@ mod alignment_tests {
         assert_eq!(
             unaligned.into_iter().collect::<Vec<_>>(),
             vec!["email".to_string()]
+        );
+    }
+
+    /// Case is compared exactly, on both sides.
+    ///
+    /// Folding either side would make a filter on `region` look aligned with a
+    /// partition source spelled `Region` — the dangerous direction: the planner
+    /// binds case-sensitively and would not bind that filter at all, while this
+    /// reported architectural enforcement.
+    #[test]
+    fn a_differently_cased_column_is_not_aligned() {
+        let filter = serde_json::json!({ "type": "eq", "term": "Region", "value": "EU" });
+        assert_eq!(
+            unaligned_columns(&filter, &metadata(Some("region")))
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["Region".to_string()],
+            "a name the binder will not bind cannot be an enforcement boundary"
         );
     }
 

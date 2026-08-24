@@ -51,27 +51,22 @@ pub struct IcebergErrorResponse {
 #[non_exhaustive]
 pub enum AppError {
     // ========================================================================
-    // 400 Bad Request errors
+    // 400 Bad Request
     // ========================================================================
-    /// Invalid request data or parameters.
-    #[error("Bad request: {0}")]
+    /// The request is wrong, and the message says how.
+    ///
+    /// One variant for every `400`, because a caller cannot act on a finer
+    /// distinction than `BadRequestException`: splitting it by *kind* of
+    /// wrongness would be a fork in every `match` that buys nothing on the wire.
+    /// What makes an error useful is the sentence, not the variant.
+    ///
+    /// And the message is that sentence, unprefixed — `"The namespace contains
+    /// U+200B, which…"`, not `"Bad request: the namespace contains…"` beside a
+    /// `type` that already says so. A prefix belongs to the variants whose
+    /// payload is a bare identifier, where `Table does not exist:
+    /// analytics.events` is the whole sentence and the prefix is the verb.
+    #[error("{0}")]
     BadRequest(String),
-
-    /// Invalid namespace identifier.
-    #[error("Invalid namespace: {0}")]
-    InvalidNamespace(String),
-
-    /// Invalid table identifier.
-    #[error("Invalid table identifier: {0}")]
-    InvalidTableIdentifier(String),
-
-    /// Invalid schema definition.
-    #[error("Invalid schema: {0}")]
-    InvalidSchema(String),
-
-    /// Request body failed validation.
-    #[error("Validation error: {0}")]
-    ValidationError(String),
 
     // ========================================================================
     // 401 Unauthorized errors
@@ -88,7 +83,8 @@ pub enum AppError {
     // 403 Forbidden errors
     // ========================================================================
     /// Access denied due to insufficient permissions.
-    #[error("Access denied: {0}")]
+    /// Carries a sentence, so it carries no prefix — see [`AppError::BadRequest`].
+    #[error("{0}")]
     Forbidden(String),
 
     // ========================================================================
@@ -107,7 +103,7 @@ pub enum AppError {
     NoSuchView(String),
 
     /// Requested snapshot does not exist.
-    #[error("Snapshot does not exist: {0}")]
+    #[error("{0}")]
     NoSuchSnapshot(String),
 
     /// Requested reference (branch/tag) does not exist.
@@ -115,14 +111,20 @@ pub enum AppError {
     NoSuchReference(String),
 
     /// Requested scan plan does not exist.
-    #[error("Plan does not exist: {0}")]
+    #[error("{0}")]
     NoSuchPlan(String),
+
+    /// Requested scan plan task does not exist.
+    #[error("{0}")]
+    NoSuchPlanTask(String),
 
     // ========================================================================
     // 406 Not Acceptable / Unsupported Operation
     // ========================================================================
     /// Operation not supported by the server.
-    #[error("Not supported: {0}")]
+    ///
+    /// Carries a sentence, so it carries no prefix — see [`AppError::BadRequest`].
+    #[error("{0}")]
     NotSupported(String),
 
     // ========================================================================
@@ -141,12 +143,21 @@ pub enum AppError {
     ViewAlreadyExists(String),
 
     /// Concurrent modification conflict.
-    #[error("Commit conflict: {0}")]
+    ///
+    /// Carries a sentence, so it carries no prefix — see [`AppError::BadRequest`].
+    #[error("{0}")]
     CommitConflict(String),
 
     /// Namespace is not empty (cannot be deleted).
     #[error("Namespace not empty: {0}")]
     NamespaceNotEmpty(String),
+
+    /// The resource is marked protected from deletion.
+    ///
+    /// `409` rather than `403`: the caller is permitted, and the resource is in
+    /// a state that forbids the operation.
+    #[error("{0}")]
+    Protected(String),
 
     // ========================================================================
     // 429 Too Many Requests
@@ -159,7 +170,9 @@ pub enum AppError {
     // 422 Unprocessable Entity errors
     // ========================================================================
     /// Request is syntactically correct but semantically invalid.
-    #[error("Unprocessable entity: {0}")]
+    ///
+    /// Carries a sentence, so it carries no prefix — see [`AppError::BadRequest`].
+    #[error("{0}")]
     UnprocessableEntity(String),
 
     // ========================================================================
@@ -181,16 +194,69 @@ pub enum AppError {
     ServiceUnavailable(String),
 }
 
+/// Error type for a path this catalog does not route.
+///
+/// Not an [`AppError`] variant, because nothing *raises* it: it is filled in by
+/// the outermost layer for a response the router already produced. It lives here
+/// so every `type` string this server can emit is in one file — which is what
+/// `every_error_type_is_documented` reads.
+pub const NOT_FOUND_TYPE: &str = "NotFoundException";
+
+/// Error type for a routed path called with the wrong method. See
+/// [`NOT_FOUND_TYPE`].
+pub const METHOD_NOT_ALLOWED_TYPE: &str = "MethodNotAllowedException";
+
+/// The **only** `type` a rejected credential is answered with.
+///
+/// Naming the reason is a credential oracle. The API key path is constant-time
+/// on purpose — a lookup that misses still verifies against a dummy hash, so
+/// timing cannot separate a real prefix from an invented one — and `disabled`
+/// and `expired` are reachable only *after* that comparison succeeds, so either
+/// one is a positive answer to "is this key real". That is what somebody working
+/// through a dump of leaked credentials is asking.
+///
+/// So every rejection answers identically and the reason goes to the audit
+/// record, where the operator can read it and nobody can probe it.
+///
+/// Named here beside the constants above because every `type` string this server
+/// can emit belongs in one file — which is what `every_error_type_is_documented`
+/// reads, across both `error_type` matches.
+pub const UNAUTHORIZED_TYPE: &str = "NotAuthorizedException";
+
+/// The **only** `type` a rate-limited request is answered with.
+///
+/// One string, named once, so a client feature-detecting on `error.type` sees
+/// the same thing whichever layer refused it — this crate's error enum or the
+/// rate limiter's own response.
+pub const RATE_LIMITED_TYPE: &str = "TooManyRequestsException";
+
+/// The challenge every `401` carries.
+///
+/// RFC 9110 §11.6.1 makes this a **MUST**: a `401` without a
+/// `WWW-Authenticate` header is not a well-formed refusal, and a client that
+/// negotiates its scheme from the challenge — `curl --anyauth`, a generated
+/// OpenAPI client, anything driven by an HTTP library's auth layer — is left
+/// with a status code and no way to know what to send.
+///
+/// `Bearer` is the accurate challenge for **both** mechanisms rather than a
+/// convenient approximation of one: the API key path reads
+/// `Authorization: Bearer <key>` as readily as it reads `X-API-Key`, which is
+/// what lets a client configured with PyIceberg's `token` property work against
+/// a key-only deployment. `X-API-Key` is a header and not an auth scheme, so it
+/// cannot appear here; the refusal's own sentence names it.
+///
+/// No `error=` parameter. RFC 6750 allows one, and it would separate "you sent
+/// no token" from "the token you sent is bad" — a distinction the caller already
+/// holds, since it chose what to send, but not one worth spending the rule in
+/// [`UNAUTHORIZED_TYPE`] on for a parameter nothing reads.
+pub const WWW_AUTHENTICATE_CHALLENGE: &str = "Bearer realm=\"rustberg\"";
+
 impl AppError {
     /// Returns the HTTP status code for this error.
     pub fn status_code(&self) -> StatusCode {
         match self {
             // 400 Bad Request
-            AppError::BadRequest(_)
-            | AppError::InvalidNamespace(_)
-            | AppError::InvalidTableIdentifier(_)
-            | AppError::InvalidSchema(_)
-            | AppError::ValidationError(_) => StatusCode::BAD_REQUEST,
+            AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
 
             // 401 Unauthorized
             AppError::Unauthenticated | AppError::InvalidCredentials => StatusCode::UNAUTHORIZED,
@@ -204,7 +270,8 @@ impl AppError {
             | AppError::NoSuchView(_)
             | AppError::NoSuchSnapshot(_)
             | AppError::NoSuchReference(_)
-            | AppError::NoSuchPlan(_) => StatusCode::NOT_FOUND,
+            | AppError::NoSuchPlan(_)
+            | AppError::NoSuchPlanTask(_) => StatusCode::NOT_FOUND,
 
             // 501 Not Implemented — the operation is understood but unsupported.
             // (406 would claim a content-negotiation failure, which this is not.)
@@ -215,7 +282,8 @@ impl AppError {
             | AppError::TableAlreadyExists(_)
             | AppError::ViewAlreadyExists(_)
             | AppError::CommitConflict(_)
-            | AppError::NamespaceNotEmpty(_) => StatusCode::CONFLICT,
+            | AppError::NamespaceNotEmpty(_)
+            | AppError::Protected(_) => StatusCode::CONFLICT,
 
             // 429 Too Many Requests
             AppError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
@@ -235,12 +303,7 @@ impl AppError {
     pub fn error_type(&self) -> &'static str {
         match self {
             AppError::BadRequest(_) => "BadRequestException",
-            AppError::InvalidNamespace(_) => "BadRequestException",
-            AppError::InvalidTableIdentifier(_) => "BadRequestException",
-            AppError::InvalidSchema(_) => "BadRequestException",
-            AppError::ValidationError(_) => "BadRequestException",
-            AppError::Unauthenticated => "NotAuthorizedException",
-            AppError::InvalidCredentials => "NotAuthorizedException",
+            AppError::Unauthenticated | AppError::InvalidCredentials => UNAUTHORIZED_TYPE,
             AppError::Forbidden(_) => "ForbiddenException",
             AppError::NoSuchNamespace(_) => "NoSuchNamespaceException",
             AppError::NoSuchTable(_) => "NoSuchTableException",
@@ -248,13 +311,15 @@ impl AppError {
             AppError::NoSuchSnapshot(_) => "NoSuchSnapshotException",
             AppError::NoSuchReference(_) => "NoSuchReferenceException",
             AppError::NoSuchPlan(_) => "NoSuchPlanIdException",
+            AppError::NoSuchPlanTask(_) => "NoSuchPlanTaskException",
             AppError::NotSupported(_) => "UnsupportedOperationException",
             AppError::NamespaceAlreadyExists(_) => "AlreadyExistsException",
             AppError::TableAlreadyExists(_) => "AlreadyExistsException",
             AppError::ViewAlreadyExists(_) => "AlreadyExistsException",
             AppError::CommitConflict(_) => "CommitFailedException",
             AppError::NamespaceNotEmpty(_) => "NamespaceNotEmptyException",
-            AppError::RateLimited => "TooManyRequestsException",
+            AppError::Protected(_) => "ProtectedException",
+            AppError::RateLimited => RATE_LIMITED_TYPE,
             AppError::UnprocessableEntity(_) => "UnprocessableEntityException",
             AppError::Internal(_) => "InternalServerError",
             AppError::StorageError(_) => "InternalServerError",
@@ -376,7 +441,14 @@ impl IntoResponse for AppError {
         // Wrap in IcebergErrorResponse per Iceberg REST Catalog spec
         let response = IcebergErrorResponse { error: body };
 
-        (status, Json(response)).into_response()
+        let mut response = (status, Json(response)).into_response();
+        if status == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static(WWW_AUTHENTICATE_CHALLENGE),
+            );
+        }
+        response
     }
 }
 
@@ -409,26 +481,48 @@ mod tests {
     }
 
     #[test]
-    fn test_all_400_errors() {
+    fn a_bad_request_is_400() {
         assert_eq!(
             AppError::BadRequest("".into()).status_code(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    /// The message is the whole message: no variant that carries a sentence
+    /// prefixes it with a restatement of its own type, which the `type` field
+    /// beside it already carries.
+    #[test]
+    fn a_sentence_carrying_error_does_not_repeat_its_own_type() {
+        for error in [
+            AppError::BadRequest("Names must be NFC.".into()),
+            AppError::Forbidden("Names must be NFC.".into()),
+            AppError::NotSupported("Names must be NFC.".into()),
+            AppError::CommitConflict("Names must be NFC.".into()),
+            AppError::UnprocessableEntity("Names must be NFC.".into()),
+            AppError::NoSuchSnapshot("Names must be NFC.".into()),
+            AppError::NoSuchPlan("Names must be NFC.".into()),
+            AppError::NoSuchPlanTask("Names must be NFC.".into()),
+        ] {
+            assert_eq!(
+                error.to_string(),
+                "Names must be NFC.",
+                "{:?} pastes a prefix in front of a message that is already a sentence",
+                error
+            );
+        }
+    }
+
+    /// And the ones whose payload is a bare identifier keep theirs, because
+    /// there the prefix *is* the sentence.
+    #[test]
+    fn an_identifier_carrying_error_keeps_its_verb() {
         assert_eq!(
-            AppError::InvalidNamespace("".into()).status_code(),
-            StatusCode::BAD_REQUEST
+            AppError::NoSuchTable("analytics.events".into()).to_string(),
+            "Table does not exist: analytics.events"
         );
         assert_eq!(
-            AppError::InvalidTableIdentifier("".into()).status_code(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            AppError::InvalidSchema("".into()).status_code(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            AppError::ValidationError("".into()).status_code(),
-            StatusCode::BAD_REQUEST
+            AppError::NamespaceNotEmpty("analytics".into()).to_string(),
+            "Namespace not empty: analytics"
         );
     }
 
@@ -554,22 +648,6 @@ mod tests {
             AppError::BadRequest("".into()).error_type(),
             "BadRequestException"
         );
-        assert_eq!(
-            AppError::InvalidNamespace("".into()).error_type(),
-            "BadRequestException"
-        );
-        assert_eq!(
-            AppError::InvalidTableIdentifier("".into()).error_type(),
-            "BadRequestException"
-        );
-        assert_eq!(
-            AppError::InvalidSchema("".into()).error_type(),
-            "BadRequestException"
-        );
-        assert_eq!(
-            AppError::ValidationError("".into()).error_type(),
-            "BadRequestException"
-        );
     }
 
     #[test]
@@ -680,23 +758,20 @@ mod tests {
 
     #[test]
     fn test_error_display_bad_request() {
-        let err = AppError::BadRequest("missing field 'name'".into());
-        assert_eq!(err.to_string(), "Bad request: missing field 'name'");
+        let err = AppError::BadRequest("The request names no 'name' field.".into());
+        assert_eq!(err.to_string(), "The request names no 'name' field.");
     }
 
     #[test]
     fn test_error_display_forbidden() {
-        let err = AppError::Forbidden("no access to table foo".into());
-        assert_eq!(err.to_string(), "Access denied: no access to table foo");
+        let err = AppError::Forbidden("Not permitted to read table 'db.foo'".into());
+        assert_eq!(err.to_string(), "Not permitted to read table 'db.foo'");
     }
 
     #[test]
     fn test_error_display_commit_conflict() {
-        let err = AppError::CommitConflict("table modified concurrently".into());
-        assert_eq!(
-            err.to_string(),
-            "Commit conflict: table modified concurrently"
-        );
+        let err = AppError::CommitConflict("Table modified concurrently.".into());
+        assert_eq!(err.to_string(), "Table modified concurrently.");
     }
 
     #[test]
@@ -708,6 +783,93 @@ mod tests {
     // ========================================================================
     // ErrorModel Tests
     // ========================================================================
+
+    /// The API reference claims to list *the exact* `type` values this server
+    /// emits. This is what makes that claim checkable.
+    ///
+    /// Both directions matter. A type missing from the table is a client
+    /// branching on a string the documentation never mentions; a type in the
+    /// table and not in the code is a client branching on one that never
+    /// arrives.
+    ///
+    /// The set is read out of this file rather than written down twice — a
+    /// second list would be the thing that drifts.
+    #[test]
+    fn every_error_type_is_documented() {
+        use std::collections::BTreeSet;
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        // **Both** `error_type` matches, not just this file's.
+        //
+        // Scanning only `src/error.rs` is how the authentication layer came to
+        // emit `ApiKeyNotFoundException`, `TokenExpiredException` and two more
+        // for one status code while this table documented `NotAuthorizedException`
+        // — a type nothing produced, sitting next to four nobody had written
+        // down. A gate that reads one of two vocabularies is a gate on neither.
+        let body: String = ["src/error.rs", "src/auth/error.rs"]
+            .iter()
+            .map(|file| {
+                let source = std::fs::read_to_string(root.join(file))
+                    .unwrap_or_else(|e| panic!("read {file}: {e}"));
+                let start = source
+                    .find("pub fn error_type(&self)")
+                    .unwrap_or_else(|| panic!("{file} has an error_type"));
+                let end = source[start..]
+                    .find("\n    }")
+                    .unwrap_or_else(|| panic!("{file}'s match ends"))
+                    + start;
+                source[start..end].to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The constants are chained rather than scanned for: an arm that names
+        // one is the point — it is how two layers stay on one string — so there
+        // is no literal in the source to find.
+        let emitted: BTreeSet<String> = body
+            .split('"')
+            .filter(|s| s.ends_with("Exception") || *s == "InternalServerError")
+            .map(str::to_string)
+            .chain([
+                NOT_FOUND_TYPE.to_string(),
+                METHOD_NOT_ALLOWED_TYPE.to_string(),
+                UNAUTHORIZED_TYPE.to_string(),
+                RATE_LIMITED_TYPE.to_string(),
+            ])
+            .collect();
+        assert!(
+            emitted.len() > 15,
+            "the scan found almost nothing: {emitted:?}"
+        );
+
+        let doc =
+            std::fs::read_to_string(root.join("site/content/docs/api.md")).expect("read api.md");
+        let table = {
+            let start = doc
+                .find("| Code | Type | Description |")
+                .expect("the table");
+            let end = doc[start..].find("\n\n").expect("its end") + start;
+            &doc[start..end]
+        };
+        let documented: BTreeSet<String> = table
+            .lines()
+            .filter_map(|line| line.split('|').nth(2))
+            .map(|cell| cell.trim().to_string())
+            .filter(|cell| cell.ends_with("Exception") || cell == "InternalServerError")
+            .collect();
+
+        let missing: Vec<_> = emitted.difference(&documented).collect();
+        assert!(
+            missing.is_empty(),
+            "these types are emitted but not in the API reference's error table: {missing:?}"
+        );
+        let invented: Vec<_> = documented.difference(&emitted).collect();
+        assert!(
+            invented.is_empty(),
+            "these types are documented but never emitted: {invented:?}"
+        );
+    }
 
     #[test]
     fn test_error_model_serialization() {
@@ -744,7 +906,7 @@ mod tests {
     #[test]
     fn test_error_with_empty_message() {
         let err = AppError::BadRequest("".into());
-        assert_eq!(err.to_string(), "Bad request: ");
+        assert_eq!(err.to_string(), "");
         assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
     }
 

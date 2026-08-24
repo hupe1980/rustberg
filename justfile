@@ -114,14 +114,23 @@ features:
     # crate was switching on the thing it needed. --all-features and
     # --no-default-features are the two ends of the range, and the middle is
     # where that breaks.
+    #
+    # The list is read from Cargo.toml rather than written here. A hardcoded one
+    # silently stops covering the feature added after it — which is how
+    # `remote-signing` went unchecked while this recipe claimed to check
+    # everything. `default` and `storage-all` are skipped: both are aggregates
+    # of entries already in the list, so checking them proves nothing new.
     cargo check --no-default-features
-    for feature in cli tls catalog-postgres storage-s3 storage-gcs storage-azure \
-                   aws-credentials gcp-credentials azure-credentials; do
+    features=$(cargo metadata --no-deps --format-version 1 \
+      | python3 -c 'import json,sys; print(" ".join(
+            f for f in json.load(sys.stdin)["packages"][0]["features"]
+            if f not in ("default", "storage-all")))')
+    for feature in $features; do
       echo "▶ $feature"
       cargo check --quiet --no-default-features --features "$feature"
     done
     cargo check --quiet --all-features
-    echo "✅ Every feature builds alone"
+    echo "✅ Every feature builds alone: $features"
 
 # Verify the crate still compiles on its declared minimum Rust version
 msrv:
@@ -143,17 +152,21 @@ audit:
 outdated:
     cargo outdated
 
-# Deny check (licenses, vulnerabilities)
+# Deny check (advisories, bans, licences, sources).
+#
+# `--all-features`, because the ban list is what keeps OpenSSL and native-tls
+# out of *every* feature combination, and it can only do that over a graph that
+# has the optional dependencies in it.
 deny:
-    cargo deny check
+    cargo deny --all-features check
 
 # ============================================================================
 # Documentation
 # ============================================================================
 
-# Build documentation
+# Build documentation, failing on a broken intra-doc link as CI does
 doc:
-    cargo doc --all-features --no-deps --open
+    RUSTDOCFLAGS=-Dwarnings cargo doc --all-features --no-deps --open
 
 # ============================================================================
 # Site
@@ -235,6 +248,33 @@ release-all:
 # Build Docker image
 docker-build tag="latest":
     docker build -t rustberg:{{tag}} .
+
+# Start the image the way the README says to, and check that it serves
+docker-smoke tag="smoke":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # `--version` and `--help` prove the binary links; they do not prove the
+    # image *starts*, which is a different question and the one that has been
+    # wrong before. This is what CI runs.
+    docker build -t rustberg:{{tag}} .
+    docker rm -f rustberg-smoke >/dev/null 2>&1 || true
+    docker run -d --name rustberg-smoke -p 8000:8000 \
+      -e RUSTBERG_INSECURE_HTTP=true rustberg:{{tag}}
+    trap 'docker rm -f rustberg-smoke >/dev/null 2>&1 || true' EXIT
+    for _ in $(seq 1 30); do
+      state=$(docker inspect -f '{{{{.State.Health.Status}}}}' rustberg-smoke)
+      [ "$state" = healthy ] && break
+      [ "$state" = unhealthy ] && break
+      sleep 2
+    done
+    docker logs rustberg-smoke
+    test "$(docker inspect -f '{{{{.State.Health.Status}}}}' rustberg-smoke)" = healthy
+    # Authentication is on by default, so 401 is the proof that the router is
+    # serving — a connection refused or a 500 would not be.
+    code=$(curl -s -o /dev/null -w '%{{{{http_code}}}}' http://localhost:8000/v1/config)
+    echo "GET /v1/config -> $code"
+    test "$code" = 401
+    echo "✅ the image starts, reports healthy, and serves"
 
 # Push Docker image
 docker-push tag="latest" registry="ghcr.io/hupe1980":

@@ -41,8 +41,11 @@ services:
     volumes:
       - rustberg-data:/var/lib/rustberg/data
       - rustberg-warehouse:/var/lib/rustberg/warehouse
+    # The image is distroless — no shell, no curl — so the binary probes itself.
+    # `healthcheck` reads /ready, which reports whether the catalog store and the
+    # policy set are usable rather than merely that the process is alive.
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "/usr/local/bin/rustberg", "healthcheck"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -71,8 +74,11 @@ services:
     volumes:
       - rustberg-dev-data:/var/lib/rustberg/data
       - rustberg-dev-warehouse:/var/lib/rustberg/warehouse
+    # The image is distroless — no shell, no curl — so the binary probes itself.
+    # `healthcheck` reads /ready, which reports whether the catalog store and the
+    # policy set are usable rather than merely that the process is alive.
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "/usr/local/bin/rustberg", "healthcheck"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -145,8 +151,11 @@ services:
     volumes:
       - ./examples/minio.toml:/etc/rustberg/config.toml:ro
       - rustberg-storage-data:/var/lib/rustberg/data
+    # The image is distroless — no shell, no curl — so the binary probes itself.
+    # `healthcheck` reads /ready, which reports whether the catalog store and the
+    # policy set are usable rather than merely that the process is alive.
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "/usr/local/bin/rustberg", "healthcheck"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -173,18 +182,26 @@ volumes:
 #    docker-compose --profile storage up -d
 #    MinIO console: http://localhost:9001 (minioadmin/minioadmin)
 #
-# 4. Generate API key (production):
-#    docker-compose exec rustberg rustberg generate-key --name admin --roles admin
+# 4. Generate an API key (production). The image is distroless, so there is no
+#    shell — `exec` runs the binary directly:
+#    docker compose exec rustberg rustberg generate-key --name admin --roles admin
 #
-# 5. Create backup:
-#    docker-compose exec rustberg rustberg backup --output /tmp/backup.tar.gz
+# 5. Back up the catalog. There is no backup subcommand: the redb file is one
+#    file, so a copy taken while nothing is writing to it is the backup. Stop
+#    the container first — redb holds an exclusive lock and a copy taken during
+#    a commit is a copy of a half-written file:
+#    docker compose stop rustberg && docker run --rm \
+#      -v rustberg_rustberg-data:/data -v "$PWD:/out" busybox \
+#      cp /data/catalog.redb /out/catalog.redb && docker compose start rustberg
+#    A Postgres-backed deployment uses `pg_dump`, which needs no downtime.
 #
 # 6. View logs:
-#    docker-compose logs -f rustberg
+#    docker compose logs -f rustberg
 #
-# 7. Check health:
-#    curl http://localhost:8000/health
-#    curl http://localhost:8000/ready
+# 7. Check health. The container checks itself every ten seconds
+#    (`docker compose ps` shows the result); from outside:
+#    curl http://localhost:8000/health   # the process is up
+#    curl http://localhost:8000/ready    # the catalog and policy set are usable
 #
 # Security Notes:
 # - Production mode (default) requires API key authentication

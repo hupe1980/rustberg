@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use iceberg::{NamespaceIdent, TableCreation, TableIdent, TableUpdate};
 use rustberg::catalog::{CatalogStore, PageRequest, PostgresCatalog};
+
+mod common;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -37,7 +39,15 @@ struct TestDb {
 
 impl TestDb {
     async fn start() -> Self {
-        let container = GenericImage::new("postgres", "16-alpine")
+        // Debian-based, deliberately, and **not** `-alpine`. Alpine is musl,
+        // whose `strcoll` is byte comparison, so every locale there behaves like
+        // `C` — which is exactly the property `listings_come_back_in_byte_order`
+        // exists to check, making the test vacuous on the image that was here
+        // before. Real deployments run glibc: the Debian image, RDS, Cloud SQL,
+        // Aurora. There `en_US.utf8` orders `aa, ab, Ärger, _underscore, Zulu`
+        // and byte order gives `Zulu, _underscore, aa, ab`, which is a different
+        // listing from redb's for the same catalog.
+        let container = GenericImage::new("postgres", "16")
             .with_exposed_port(5432.tcp())
             .with_wait_for(WaitFor::message_on_stderr(
                 "database system is ready to accept connections",
@@ -146,6 +156,49 @@ async fn schema_creation_is_idempotent_across_replicas() {
     );
 }
 
+/// A database created by a build with a different schema is refused at startup.
+///
+/// `CREATE TABLE IF NOT EXISTS` cannot reshape a database that already exists,
+/// so a schema change leaves the old rows in the old shape and the new relations
+/// empty. That shows up as tables reporting themselves missing, which points at
+/// nothing. The stamp turns it into one sentence naming both versions, and it
+/// covers every future change rather than the one somebody remembered to detect.
+#[tokio::test]
+#[ignore = "requires Docker; run with --ignored"]
+async fn a_database_from_another_schema_version_is_refused() {
+    let db = TestDb::start().await;
+
+    // A first replica stamps the database.
+    let _first = db.catalog().await;
+
+    // Rewrite the stamp to a version this build does not serve, which is what a
+    // database created by a different build looks like from here.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&db.dsn)
+        .await
+        .expect("connect");
+    sqlx::query("UPDATE rustberg_schema_version SET version = version + 1, created_by = $1")
+        .bind("0.0.1-from-the-past")
+        .execute(&pool)
+        .await
+        .expect("restamp");
+
+    let err = PostgresCatalog::connect(
+        &db.dsn,
+        &format!("file://{}", db.warehouse.path().display()),
+    )
+    .await
+    .expect_err("a database this build does not describe must be refused");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("schema") && message.contains("0.0.1-from-the-past"),
+        "the refusal must name both versions so an operator knows what happened, got: \
+         {message}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires Docker; run with --ignored"]
 async fn rejects_duplicate_namespace() {
@@ -177,6 +230,84 @@ async fn refuses_to_drop_a_namespace_holding_tables() {
         err.message().contains("not empty"),
         "error should say why: {err}"
     );
+    assert!(
+        err.message().contains("tables"),
+        "and say what is in there: {err}"
+    );
+}
+
+/// Every relationship in the schema is a real constraint, so each kind of
+/// occupant blocks the drop and the message names which one.
+///
+/// This is not a `SELECT`-then-`DELETE`: under Postgres's default `READ
+/// COMMITTED` isolation a concurrent `createTable` that commits between the two
+/// is invisible to the reader, and the drop would succeed — leaving a table
+/// reachable by exact path, absent from every listing, and impossible to remove
+/// through the API. The foreign key has no such window.
+#[tokio::test]
+#[ignore = "requires Docker; run with --ignored"]
+async fn every_kind_of_occupant_blocks_a_namespace_drop() {
+    let db = TestDb::start().await;
+    let catalog = db.catalog().await;
+
+    // A view.
+    let with_view = namespace(&catalog, "has_view").await;
+    let view = TableIdent::new(with_view.clone(), "v".to_string());
+    catalog
+        .create_view(
+            &view,
+            common::simple_view_metadata(&with_view, "v", "file:///tmp/rustberg-test/has_view/v"),
+        )
+        .await
+        .expect("view is created");
+    let err = catalog
+        .drop_namespace(&with_view)
+        .await
+        .expect_err("a view blocks the drop");
+    assert!(err.message().contains("views"), "{err}");
+
+    // A child namespace.
+    let parent = namespace(&catalog, "has_child").await;
+    let child = NamespaceIdent::from_vec(vec!["has_child".into(), "inner".into()]).unwrap();
+    catalog
+        .create_namespace(&child, HashMap::new())
+        .await
+        .expect("child is created");
+    let err = catalog
+        .drop_namespace(&parent)
+        .await
+        .expect_err("a child namespace blocks the drop");
+    assert!(err.message().contains("child namespaces"), "{err}");
+
+    // Emptying it makes the drop succeed, so the constraint is not simply
+    // refusing everything.
+    catalog.drop_namespace(&child).await.expect("child drops");
+    catalog.drop_namespace(&parent).await.expect("parent drops");
+}
+
+/// A staged table is not a table: it cascades with the namespace rather than
+/// blocking its drop, so nothing can later be promoted into a namespace that is
+/// gone.
+#[tokio::test]
+#[ignore = "requires Docker; run with --ignored"]
+async fn a_staged_table_does_not_block_a_namespace_drop() {
+    let db = TestDb::start().await;
+    let catalog = db.catalog().await;
+
+    let ns = namespace(&catalog, "has_staged").await;
+    let creation = iceberg::TableCreation::builder()
+        .name("pending".to_string())
+        .schema(test_schema())
+        .build();
+    catalog
+        .stage_create_table(&ns, creation)
+        .await
+        .expect("staging succeeds");
+
+    catalog
+        .drop_namespace(&ns)
+        .await
+        .expect("a staged table has no claim on the name");
 }
 
 #[tokio::test]
@@ -638,8 +769,6 @@ async fn paging_namespaces_counts_only_direct_children() {
 // Shared backend contract
 // ============================================================================
 
-mod common;
-
 /// Runs the contract in `tests/common` against Postgres.
 ///
 /// redb runs the identical suite. This pairing is what catches a backend
@@ -994,4 +1123,88 @@ async fn concurrent_policy_writes_get_distinct_sequences() {
         sequences.len(),
         "two revisions shared a sequence, so one rule set overwrote another: {sequences:?}"
     );
+}
+
+// ── Ordering ────────────────────────────────────────────────────────────
+
+/// Postgres and redb must page in the *same* order, or a client that migrates
+/// between them silently sees a different listing — and `tests/redb_catalog_
+/// tests.rs` asserts the same sequence against the same names.
+///
+/// This is what `COLLATE "C"` on every key column buys. Under a locale
+/// collation `Ä` sorts beside `A`, `_` and `-` are ignored at the primary
+/// level, and U+001F — the separator every namespace key is built from — is
+/// *completely ignorable*, so `a␟b` and `ab` compare equal. None of that
+/// matches a byte-ordered B-tree.
+#[tokio::test]
+#[ignore = "requires Docker; run with --ignored"]
+async fn listings_come_back_in_byte_order() {
+    let db = TestDb::start().await;
+    let catalog = db.catalog().await;
+
+    // Chosen so a locale collation reorders them: `Z` before `a` only in byte
+    // order, and the diacritic and the underscore both move under a locale.
+    let names = ["Zulu", "_underscore", "aa", "ab", "Ärger", "zz"];
+    for name in names {
+        namespace(&catalog, name).await;
+    }
+
+    let listed: Vec<String> = catalog
+        .list_namespaces(None, &PageRequest::first(100))
+        .await
+        .expect("list")
+        .into_items()
+        .into_iter()
+        .map(|ns| ns.join("."))
+        .collect();
+
+    let mut expected: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+    expected.sort_unstable();
+
+    assert_eq!(
+        listed, expected,
+        "listings must come back in byte order, the order redb uses"
+    );
+}
+
+/// Keyset pagination is `name > $cursor`. Under a collation that sorts two
+/// distinct names equal, the cursor either stalls on a row or skips past one —
+/// so every name must be visited exactly once, whatever the page size.
+#[tokio::test]
+#[ignore = "requires Docker; run with --ignored"]
+async fn paging_visits_every_name_exactly_once() {
+    let db = TestDb::start().await;
+    let catalog = db.catalog().await;
+
+    let names = ["Zulu", "_underscore", "aa", "a-a", "a_a", "Ärger", "zz"];
+    for name in names {
+        namespace(&catalog, name).await;
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..names.len() * 2 {
+        let page = catalog
+            .list_namespaces(
+                None,
+                &PageRequest {
+                    after: cursor.clone(),
+                    limit: 2,
+                },
+            )
+            .await
+            .expect("list");
+        let next = page.next.clone();
+        for entry in &page.entries {
+            seen.push(entry.item.join("."));
+        }
+        match next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    let mut expected: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+    expected.sort_unstable();
+    assert_eq!(seen, expected, "every name once, in byte order");
 }

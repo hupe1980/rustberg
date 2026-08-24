@@ -44,6 +44,8 @@
 //! comparison is about *where the bytes live* rather than how the URL was
 //! spelled.
 
+use iceberg::{TableUpdate, ViewUpdate};
+
 use crate::error::{AppError, Result};
 
 /// Folds the aliases of one storage service onto a single scheme.
@@ -68,6 +70,13 @@ fn canonical_scheme(scheme: &str) -> &str {
 /// A bare path with no scheme is local, and is reported as `file` so that
 /// `/srv/warehouse` and `file:///srv/warehouse` compare equal — operators write
 /// both, and they mean the same directory.
+///
+/// The leading slash is kept in the returned path, and [`is_within`] compares
+/// it, because [`segments`] throws that distinction away: without it the
+/// *relative* path `srv/warehouse/x` splits into the same segments as the
+/// absolute `/srv/warehouse/x` and would be admitted into a warehouse it does
+/// not name. A relative table location has no meaning here anyway — it would be
+/// resolved against whatever directory the process happened to start in.
 fn split(location: &str) -> (String, &str) {
     match location.split_once("://") {
         Some((scheme, rest)) => (
@@ -78,10 +87,26 @@ fn split(location: &str) -> (String, &str) {
     }
 }
 
+/// Whether a local path is rooted.
+///
+/// Only asked about the `file` scheme: after `scheme://` the remainder always
+/// starts at an authority or a bucket, so there is no leading slash to compare.
+fn is_absolute(path: &str) -> bool {
+    path.starts_with('/')
+}
+
 /// Splits a path into non-empty segments.
 ///
 /// Empty segments are dropped so that `bucket//wh` and `bucket/wh` agree; a
 /// doubled slash is a typo, not a different location.
+///
+/// A `.` segment is **kept**, and that is deliberate. On a filesystem it means
+/// "this directory" and could be dropped; in an object store it is an ordinary
+/// key segment, and `wh/./t` and `wh/t` are two different objects. Dropping it
+/// would make containment agree with the filesystem reading and disagree with
+/// the store the credential is scoped to — and the comparison here has to be
+/// about the bytes the storage service will address. `..` is refused outright by
+/// the callers below rather than resolved, for the same reason.
 fn segments(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty()).collect()
 }
@@ -99,6 +124,12 @@ pub fn is_within(root: &str, candidate: &str) -> bool {
     let (candidate_scheme, candidate_path) = split(candidate);
 
     if root_scheme != candidate_scheme {
+        return false;
+    }
+
+    // A local path must be rooted the same way as the warehouse, or two
+    // different directories compare equal — see `split`.
+    if root_scheme == "file" && is_absolute(root_path) != is_absolute(candidate_path) {
         return false;
     }
 
@@ -135,6 +166,10 @@ pub fn is_prefix_within(root: &str, candidate: &str) -> bool {
         return false;
     }
 
+    if root_scheme == "file" && is_absolute(root_path) != is_absolute(candidate_path) {
+        return false;
+    }
+
     let root_segments = segments(root_path);
     let candidate_segments = segments(candidate_path);
 
@@ -163,7 +198,7 @@ pub fn is_prefix_within(root: &str, candidate: &str) -> bool {
 /// "none configured" means none — never "anywhere". Reading it the other way
 /// makes a provider built without prefixes mint credentials for any bucket its
 /// role can reach, which is the confused-deputy hole
-/// [`ensure_within_warehouse`] exists to close, one layer down.
+/// [`LocationBound`] exists to close, one layer down.
 ///
 /// Failing closed costs a misconfigured deployment its credential vending,
 /// which is visible and recoverable. Failing open costs it the blast radius of
@@ -174,79 +209,366 @@ pub fn is_vendable(allowed_prefixes: &[String], location: &str) -> bool {
         .any(|prefix| is_within(prefix, location))
 }
 
-/// Confines a client-supplied `location` to the `warehouse`.
+/// How far a client may move a resource's storage.
 ///
-/// # Errors
+/// # Why this is a choice at all, and why the default is the tight one
 ///
-/// Returns [`AppError::BadRequest`] when `location` is empty or falls outside
-/// `warehouse`. The message names the warehouse, because the caller is
-/// permitted to know where it is allowed to write — it is the location it did
-/// *not* get access to that stays unnamed.
-pub fn ensure_within_warehouse(warehouse: &str, location: &str) -> Result<()> {
-    if location.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "Storage location must not be empty".to_string(),
-        ));
-    }
-
-    if is_within(warehouse, location) {
-        return Ok(());
-    }
-
-    Err(AppError::BadRequest(format!(
-        "Storage location '{location}' is outside this catalog's warehouse \
-         ('{warehouse}'). A catalog only manages locations within its own \
-         warehouse, because the credentials it vends are scoped to them."
-    )))
+/// Every guarantee in this crate is written over the **namespace tree**: a Cedar
+/// policy names `Namespace::"acme␟finance"`, and a caller either may reach what
+/// is under it or may not. Storage access is written over a **path**: a vended
+/// credential, and a signature, are scoped to the location the table declares.
+///
+/// Those two hierarchies are only the same hierarchy while a table's files stay
+/// where its name puts them. Let a table declare any location in the warehouse
+/// and the mapping breaks in one move: a caller with `Update` on one table of
+/// its own points that table at `…/finance/secret`, asks for credentials, and is
+/// handed a correctly-scoped credential for a prefix its policy never mentioned.
+/// Nothing in that sequence is a bug in the authorizer — every step is
+/// permitted. The location was simply not something the caller should have been
+/// able to choose.
+///
+/// Apache Polaris draws the same line, from the same reasoning, and defaults the
+/// same way (`ALLOW_UNSTRUCTURED_TABLE_LOCATION`, off).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LocationScope {
+    /// A resource's files live under `<warehouse>/<namespace…>/<name>` — the
+    /// layout the registries already assign, held to as a *rule*.
+    ///
+    /// The storage hierarchy is then the policy hierarchy, so a location-scoped
+    /// credential is a faithful enforcement of a namespace-scoped grant. Two
+    /// resources cannot overlap, because names are unique within a namespace and
+    /// namespaces nest by segment — no lookup, no scan, nothing to race.
+    #[default]
+    Table,
+    /// Anywhere inside the warehouse.
+    ///
+    /// What it is for: adopting a lake whose layout predates this catalog, where
+    /// `registerTable` has to name files that are not where a name would put
+    /// them.
+    ///
+    /// What it costs: the paragraph above, in full. A caller permitted to write
+    /// **one** table can point it anywhere in the warehouse and be credentialed
+    /// there. Only choose it where something outside Rustberg enforces the
+    /// isolation — a bucket per tenant, say — or where every principal that can
+    /// write is trusted with the whole warehouse.
+    Warehouse,
 }
 
-/// Confines the location a *metadata document* declares, at the moment a
-/// catalog adopts it.
-///
-/// # Why this lives in the backend and not in the handler
-///
-/// `registerTable` names a metadata file, and the `location` recorded *inside*
-/// that file is what a vended credential is later scoped to — not the path the
-/// caller handed in. So the file path being inside the warehouse proves nothing;
-/// a file at a legitimate path may declare any location it likes.
-///
-/// Checking after the pointer is published leaves a window in which a table
-/// declaring somebody else's prefix is loadable. Checking before it, from the
-/// handler, is worse: the caller controls that file, so the bytes checked and
-/// the bytes adopted are two different reads of something that can change in
-/// between.
-///
-/// There is exactly one read that is safe to check: **the one the catalog is
-/// about to record**. That read happens inside the backend, so the check does
-/// too, and no pointer is published at all.
-///
-/// A backend with no warehouse of its own (`None`) is not confined here. That is
-/// a federated mount over somebody else's catalog, which stores nothing and
-/// refuses registration on capability grounds before reaching this.
-///
-/// # Errors
-///
-/// An [`iceberg::Error`] rather than an [`AppError`], because the caller is a
-/// [`CatalogStore`](crate::catalog::CatalogStore) and that is the vocabulary the
-/// trait speaks. It maps to `400`.
-pub fn confine_declared_location(warehouse: Option<&str>, declared: &str) -> iceberg::Result<()> {
-    let Some(warehouse) = warehouse else {
-        return Ok(());
-    };
+impl LocationScope {
+    /// Parses the configured value.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Internal`] naming the accepted values. Unrecognised is a
+    /// startup failure rather than a silent fall back to either side: falling
+    /// back to `Table` breaks a deployment that meant `Warehouse`, and falling
+    /// back to `Warehouse` silently removes the bound.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "table" => Ok(Self::Table),
+            "warehouse" => Ok(Self::Warehouse),
+            other => Err(AppError::Internal(format!(
+                "Unknown storage.location_scope '{other}'. Valid values are 'table' (the \
+                 default: a resource's files live under <warehouse>/<namespace>/<name>) \
+                 and 'warehouse' (anywhere in the warehouse, which lets a caller \
+                 permitted to write one table be credentialed for any prefix in it)."
+            ))),
+        }
+    }
+}
 
-    if is_within(warehouse, declared) {
-        return Ok(());
+/// The prefix a resource's storage must sit inside, and enough context to say
+/// why when it does not.
+///
+/// One value built once per request, then asked about every location that
+/// request carries — a `createTable` body, the four a `commitTable` carries, the
+/// location a registered metadata file declares. Building it once is what keeps
+/// those callers from each deciding the rule for themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocationBound {
+    root: String,
+    scope: LocationScope,
+}
+
+impl LocationBound {
+    /// The bound for one named resource, given the prefix its namespace occupies.
+    ///
+    /// `namespace_prefix` is where the backend holding this namespace keeps its
+    /// resources — `warehouse` plus the namespace's own levels, *as that backend
+    /// sees them*. It is passed in rather than derived here because under
+    /// federation the two differ: a mount's name is a segment of the namespace
+    /// **here** and not a segment of the path **there**, so building the prefix
+    /// from the federated namespace produces `…/prod/db/events` for a table the
+    /// mount itself keeps at `…/db/events`, and every register into a mount
+    /// fails its own bound. [`CatalogStore::namespace_prefix_for`] is what
+    /// routes it.
+    ///
+    /// Under [`LocationScope::Warehouse`] neither the prefix nor the name is
+    /// used — the bound is the warehouse — and both are taken anyway so a caller
+    /// cannot express "confine this, but I have not worked out to what".
+    ///
+    /// [`CatalogStore::namespace_prefix_for`]: crate::catalog::CatalogStore::namespace_prefix_for
+    pub fn new(scope: LocationScope, warehouse: &str, namespace_prefix: &str, name: &str) -> Self {
+        let root = match scope {
+            LocationScope::Warehouse => warehouse.to_string(),
+            LocationScope::Table => {
+                format!("{}/{}", namespace_prefix.trim_end_matches('/'), name)
+            }
+        };
+        Self { root, scope }
     }
 
-    Err(iceberg::Error::new(
-        iceberg::ErrorKind::DataInvalid,
-        format!(
-            "The metadata being registered declares the location '{declared}', which is \
-             outside this catalog's warehouse ('{warehouse}'). A catalog only manages \
-             locations within its own warehouse, because the credentials it vends are \
-             scoped to them."
-        ),
-    ))
+    /// The prefix itself, for a caller that needs to build a default location
+    /// rather than check one.
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    /// Confines one client-supplied location.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::BadRequest`] when `location` is empty or falls outside the
+    /// bound. The message names the bound, because the caller is permitted to
+    /// know where it *may* write — it is the location it did not get access to
+    /// that stays unnamed.
+    pub fn ensure(&self, location: &str) -> Result<()> {
+        if location.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "Storage location must not be empty".to_string(),
+            ));
+        }
+
+        if is_within(&self.root, location) {
+            return Ok(());
+        }
+
+        Err(AppError::BadRequest(self.explain(location)))
+    }
+
+    /// The same, as an [`iceberg::Error`], for a caller inside a
+    /// [`CatalogStore`](crate::catalog::CatalogStore) — which speaks that
+    /// vocabulary. Maps to `400`.
+    ///
+    /// # Errors
+    ///
+    /// [`iceberg::ErrorKind::DataInvalid`] when `location` falls outside.
+    pub fn ensure_iceberg(&self, location: &str) -> iceberg::Result<()> {
+        if is_within(&self.root, location) {
+            return Ok(());
+        }
+        Err(iceberg::Error::new(
+            iceberg::ErrorKind::DataInvalid,
+            self.explain(location),
+        ))
+    }
+
+    /// Confines every location a **table commit** carries, given where the
+    /// table's files are *now*.
+    ///
+    /// # Why a commit carries any, and why two bounds
+    ///
+    /// `createTable` and `registerTable` obviously name a location. `commitTable`
+    /// reads as "change the schema, add a snapshot" and names four:
+    ///
+    /// | Update | Names | Bounded by |
+    /// |---|---|---|
+    /// | `SetLocation` | the table's location — it *moves* the table | `self`, or `current` |
+    /// | `AddSnapshot` | a manifest list, read by a plan and deleted by a purge | `current` |
+    /// | `SetStatistics`, `SetPartitionStatistics` | a Puffin file, deleted by a purge | `current` |
+    ///
+    /// The three that name *files* are bounded by the table's own location:
+    /// whatever it is, the table already owns it and a credential is already
+    /// scoped to exactly that, so a file underneath grants nothing new. It has to
+    /// be the location and not the name, because **rename** moves a registry
+    /// entry and never the files — `db.old` renamed to `db.new` keeps its files
+    /// at `…/db/old`, and a bound taken from the new name would make the table
+    /// unwritable.
+    ///
+    /// `SetLocation` *changes* what a credential will be scoped to, so it is
+    /// bounded by what the caller's name entitles it to. Anything under `current`
+    /// passes too: that is reorganising where the table already is.
+    ///
+    /// What it cannot reach is the *contents* of a manifest, which lists data
+    /// files by path; [`catalog::purge`](crate::catalog::purge) takes that end
+    /// instead.
+    ///
+    /// # Errors
+    ///
+    /// [`iceberg::ErrorKind::DataInvalid`] naming the first location that falls
+    /// outside, which maps to `400`. An [`iceberg::Error`] rather than an
+    /// [`AppError`] because this runs inside a
+    /// [`CatalogStore`](crate::catalog::CatalogStore) — the one place `current`
+    /// is in hand without loading the table twice.
+    pub fn ensure_commit(&self, current: &str, updates: &[TableUpdate]) -> iceberg::Result<()> {
+        for update in updates {
+            // Matched by variant rather than by scanning the serialised form for
+            // anything path-shaped: a heuristic over JSON both misses a path
+            // under an unexpected key and refuses a property value that merely
+            // looks like one.
+            //
+            // The `_` arm is the risk, and it is bounded by
+            // `commit_cannot_move_a_table_outside_its_bound`, which sends the
+            // wire form of all four actions. Reviewed against `iceberg` 0.10; a
+            // dependency bump that adds a location-carrying update needs a line
+            // here.
+            match update {
+                TableUpdate::SetLocation { location } => {
+                    if !is_within(&self.root, location) && !is_within(current, location) {
+                        return Err(iceberg::Error::new(
+                            iceberg::ErrorKind::DataInvalid,
+                            self.explain(location),
+                        ));
+                    }
+                }
+                TableUpdate::AddSnapshot { snapshot } => {
+                    Self::ensure_owned(current, snapshot.manifest_list())?;
+                }
+                TableUpdate::SetStatistics { statistics } => {
+                    Self::ensure_owned(current, &statistics.statistics_path)?;
+                }
+                TableUpdate::SetPartitionStatistics {
+                    partition_statistics,
+                } => {
+                    Self::ensure_owned(current, &partition_statistics.statistics_path)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The same rule for a **view commit**.
+    ///
+    /// A view has no snapshots and no statistics, so `SetLocation` is the only
+    /// update that carries a path — but it carries it for the same reason and
+    /// gets the same answer.
+    ///
+    /// # Errors
+    ///
+    /// [`iceberg::ErrorKind::DataInvalid`] naming the location that falls
+    /// outside.
+    pub fn ensure_view_commit(&self, current: &str, updates: &[ViewUpdate]) -> iceberg::Result<()> {
+        for update in updates {
+            if let ViewUpdate::SetLocation { location } = update
+                && !is_within(&self.root, location)
+                && !is_within(current, location)
+            {
+                return Err(iceberg::Error::new(
+                    iceberg::ErrorKind::DataInvalid,
+                    self.explain(location),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The same rule again, for a view commit that arrives as **finished
+    /// metadata** rather than as a list of updates.
+    ///
+    /// The HTTP handler applies the client's `ViewUpdate`s itself, so it can
+    /// check each one; an in-process host holds a `ViewMetadata` and edits it,
+    /// so what reaches this check is only the result. The question is the same —
+    /// may this view live where it now says it does — and it must be asked, or
+    /// the library surface would be the one way to move a view's storage outside
+    /// the prefix its name puts it in.
+    ///
+    /// `current` is allowed for the reason a rename is: a view's files do not
+    /// move when its registry entry does, so a document that already sits where
+    /// the catalog put it stays legal.
+    ///
+    /// # Errors
+    ///
+    /// [`iceberg::ErrorKind::DataInvalid`] naming the location that falls
+    /// outside.
+    pub fn ensure_view_commit_metadata(
+        &self,
+        current: &str,
+        metadata: &iceberg::spec::ViewMetadata,
+    ) -> iceberg::Result<()> {
+        let location = metadata.location();
+        if is_within(&self.root, location) || is_within(current, location) {
+            return Ok(());
+        }
+        Err(iceberg::Error::new(
+            iceberg::ErrorKind::DataInvalid,
+            self.explain(location),
+        ))
+    }
+
+    /// Refuses a file the table does not own.
+    fn ensure_owned(current: &str, location: &str) -> iceberg::Result<()> {
+        if is_within(current, location) {
+            return Ok(());
+        }
+        Err(iceberg::Error::new(
+            iceberg::ErrorKind::DataInvalid,
+            format!(
+                "This commit names the file '{location}', which is outside the table's own \
+                 storage ('{current}'). A commit records files the table owns; one it does \
+                 not own would be read by a scan plan and deleted by a purge, neither of \
+                 which this table is entitled to do to it."
+            ),
+        ))
+    }
+
+    /// Why a location was refused, in terms of the scope that refused it.
+    ///
+    /// The two scopes fail for different reasons and an operator reading the
+    /// message has different work to do, so they do not share a sentence.
+    fn explain(&self, location: &str) -> String {
+        match self.scope {
+            LocationScope::Table => format!(
+                "Storage location '{location}' is outside '{}', which is where this \
+                 catalog keeps this resource's files. A location-scoped credential is \
+                 how a namespace-scoped grant is enforced, so a resource may not \
+                 declare storage outside the prefix its name puts it in. Set \
+                 `storage.location_scope = \"warehouse\"` to adopt a layout that \
+                 predates this catalog — and read what that costs before you do.",
+                self.root
+            ),
+            LocationScope::Warehouse => format!(
+                "Storage location '{location}' is outside this catalog's warehouse \
+                 ('{}'). A catalog only manages locations within its own warehouse, \
+                 because the credentials it vends are scoped to them.",
+                self.root
+            ),
+        }
+    }
+}
+
+/// `<warehouse>/<namespace…>/<name>`: where the registries put a resource's
+/// files, restated so a client-supplied location can be held to it.
+///
+/// Kept here rather than in each backend because it is the same rule read from
+/// two sides — the side that *assigns* a location and the side that *checks*
+/// one — and a copy is one edit away from the two disagreeing, silently and in
+/// the direction that grants more.
+pub fn canonical_prefix(warehouse: &str, namespace: &[String], name: &str) -> String {
+    let mut prefix = join_segments(warehouse, namespace);
+    prefix.push('/');
+    prefix.push_str(name);
+    prefix
+}
+
+/// `<warehouse>/<namespace…>`, with no trailing slash.
+///
+/// The prefix a backend keeps one namespace's resources under. Public because
+/// every [`CatalogStore`](crate::catalog::CatalogStore) answers
+/// `namespace_prefix_for` with it, and a per-backend copy is one edit away from
+/// two backends laying out the same namespace differently.
+pub fn namespace_prefix(warehouse: &str, namespace: &[String]) -> String {
+    join_segments(warehouse, namespace)
+}
+
+/// `<warehouse>/<namespace…>`, with no trailing slash.
+fn join_segments(warehouse: &str, namespace: &[String]) -> String {
+    let mut out = warehouse.trim_end_matches('/').to_string();
+    for level in namespace {
+        out.push('/');
+        out.push_str(level);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -303,12 +625,32 @@ mod tests {
         assert!(!is_within("/srv/warehouse", "/srv/warehouse-other/db/t"));
     }
 
+    /// Segment comparison drops the leading slash, so without an explicit test
+    /// a *relative* path is admitted into an absolute warehouse — two different
+    /// directories, decided equal.
+    #[test]
+    fn a_relative_path_is_not_inside_an_absolute_warehouse() {
+        assert!(!is_within("/srv/warehouse", "srv/warehouse/db/t"));
+        assert!(!is_within("file:///srv/warehouse", "srv/warehouse/db/t"));
+        assert!(!is_within("srv/warehouse", "/srv/warehouse/db/t"));
+        assert!(!is_prefix_within("/srv/wh/t", "srv/wh/t/data/"));
+    }
+
     /// A traversal segment would let a location climb out of the root it
     /// appears to be under.
     #[test]
     fn traversal_is_refused() {
         assert!(!is_within("s3://bucket/wh", "s3://bucket/wh/../evil/t"));
         assert!(!is_within("/srv/wh", "/srv/wh/db/../../etc/passwd"));
+    }
+
+    /// `.` is an ordinary object key segment, so it is compared rather than
+    /// resolved: `wh/./t` and `wh/t` are two different objects in S3.
+    #[test]
+    fn a_dot_segment_is_an_ordinary_segment() {
+        assert!(is_within("s3://bucket/wh", "s3://bucket/wh/./t"));
+        assert!(!is_within("s3://bucket/wh/./t", "s3://bucket/wh/t"));
+        assert!(!is_within("s3://bucket/./wh", "s3://bucket/wh/t"));
     }
 
     #[test]
@@ -328,9 +670,30 @@ mod tests {
         assert!(!is_within("s3://bucket/wh", "s3://bucket/WH/t"));
     }
 
+    /// The bound every handler builds. `db` is the namespace, `events` the
+    /// table, so under the default scope the resource's storage lives under
+    /// `.../wh/db/events` and nothing wider is accepted.
+    fn table_bound() -> LocationBound {
+        LocationBound::new(
+            LocationScope::Table,
+            "s3://bucket/wh",
+            "s3://bucket/wh/db",
+            "events",
+        )
+    }
+
+    fn warehouse_bound() -> LocationBound {
+        LocationBound::new(
+            LocationScope::Warehouse,
+            "s3://bucket/wh",
+            "s3://bucket/wh/db",
+            "events",
+        )
+    }
+
     #[test]
     fn ensure_reports_a_bad_request_with_both_locations_named() {
-        let err = ensure_within_warehouse("s3://bucket/wh", "s3://elsewhere/t").unwrap_err();
+        let err = warehouse_bound().ensure("s3://elsewhere/t").unwrap_err();
         assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
         let msg = err.to_string();
         assert!(
@@ -342,16 +705,102 @@ mod tests {
 
     #[test]
     fn an_empty_location_is_refused() {
-        assert!(ensure_within_warehouse("s3://bucket/wh", "").is_err());
-        assert!(ensure_within_warehouse("s3://bucket/wh", "   ").is_err());
+        assert!(warehouse_bound().ensure("").is_err());
+        assert!(warehouse_bound().ensure("   ").is_err());
+        assert!(table_bound().ensure("").is_err());
     }
 
     #[test]
     fn ensure_accepts_the_ordinary_case() {
-        assert!(ensure_within_warehouse("s3://bucket/wh", "s3://bucket/wh/db/t").is_ok());
+        assert!(warehouse_bound().ensure("s3://bucket/wh/db/t").is_ok());
+        assert!(table_bound().ensure("s3://bucket/wh/db/events").is_ok());
+        assert!(
+            table_bound()
+                .ensure("s3://bucket/wh/db/events/data/f.parquet")
+                .is_ok(),
+            "a sub-layout under the resource's own prefix is its own business"
+        );
+    }
+
+    /// The whole point of the default scope. Under `Warehouse` this location is
+    /// accepted, and a caller with `Update` on `db.events` alone is credentialed
+    /// for `finance/secret` — a prefix its policy never mentioned.
+    #[test]
+    fn another_namespaces_prefix_is_refused_under_the_default_scope() {
+        let other = "s3://bucket/wh/finance/secret";
+
+        assert!(
+            warehouse_bound().ensure(other).is_ok(),
+            "the loose scope is what it says it is"
+        );
+        assert!(
+            table_bound().ensure(other).is_err(),
+            "the default scope refuses another namespace's prefix"
+        );
+    }
+
+    /// And a sibling *table* in the caller's own namespace, which is the same
+    /// hole one level down: a Cedar policy can name an individual table.
+    #[test]
+    fn a_sibling_tables_prefix_is_refused_under_the_default_scope() {
+        assert!(table_bound().ensure("s3://bucket/wh/db/salaries").is_err());
+    }
+
+    /// The sibling-spelling hazard reaches the tighter bound too.
+    #[test]
+    fn a_sibling_spelling_of_the_resource_prefix_is_refused() {
+        assert!(
+            table_bound()
+                .ensure("s3://bucket/wh/db/events-evil")
+                .is_err()
+        );
+        assert!(table_bound().ensure("s3://bucket/wh/db/events2").is_err());
+    }
+
+    /// The bound is the canonical prefix, and the canonical prefix is what the
+    /// registries assign. If these two ever disagree, every default location
+    /// this catalog creates fails its own check.
+    #[test]
+    fn the_default_location_a_registry_assigns_passes_its_own_bound() {
+        let assigned = canonical_prefix("s3://bucket/wh", &["db".to_string()], "events");
+        assert_eq!(assigned, "s3://bucket/wh/db/events");
+        assert!(table_bound().ensure(&assigned).is_ok());
+
+        // A trailing slash on the warehouse must not produce `wh//db/events`.
+        assert_eq!(
+            canonical_prefix("s3://bucket/wh/", &["db".to_string()], "events"),
+            "s3://bucket/wh/db/events"
+        );
+
+        // Nested namespaces nest in the path, which is what makes two
+        // namespaces' prefixes disjoint by construction.
+        assert_eq!(
+            canonical_prefix(
+                "s3://bucket/wh",
+                &["a".to_string(), "b".to_string()],
+                "events"
+            ),
+            "s3://bucket/wh/a/b/events"
+        );
+    }
+
+    /// An unrecognised scope is a startup failure, never a guess. Guessing tight
+    /// breaks a deployment that meant loose; guessing loose removes a security
+    /// bound without saying so.
+    #[test]
+    fn an_unknown_scope_is_refused_rather_than_defaulted() {
+        assert_eq!(LocationScope::parse("table").unwrap(), LocationScope::Table);
+        assert_eq!(
+            LocationScope::parse(" WAREHOUSE ").unwrap(),
+            LocationScope::Warehouse
+        );
+        assert!(LocationScope::parse("namespace").is_err());
+        assert!(LocationScope::parse("").is_err());
+        assert_eq!(LocationScope::default(), LocationScope::Table);
     }
 
     /// The rule that keeps a provider from becoming a confused deputy: no
+    /// configured scope is no scope, not universal scope.    /// The rule that keeps a provider from becoming a confused deputy: no
     /// configured scope is no scope, not universal scope.
     #[test]
     fn no_configured_prefix_vends_nothing() {
@@ -378,29 +827,32 @@ mod tests {
         );
     }
 
-    /// The check a `registerTable` performs before it publishes anything.
+    /// The check a `registerTable` performs before it publishes anything, in the
+    /// `iceberg::Error` vocabulary the backend that runs it speaks.
     #[test]
-    fn a_declared_location_outside_the_warehouse_is_refused() {
-        assert!(confine_declared_location(Some("s3://bucket/wh"), "s3://bucket/wh/db/t").is_ok());
+    fn a_declared_location_outside_the_bound_is_refused() {
+        assert!(
+            table_bound()
+                .ensure_iceberg("s3://bucket/wh/db/events")
+                .is_ok()
+        );
 
-        let err = confine_declared_location(Some("s3://bucket/wh"), "s3://elsewhere/secrets")
+        let err = table_bound()
+            .ensure_iceberg("s3://bucket/wh/finance/secret")
             .unwrap_err();
         assert_eq!(err.kind(), iceberg::ErrorKind::DataInvalid);
-        assert!(err.to_string().contains("s3://elsewhere/secrets"));
-        assert!(err.to_string().contains("s3://bucket/wh"));
+        assert!(err.to_string().contains("s3://bucket/wh/finance/secret"));
+        assert!(err.to_string().contains("s3://bucket/wh/db/events"));
     }
 
     /// The sibling-prefix hazard reaches this caller too.
     #[test]
     fn a_declared_sibling_prefix_is_refused() {
-        assert!(confine_declared_location(Some("s3://bucket/wh"), "s3://bucket/wh-evil").is_err());
-    }
-
-    /// A backend that owns no warehouse cannot confine anything, and says so by
-    /// not pretending to.
-    #[test]
-    fn a_backend_without_a_warehouse_confines_nothing() {
-        assert!(confine_declared_location(None, "s3://anywhere/at/all").is_ok());
+        assert!(
+            warehouse_bound()
+                .ensure_iceberg("s3://bucket/wh-evil")
+                .is_err()
+        );
     }
 
     #[test]

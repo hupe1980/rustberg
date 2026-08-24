@@ -122,7 +122,9 @@ impl FederatedCatalog {
             }
             // The name becomes a namespace segment, so it must survive the same
             // encoding every other segment does.
-            if mount.name.contains('\u{1F}') || mount.name.contains('\u{1E}') {
+            if mount.name.contains(crate::names::PART_SEPARATOR)
+                || mount.name.contains(crate::names::NAME_SEPARATOR)
+            {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!("Mount name '{}' contains a reserved separator", mount.name),
@@ -310,9 +312,13 @@ impl FederatedCatalog {
     /// This is what `GET /v1/config` publishes. See
     /// [`capabilities`](super::capabilities) for why the intersection.
     pub fn effective_capabilities(&self) -> Capabilities {
+        // Seeded from the catalog underneath, not from `full()`: names no mount
+        // claims still reach it (§6.1), so it is one of the backends the
+        // advertised set has to be honest about. Asked with the root namespace,
+        // which is the one every backend can answer for.
         self.mounts
             .values()
-            .fold(Capabilities::full(), |acc, mount| {
+            .fold(self.default.capabilities_for(None), |acc, mount| {
                 acc.intersect(mount.capabilities)
             })
     }
@@ -387,7 +393,8 @@ impl FederatedCatalog {
         if inner.is_empty() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
-                "A mount root is not a namespace: tables and views live in namespaces                  inside it, so create one first.",
+                "A mount root is not a namespace: tables and views live in namespaces \
+                 inside it, so create one first.",
             ));
         }
         NamespaceIdent::from_vec(inner)
@@ -1044,16 +1051,25 @@ impl CatalogStore for FederatedCatalog {
     async fn update_view(
         &self,
         view: &TableIdent,
+        expected_metadata_location: &str,
         metadata: ViewMetadata,
     ) -> Result<(String, ViewMetadata)> {
         match self.route(view.namespace()) {
-            Routed::Default => self.default.update_view(view, metadata).await,
+            Routed::Default => {
+                self.default
+                    .update_view(view, expected_metadata_location, metadata)
+                    .await
+            }
             Routed::Mounted { mount, inner } => {
                 Self::require(mount, Capability::Views)?;
                 Self::require(mount, Capability::Write)?;
                 mount
                     .store
-                    .update_view(&Self::inner_ident(inner, view.name())?, metadata)
+                    .update_view(
+                        &Self::inner_ident(inner, view.name())?,
+                        expected_metadata_location,
+                        metadata,
+                    )
                     .await
             }
         }
@@ -1111,6 +1127,49 @@ impl CatalogStore for FederatedCatalog {
         }
     }
 
+    /// The prefix of the **one** backend this namespace routes to, with the
+    /// mount's name stripped.
+    ///
+    /// Built from the mount's *declared* warehouse rather than from the store's
+    /// own, for the reason [`Self::warehouse_for`] gives: a mount root has no
+    /// inner namespace to ask the backend about, and configuration is where the
+    /// answer comes from. The inner levels are what the mount's catalog sees, so
+    /// the prefix this returns is the one that catalog actually writes to.
+    fn namespace_prefix_for(&self, namespace: &NamespaceIdent) -> Option<String> {
+        match self.route(namespace) {
+            Routed::Default => self.default.namespace_prefix_for(namespace),
+            Routed::Mounted { mount, inner } => mount
+                .warehouse
+                .as_deref()
+                .map(|warehouse| crate::location::namespace_prefix(warehouse, &inner)),
+        }
+    }
+
+    /// The capabilities of the **one** backend this namespace routes to.
+    ///
+    /// Not [`effective_capabilities`](Self::effective_capabilities), which is
+    /// the intersection `GET /v1/config` publishes. The two answer different
+    /// questions and confusing them fails in a visible way: gating a *request*
+    /// on the intersection makes one read-only `rest` mount switch an operation
+    /// off for the native tables beside it, which is exactly the promise
+    /// [`capabilities`](super::capabilities) makes about refusals being
+    /// per-request.
+    fn capabilities_for(&self, namespace: Option<&NamespaceIdent>) -> Capabilities {
+        let Some(namespace) = namespace else {
+            // The catalog as a whole is the catalog underneath: mounts are
+            // additive, so what they add is folded in by
+            // `effective_capabilities` rather than here.
+            return self.default.capabilities_for(None);
+        };
+        match self.route(namespace) {
+            Routed::Default => self.default.capabilities_for(Some(namespace)),
+            // The mount's declared set, for the reason `warehouse_for` gives:
+            // a mount root has no inner namespace to ask the backend about, and
+            // `read_only` is configuration rather than something a backend knows.
+            Routed::Mounted { mount, .. } => mount.capabilities,
+        }
+    }
+
     async fn storage_health_check(&self) -> Result<StorageHealthStatus> {
         // The native catalog decides overall health. A mount that is down makes
         // its own namespaces fail, which the client sees directly; reporting the
@@ -1157,6 +1216,13 @@ mod tests {
 
     #[async_trait]
     impl CatalogStore for Nowhere {
+        fn namespace_prefix_for(&self, _: &NamespaceIdent) -> Option<String> {
+            None
+        }
+        fn capabilities_for(&self, _: Option<&NamespaceIdent>) -> Capabilities {
+            Capabilities::full()
+        }
+
         async fn list_namespaces(
             &self,
             _: Option<&NamespaceIdent>,
@@ -1261,6 +1327,7 @@ mod tests {
         async fn update_view(
             &self,
             _: &TableIdent,
+            _: &str,
             _: ViewMetadata,
         ) -> Result<(String, ViewMetadata)> {
             Err(Error::new(ErrorKind::FeatureUnsupported, "test stub"))
@@ -1328,6 +1395,13 @@ mod tests {
 
     #[async_trait]
     impl CatalogStore for Echo {
+        fn namespace_prefix_for(&self, _: &NamespaceIdent) -> Option<String> {
+            None
+        }
+        fn capabilities_for(&self, _: Option<&NamespaceIdent>) -> Capabilities {
+            Capabilities::full()
+        }
+
         async fn list_namespaces(
             &self,
             _: Option<&NamespaceIdent>,
@@ -1432,6 +1506,7 @@ mod tests {
         async fn update_view(
             &self,
             _: &TableIdent,
+            _: &str,
             _: ViewMetadata,
         ) -> Result<(String, ViewMetadata)> {
             Err(Error::new(ErrorKind::FeatureUnsupported, "test stub"))
@@ -1609,6 +1684,42 @@ mod tests {
         assert_eq!(catalog.effective_capabilities(), Capabilities::read_only());
     }
 
+    /// And the intersection is *only* what is advertised. A refusal is
+    /// per-request, so the capability a handler asks about is the one belonging
+    /// to the backend that namespace routes to — otherwise one read-only `rest`
+    /// mount switches an operation off for the native tables beside it, which is
+    /// the opposite of what the intersection rule promises.
+    #[test]
+    fn a_request_asks_the_mount_it_routes_to_not_the_intersection() {
+        let catalog = federated(vec![
+            mount("prod", Capabilities::full()),
+            mount("legacy", Capabilities::read_only()),
+        ]);
+
+        assert!(
+            !catalog.effective_capabilities().scan_planning,
+            "the advertised set is the intersection"
+        );
+        assert!(
+            catalog
+                .capabilities_for(Some(&ns(&["prod", "db"])))
+                .scan_planning,
+            "a native mount still plans"
+        );
+        assert!(
+            !catalog
+                .capabilities_for(Some(&ns(&["legacy", "db"])))
+                .scan_planning,
+            "the read-only mount does not"
+        );
+        assert!(
+            catalog
+                .capabilities_for(Some(&ns(&["unmounted"])))
+                .scan_planning,
+            "and neither does a mount govern the catalog underneath"
+        );
+    }
+
     /// Credential vending is scoped to these, so a missing entry means a mount
     /// whose tables silently get no credentials.
     #[tokio::test]
@@ -1687,6 +1798,13 @@ mod tests {
         struct Forged;
         #[async_trait]
         impl CatalogStore for Forged {
+            fn namespace_prefix_for(&self, _: &NamespaceIdent) -> Option<String> {
+                None
+            }
+            fn capabilities_for(&self, _: Option<&NamespaceIdent>) -> Capabilities {
+                Capabilities::full()
+            }
+
             async fn get_namespace(&self, n: &NamespaceIdent) -> Result<Namespace> {
                 let mut properties = HashMap::new();
                 ownership::set_owner(&mut properties, "attacker");
@@ -1802,6 +1920,7 @@ mod tests {
             async fn update_view(
                 &self,
                 _: &TableIdent,
+                _: &str,
                 _: ViewMetadata,
             ) -> Result<(String, ViewMetadata)> {
                 Err(Error::new(ErrorKind::FeatureUnsupported, "stub"))

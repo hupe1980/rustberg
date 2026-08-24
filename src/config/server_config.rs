@@ -63,6 +63,50 @@ pub struct ServerConfig {
     /// CORS configuration
     #[serde(default)]
     pub cors: CorsConfig,
+
+    /// Address ranges that are forwarding infrastructure rather than callers.
+    ///
+    /// Empty — the default — means no proxy is trusted and the caller's address
+    /// is always the TCP peer; `X-Forwarded-For` and `X-Real-IP` are not read at
+    /// all. Behind a load balancer, name the subnet it runs in
+    /// (`["10.0.0.0/8"]`) and the forwarding chain is walked from the right
+    /// until it leaves that infrastructure.
+    ///
+    /// This is one setting for three consumers — the rate-limit bucket,
+    /// `context.source_ip` in a Cedar policy, and the address on an audit
+    /// record — because they must agree, and because an address a caller can
+    /// choose is an authorization bypass in the second of them. See
+    /// [`crate::remote_ip`].
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+
+    /// How long to keep serving after `SIGTERM` before draining, in seconds.
+    ///
+    /// Zero — the default — begins the graceful shutdown immediately, which is
+    /// right for every shape where nothing is routing to this process but the
+    /// person who started it.
+    ///
+    /// Behind a **load balancer it is not**, and Kubernetes is the case that
+    /// makes it obvious. Removing a pod from its Service's endpoints and sending
+    /// it `SIGTERM` are concurrent, and the removal has to propagate to every
+    /// kube-proxy and ingress before they stop routing. A server that stops
+    /// accepting the instant it is signalled refuses the requests that arrive in
+    /// that window, and they surface to clients as connection errors during
+    /// every rolling update.
+    ///
+    /// The usual answer is a `preStop` hook that sleeps, and **it cannot work
+    /// here**: the image is distroless, so there is no shell to run `sleep` in.
+    /// So the wait is in-process, which is better anyway — it does not depend on
+    /// the orchestrator, and it is one number rather than two that have to agree.
+    ///
+    /// It applies to `SIGTERM` only, never to `Ctrl+C`: an orchestrator is
+    /// taking this process out of rotation, and a person at a terminal is not.
+    ///
+    /// Keep it comfortably below the orchestrator's own grace period — the Helm
+    /// chart sets both, and sizes `terminationGracePeriodSeconds` to cover this
+    /// plus the drain that follows it.
+    #[serde(default)]
+    pub shutdown_delay_seconds: u64,
 }
 
 impl Default for ServerConfig {
@@ -72,6 +116,8 @@ impl Default for ServerConfig {
             port: default_port(),
             auth: AuthConfig::default(),
             cors: CorsConfig::default(),
+            trusted_proxies: Vec::new(),
+            shutdown_delay_seconds: 0,
         }
     }
 }
@@ -169,6 +215,32 @@ impl ApiKeyConfig {
             )));
         }
 
+        // The same rule the JWT path applies to a claim, applied to a config
+        // value — a tenant id is the first segment of every Cedar entity id
+        // either way, and `acme␟analytics` would build the ids of tenant
+        // `acme`'s `analytics` namespace. Here it is a **startup failure**
+        // rather than a rejected credential, because an operator who wrote it
+        // believes something about the deployment that is not true.
+        crate::names::validate_tenant_id(&self.tenant)
+            .map_err(|e| ConfigError::ValidationError(format!("API key '{}': {e}", self.name)))?;
+
+        // And the same rule for a role, which becomes `Group::"…"`. A token's
+        // roles are *dropped* when they cannot be rendered, because the caller
+        // neither chose nor can fix them (`names::unusable_role_char`); one
+        // written in this file is a startup failure, because an operator can.
+        for role in &self.roles {
+            if let Some(found) = crate::names::unusable_role_char(role) {
+                return Err(ConfigError::ValidationError(format!(
+                    "API key '{}' declares a role containing U+{:04X}, which cannot be a \
+                     Cedar group id — it is a control, formatting, private-use or \
+                     unassigned character, or the role is empty, over-long, or not in \
+                     normalization form NFC. No policy could name it, so the key would \
+                     authenticate and match nothing.",
+                    self.name, found as u32
+                )));
+            }
+        }
+
         Ok(crate::auth::ApiKeyBuilder::new(&self.name, &self.tenant)
             .with_roles(self.roles.clone())
             .build_with_key(&secret))
@@ -194,11 +266,22 @@ pub struct JwtConfigSerde {
     /// OIDC issuer URL (e.g., "<https://accounts.google.com>")
     pub issuer: String,
 
-    /// Expected audience (e.g., "rustberg-api")
-    pub audience: String,
+    /// Audiences a token may name. A token is accepted when its `aud` matches
+    /// any of them.
+    ///
+    /// More than one is ordinary: an identity provider registers one client per
+    /// application, so Spark, Trino and a notebook are three audiences reaching
+    /// one catalog.
+    pub audiences: Vec<String>,
 
-    /// JWKS endpoint URL (e.g., "<https://accounts.google.com/.well-known/jwks.json>")
-    pub jwks_url: String,
+    /// JWKS endpoint URL.
+    ///
+    /// Omit it and the issuer's `/.well-known/openid-configuration` is read to
+    /// find it, with the document's own `issuer` checked against this one. Set
+    /// it for a provider with a non-standard layout, or where the discovery
+    /// document is not reachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks_url: Option<String>,
 
     /// Default tenant ID if not in JWT claims (default: "default")
     #[serde(default = "default_tenant_id")]
@@ -223,9 +306,11 @@ pub struct JwtConfigSerde {
     /// is the migration path the Iceberg spec recommends in place of the
     /// deprecated `oauth/tokens` endpoint.
     ///
-    /// Set explicitly rather than derived from `issuer`: deriving it would mean
-    /// OIDC discovery at startup, and a wrong guess sends credentials to the
-    /// wrong host.
+    /// Set explicitly rather than taken from the discovery document's
+    /// `token_endpoint`. Discovery happens lazily, at the first token that needs
+    /// a signing key, and `GET /v1/config` is answered before any of those — so
+    /// deriving this would make the advertised endpoint depend on whether
+    /// anyone had authenticated yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth2_server_uri: Option<String>,
 }
@@ -234,7 +319,7 @@ impl From<JwtConfigSerde> for JwtConfig {
     fn from(config: JwtConfigSerde) -> Self {
         JwtConfig {
             issuer: config.issuer,
-            audience: config.audience,
+            audiences: config.audiences,
             jwks_url: config.jwks_url,
             default_tenant_id: config.default_tenant_id,
             tenant_claim: config.tenant_claim,
@@ -730,6 +815,27 @@ pub struct StorageConfig {
     /// silently absent property.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub properties: HashMap<String, String>,
+
+    /// How far inside the warehouse a client may put a resource's files.
+    ///
+    /// - `"table"` (default) — under `<warehouse>/<namespace>/<name>`, the
+    ///   layout this catalog assigns. The storage hierarchy is then the policy
+    ///   hierarchy, which is what makes a location-scoped credential a faithful
+    ///   enforcement of a namespace-scoped grant.
+    /// - `"warehouse"` — anywhere in the warehouse. For adopting a lake whose
+    ///   layout predates this catalog. A caller permitted to write **one** table
+    ///   can then point it at any prefix in the warehouse and be credentialed
+    ///   there.
+    ///
+    /// See [`crate::location::LocationScope`] for the full argument.
+    #[serde(default = "default_location_scope")]
+    pub location_scope: String,
+}
+
+/// The tight bound, because the loose one hands a caller with one grant the
+/// whole warehouse.
+fn default_location_scope() -> String {
+    "table".to_string()
 }
 
 impl Default for StorageConfig {
@@ -737,6 +843,7 @@ impl Default for StorageConfig {
         Self {
             catalog_url: default_catalog_url(),
             warehouse_location: None,
+            location_scope: default_location_scope(),
             properties: HashMap::new(),
         }
     }
@@ -773,16 +880,6 @@ pub struct RateLimitConfigFile {
     /// Auth failure lockout duration in seconds.
     #[serde(default = "default_lockout_duration")]
     pub lockout_duration_seconds: u64,
-
-    /// Trust proxy headers (X-Forwarded-For, X-Real-IP) for client IP detection.
-    ///
-    /// **SECURITY WARNING**: Only enable this when running behind a trusted reverse proxy
-    /// that sets these headers correctly. If enabled without a trusted proxy, attackers
-    /// can spoof their IP address to bypass rate limiting.
-    ///
-    /// Default: `false` (use connection IP only)
-    #[serde(default)]
-    pub trust_proxy_headers: bool,
 }
 
 impl Default for RateLimitConfigFile {
@@ -794,7 +891,6 @@ impl Default for RateLimitConfigFile {
             track_auth_failures: true,
             max_auth_failures: default_max_auth_failures(),
             lockout_duration_seconds: default_lockout_duration(),
-            trust_proxy_headers: false, // SECURE DEFAULT
         }
     }
 }
@@ -926,45 +1022,6 @@ impl RustbergConfig {
         Ok(config)
     }
 
-    /// Tries to load from file, falls back to defaults.
-    pub fn load_or_default<P: AsRef<Path>>(path: P) -> Self {
-        match Self::from_file(path.as_ref()) {
-            Ok(config) => {
-                tracing::info!(path = %path.as_ref().display(), "Loaded configuration from file");
-                config
-            }
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.as_ref().display(),
-                    error = %e,
-                    "Failed to load config, using defaults"
-                );
-                Self::default()
-            }
-        }
-    }
-
-    /// Searches for config in common locations.
-    pub fn discover() -> Self {
-        let search_paths = [
-            "rustberg.toml",
-            "/etc/rustberg/config.toml",
-            "config/rustberg.toml",
-        ];
-
-        for path in search_paths {
-            if Path::new(path).exists()
-                && let Ok(config) = Self::from_file(path)
-            {
-                tracing::info!(path = %path, "Discovered configuration file");
-                return config;
-            }
-        }
-
-        tracing::debug!("No config file found, using defaults");
-        Self::default()
-    }
-
     /// Validates the configuration.
     ///
     /// # Errors
@@ -979,11 +1036,27 @@ impl RustbergConfig {
             ));
         }
 
-        // Validate rate limit configuration
-        if self.rate_limit.enabled && self.rate_limit.requests_per_second == 0 {
-            return Err(ConfigError::ValidationError(
-                "requests_per_second must be > 0".to_string(),
-            ));
+        // A rate limiter configured to zero refuses everything rather than
+        // limiting anything: with no refill rate the bucket never fills, and
+        // with no capacity it starts empty. Either is a server that answers
+        // `429` to every request after the first burst, which reads as an
+        // outage. Switching rate limiting off is what `enabled = false` is for.
+        if self.rate_limit.enabled {
+            if self.rate_limit.requests_per_second == 0 {
+                return Err(ConfigError::ValidationError(
+                    "rate_limit.requests_per_second must be > 0. To turn rate limiting off, \
+                     set rate_limit.enabled = false."
+                        .to_string(),
+                ));
+            }
+            if self.rate_limit.burst_size == 0 {
+                return Err(ConfigError::ValidationError(
+                    "rate_limit.burst_size must be > 0: a bucket with no capacity never \
+                     admits a request. To turn rate limiting off, set rate_limit.enabled = \
+                     false."
+                        .to_string(),
+                ));
+            }
         }
 
         Ok(())
@@ -1008,6 +1081,8 @@ impl RustbergConfig {
                     api_keys: Vec::new(),
                 },
                 cors: CorsConfig::default(),
+                trusted_proxies: Vec::new(),
+                shutdown_delay_seconds: 0,
             },
             tls: TlsConfigFile {
                 enabled: true,
@@ -1016,6 +1091,7 @@ impl RustbergConfig {
                 insecure_http: false,
             },
             storage: StorageConfig {
+                location_scope: default_location_scope(),
                 catalog_url: default_catalog_url(),
                 warehouse_location: Some("s3://my-bucket/warehouse".to_string()),
                 properties: HashMap::from([
@@ -1064,6 +1140,7 @@ mod tests {
     #[test]
     fn plain_storage_properties_pass_through() {
         let storage = StorageConfig {
+            location_scope: default_location_scope(),
             catalog_url: default_catalog_url(),
             warehouse_location: None,
             properties: HashMap::from([
@@ -1089,6 +1166,7 @@ mod tests {
     #[test]
     fn an_env_property_is_read_from_the_environment() {
         let storage = StorageConfig {
+            location_scope: default_location_scope(),
             catalog_url: default_catalog_url(),
             warehouse_location: None,
             properties: HashMap::from([(
@@ -1111,6 +1189,7 @@ mod tests {
     #[test]
     fn a_missing_env_property_names_itself_and_its_setting() {
         let storage = StorageConfig {
+            location_scope: default_location_scope(),
             catalog_url: default_catalog_url(),
             warehouse_location: None,
             properties: HashMap::from([(
@@ -1128,8 +1207,8 @@ mod tests {
     fn test_jwt_config_conversion() {
         let jwt_config_serde = JwtConfigSerde {
             issuer: "https://issuer.example.com".to_string(),
-            audience: "rustberg-api".to_string(),
-            jwks_url: "https://issuer.example.com/.well-known/jwks.json".to_string(),
+            audiences: vec!["rustberg-api".to_string()],
+            jwks_url: Some("https://issuer.example.com/.well-known/jwks.json".to_string()),
             default_tenant_id: "test-tenant".to_string(),
             tenant_claim: "custom_tenant".to_string(),
             roles_claim: "custom_roles".to_string(),
@@ -1139,7 +1218,7 @@ mod tests {
 
         let jwt_config: JwtConfig = jwt_config_serde.into();
         assert_eq!(jwt_config.issuer, "https://issuer.example.com");
-        assert_eq!(jwt_config.audience, "rustberg-api");
+        assert_eq!(jwt_config.audiences, vec!["rustberg-api".to_string()]);
         assert_eq!(jwt_config.default_tenant_id, "test-tenant");
         assert_eq!(jwt_config.tenant_claim, "custom_tenant");
         assert_eq!(jwt_config.roles_claim, "custom_roles");
@@ -1151,6 +1230,7 @@ mod tests {
         let config = ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 9000,
+            shutdown_delay_seconds: 0,
             auth: AuthConfig {
                 api_key_enabled: true,
                 jwt_enabled: true,
@@ -1158,8 +1238,8 @@ mod tests {
                 api_keys: Vec::new(),
                 jwt: Some(JwtConfigSerde {
                     issuer: "https://issuer.example.com".to_string(),
-                    audience: "rustberg-api".to_string(),
-                    jwks_url: "https://issuer.example.com/.well-known/jwks.json".to_string(),
+                    audiences: vec!["rustberg-api".to_string()],
+                    jwks_url: Some("https://issuer.example.com/.well-known/jwks.json".to_string()),
                     default_tenant_id: "default".to_string(),
                     tenant_claim: "tenant_id".to_string(),
                     roles_claim: "roles".to_string(),
@@ -1168,6 +1248,7 @@ mod tests {
                 }),
             },
             cors: CorsConfig::default(),
+            trusted_proxies: vec!["10.0.0.0/8".to_string()],
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -1178,6 +1259,7 @@ mod tests {
         assert!(deserialized.auth.api_key_enabled);
         assert!(deserialized.auth.jwt_enabled);
         assert!(deserialized.auth.jwt.is_some());
+        assert_eq!(deserialized.trusted_proxies, vec!["10.0.0.0/8".to_string()]);
     }
 
     #[test]
@@ -1354,6 +1436,48 @@ key_env = "RUSTBERG_KEY_CI"
         let config = RustbergConfig::parse_str("[server]\nport = 8000\n").unwrap();
         assert_eq!(config.storage.catalog_url, "file:///var/lib/rustberg/data");
     }
+    /// Every optional feature is checked on its own in CI.
+    ///
+    /// The workflow's matrix is a hand-written list — a GitHub Actions matrix
+    /// cannot read `Cargo.toml` — so it is the one place that can silently stop
+    /// covering a feature added after it. That is not hypothetical: it happened
+    /// to `remote-signing`, and `--all-features` cannot notice, because a
+    /// feature broken *alone* is exactly what a full build hides.
+    ///
+    /// `default` and `storage-all` are excluded: both are aggregates of entries
+    /// the list already has, so checking them proves nothing new.
+    #[test]
+    fn ci_checks_every_optional_feature_on_its_own() {
+        let manifest = include_str!("../../Cargo.toml");
+        let workflow = include_str!("../../.github/workflows/ci.yml");
+
+        let declared: Vec<&str> = manifest
+            .lines()
+            .skip_while(|line| line.trim() != "[features]")
+            .skip(1)
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name.trim()))
+            .filter(|name| !name.is_empty() && !name.starts_with('#'))
+            .filter(|name| !matches!(*name, "default" | "storage-all"))
+            .collect();
+
+        assert!(
+            declared.len() >= 8,
+            "the [features] section was not read: {declared:?}"
+        );
+
+        let missing: Vec<&&str> = declared
+            .iter()
+            .filter(|feature| !workflow.contains(&format!("- {feature}\n")))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "these features are declared but absent from the CI feature matrix in \
+             .github/workflows/ci.yml, so nothing checks that they build alone: {missing:?}"
+        );
+    }
+
     // ── Documented configuration must parse ─────────────────────────────
 
     /// Every ```toml block in the docs is parsed against the real schema.
@@ -1367,22 +1491,30 @@ key_env = "RUSTBERG_KEY_CI"
 
         // TOML embedded in a Kubernetes ConfigMap is what an operator copies, so
         // it is checked alongside the fenced blocks.
+        /// TOML embedded in a YAML block scalar.
+        ///
+        /// Two spellings, because two things do it: a Kubernetes ConfigMap keys
+        /// the file by name (`config.toml: |`), and the Helm chart passes it as
+        /// a value (`config: |`). Both are this schema handed to a cluster, and
+        /// the chart's copy is the one furthest from this file.
         fn configmap_blocks(doc: &str) -> Vec<String> {
             let mut out = Vec::new();
-            let mut rest = doc;
-            while let Some(at) = rest.find("config.toml: |") {
-                rest = &rest[at + "config.toml: |".len()..];
-                let mut block = String::new();
-                for line in rest.lines() {
-                    // The block ends at the first line that is neither blank nor
-                    // indented into it.
-                    if !line.trim().is_empty() && !line.starts_with("    ") {
-                        break;
+            for marker in ["config.toml: |", "config: |"] {
+                let mut rest = doc;
+                while let Some(at) = rest.find(marker) {
+                    rest = &rest[at + marker.len()..];
+                    let mut block = String::new();
+                    for line in rest.lines() {
+                        // The block ends at the first line that is neither blank
+                        // nor indented into it.
+                        if !line.trim().is_empty() && !line.starts_with("    ") {
+                            break;
+                        }
+                        block.push_str(line.trim_start());
+                        block.push('\n');
                     }
-                    block.push_str(line.trim_start());
-                    block.push('\n');
+                    out.push(block);
                 }
-                out.push(block);
             }
             out
         }
@@ -1401,6 +1533,13 @@ key_env = "RUSTBERG_KEY_CI"
                 .filter(|p| p.extension().is_some_and(|e| e == "md"))
                 .collect();
         files.push(root.join("README.md"));
+        // The design document too: it shows a mount table, and a design
+        // document whose examples do not parse is one a reader copies from.
+        files.push(root.join("CONCEPT.md"));
+        // And the Helm chart, whose `config:` block is this exact schema handed
+        // to a cluster. It is the copy furthest from this file and so the one
+        // most likely to drift.
+        files.push(root.join("charts").join("rustberg").join("README.md"));
         files.sort();
 
         for path in files {
@@ -1483,5 +1622,31 @@ key_env = "RUSTBERG_KEY_CI"
             err.to_string().contains("read_timeout_secs"),
             "error should name the offending key: {err}"
         );
+    }
+    /// A limiter configured to zero refuses everything rather than limiting
+    /// anything, which reads as an outage. `enabled = false` is how you turn it
+    /// off.
+    #[test]
+    fn a_rate_limit_of_zero_is_refused_rather_than_serving_nothing() {
+        for (rps, burst) in [(0u32, 200u32), (100, 0)] {
+            let mut config = RustbergConfig::default();
+            config.rate_limit.enabled = true;
+            config.rate_limit.requests_per_second = rps;
+            config.rate_limit.burst_size = burst;
+
+            assert!(
+                config.validate().is_err(),
+                "rps={rps} burst={burst} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_disabled_limiter_does_not_have_to_be_configured() {
+        let mut config = RustbergConfig::default();
+        config.rate_limit.enabled = false;
+        config.rate_limit.requests_per_second = 0;
+        config.rate_limit.burst_size = 0;
+        assert!(config.validate().is_ok());
     }
 }

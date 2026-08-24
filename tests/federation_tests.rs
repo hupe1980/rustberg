@@ -351,6 +351,65 @@ async fn config_advertises_only_what_every_mount_supports() {
     }
 }
 
+/// And what the intersection removes from the *advertisement* it must not remove
+/// from the mounts that have it.
+///
+/// Scan planning is the case worth driving end to end: `AppState` carries the
+/// advertised set, so a handler checking it compiles and reads plausibly — and
+/// then one read-only mount switches planning off for every native table in the
+/// catalog. `/v1/config` stops promising `/plan`; `POST …/plan` under a capable
+/// namespace must keep working.
+#[tokio::test]
+async fn a_capability_the_intersection_dropped_still_works_where_it_exists() {
+    let f = federation().await;
+
+    // The advertisement no longer promises planning: `legacy` is read-only.
+    let (_, config) = send(&f.app, Method::GET, "/v1/config", None).await;
+    let endpoints: Vec<String> = parse(&config)["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !endpoints.iter().any(|e| e.ends_with("/plan")),
+        "one mount that cannot plan removes the promise: {endpoints:?}"
+    );
+
+    // A table in the writable mount, which can.
+    let (status, body) = send(
+        &f.app,
+        Method::POST,
+        "/v1/namespaces",
+        Some(json!({ "namespace": ["prod", "db"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = send(
+        &f.app,
+        Method::POST,
+        "/v1/namespaces/prod%1Fdb/tables",
+        Some(json!({ "name": "events", "schema": schema() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = send(
+        &f.app,
+        Method::POST,
+        "/v1/namespaces/prod%1Fdb/tables/events/plan",
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "planning must still work on a mount that supports it: {body}"
+    );
+    assert_eq!(parse(&body)["status"], "completed");
+}
+
 /// Without a read-only mount, everything is advertised again — the intersection
 /// is not a one-way ratchet applied to the whole server.
 #[tokio::test]
@@ -994,9 +1053,13 @@ fn mount_config(backend: &str, catalog_url: &str) -> MountConfig {
 async fn a_rest_backend_is_buildable_from_configuration() {
     let (upstream, _up_dir) = upstream_with_a_table().await;
 
-    let mount = rustberg::AppBuilder::build_mount("partner", &mount_config("rest", &upstream.base))
-        .await
-        .expect("a rest mount builds from configuration");
+    let mount = rustberg::AppBuilder::build_mount(
+        "partner",
+        &mount_config("rest", &upstream.base),
+        rustberg::location::LocationScope::default(),
+    )
+    .await
+    .expect("a rest mount builds from configuration");
 
     assert_eq!(mount.name, "partner");
     assert!(
@@ -1018,9 +1081,13 @@ async fn a_native_backend_is_buildable_from_configuration() {
     let mut config = mount_config("native", &format!("file://{}", dir.path().display()));
     config.warehouse_location = format!("file://{}", warehouse.display());
 
-    let mount = rustberg::AppBuilder::build_mount("local", &config)
-        .await
-        .expect("a native mount builds from configuration");
+    let mount = rustberg::AppBuilder::build_mount(
+        "local",
+        &config,
+        rustberg::location::LocationScope::default(),
+    )
+    .await
+    .expect("a native mount builds from configuration");
 
     assert!(mount.capabilities.write, "a native mount is writable");
 }
@@ -1035,9 +1102,13 @@ async fn a_read_only_native_backend_keeps_its_views_readable() {
     config.warehouse_location = format!("file://{}", warehouse.display());
     config.read_only = true;
 
-    let mount = rustberg::AppBuilder::build_mount("archive", &config)
-        .await
-        .expect("mount builds");
+    let mount = rustberg::AppBuilder::build_mount(
+        "archive",
+        &config,
+        rustberg::location::LocationScope::default(),
+    )
+    .await
+    .expect("mount builds");
 
     assert!(!mount.capabilities.write);
     assert!(
@@ -1049,9 +1120,13 @@ async fn a_read_only_native_backend_keeps_its_views_readable() {
 /// An unknown backend is a startup failure naming what is available.
 #[tokio::test]
 async fn an_unknown_backend_is_refused_with_the_valid_options() {
-    let err = rustberg::AppBuilder::build_mount("bad", &mount_config("glue", "arn:whatever"))
-        .await
-        .expect_err("glue is not implemented");
+    let err = rustberg::AppBuilder::build_mount(
+        "bad",
+        &mount_config("glue", "arn:whatever"),
+        rustberg::location::LocationScope::default(),
+    )
+    .await
+    .expect_err("glue is not implemented");
 
     let message = err.to_string();
     assert!(message.contains("glue"), "{message}");
@@ -1070,9 +1145,13 @@ async fn a_missing_mount_token_is_a_startup_failure() {
     let mut config = mount_config("rest", &upstream.base);
     config.token_env = Some("RUSTBERG_TEST_MOUNT_TOKEN_UNSET".to_string());
 
-    let err = rustberg::AppBuilder::build_mount("partner", &config)
-        .await
-        .expect_err("a named-but-unset token must fail");
+    let err = rustberg::AppBuilder::build_mount(
+        "partner",
+        &config,
+        rustberg::location::LocationScope::default(),
+    )
+    .await
+    .expect_err("a named-but-unset token must fail");
 
     let message = err.to_string();
     assert!(
@@ -1106,6 +1185,17 @@ async fn an_unconditional_federated_load_makes_one_remote_call() {
 
     #[async_trait::async_trait]
     impl CatalogStore for Counting {
+        fn namespace_prefix_for(&self, _: &iceberg::NamespaceIdent) -> Option<String> {
+            None
+        }
+
+        fn capabilities_for(
+            &self,
+            _: Option<&iceberg::NamespaceIdent>,
+        ) -> rustberg::catalog::Capabilities {
+            rustberg::catalog::Capabilities::full()
+        }
+
         async fn load_table(
             &self,
             table: &iceberg::TableIdent,
@@ -1252,9 +1342,10 @@ async fn an_unconditional_federated_load_makes_one_remote_call() {
         async fn update_view(
             &self,
             v: &iceberg::TableIdent,
+            expected: &str,
             m: iceberg::spec::ViewMetadata,
         ) -> iceberg::Result<(String, iceberg::spec::ViewMetadata)> {
-            self.inner.update_view(v, m).await
+            self.inner.update_view(v, expected, m).await
         }
         async fn drop_view(&self, v: &iceberg::TableIdent) -> iceberg::Result<()> {
             self.inner.drop_view(v).await

@@ -18,11 +18,14 @@ struct Cli {
     #[arg(short, long, env = "RUSTBERG_CONFIG")]
     config: Option<PathBuf>,
 
-    /// Server bind address
-    ///
-    /// No `default_value`, deliberately: clap cannot tell "not passed" from
-    /// "passed the default", so a default here silently outranks the
-    /// configuration file. The default is applied in [`bind_address`] instead.
+    /// Server bind address (default: 0.0.0.0, every interface)
+    //
+    // No `default_value`, deliberately: clap cannot tell "not passed" from
+    // "passed the default", so a default here silently outranks the
+    // configuration file. The default is applied in `bind_address` instead —
+    // and this stays a `//` comment, because a doc comment on a clap field is
+    // what the user reads in `--help`, where an argument about clap's internals
+    // is noise.
     #[arg(long, env = "RUSTBERG_HOST")]
     host: Option<String>,
 
@@ -79,6 +82,16 @@ struct Cli {
     #[arg(long, env = "RUSTBERG_INSECURE_HTTP")]
     insecure_http: bool,
 
+    /// Seconds to keep serving after SIGTERM, before draining.
+    ///
+    /// Zero — the default — drains immediately, which is right wherever nothing
+    /// is routing to this process but whoever started it. Behind a load
+    /// balancer it is not: taking an instance out of rotation takes time to
+    /// propagate, and requests that arrive in that window are refused. Set it to
+    /// a few seconds there. Ignored on Ctrl+C.
+    #[arg(long, env = "RUSTBERG_SHUTDOWN_DELAY")]
+    shutdown_delay: Option<u64>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -123,52 +136,21 @@ enum Commands {
         output: Option<PathBuf>,
     },
 
-    /// Create a backup of the catalog database
-    Backup {
-        /// Output file path for the backup
-        #[arg(short, long)]
-        output: String,
-
-        /// Catalog data directory to backup
-        #[arg(short, long, default_value = "/var/lib/rustberg/data")]
-        data_dir: String,
-
-        /// Compress the backup with gzip
-        #[arg(long, default_value = "true")]
-        compress: bool,
-    },
-
-    /// Restore a catalog database from backup
-    Restore {
-        /// Input backup file path
-        #[arg(short, long)]
-        input: String,
-
-        /// Target catalog data directory
-        #[arg(short, long, default_value = "/var/lib/rustberg/data")]
-        data_dir: String,
-
-        /// Force restore even if target directory exists
+    /// Probe a running server's /ready endpoint and exit non-zero if it is not
+    /// serving
+    ///
+    /// This exists so a container can check itself. The published image is
+    /// distroless — no shell and no curl — so a HEALTHCHECK has to be the
+    /// binary that is already there.
+    Healthcheck {
+        /// Full URL to probe. Defaults to this server's own address on
+        /// localhost, taken from --port or the config file.
         #[arg(long)]
-        force: bool,
+        url: Option<String>,
     },
 
-    /// Validate a backup file without restoring
-    ValidateBackup {
-        /// Backup file to validate
-        #[arg(short, long)]
-        input: String,
-    },
-
-    /// Show catalog statistics and health
-    Status {
-        /// Catalog data directory
-        #[arg(short, long, default_value = "/var/lib/rustberg/data")]
-        data_dir: String,
-    },
-
-    /// Run startup/performance benchmarks
-    Benchmark {
+    /// Measure the numbers this project claims, the way CI measures them
+    Bench {
         /// Number of iterations
         #[arg(short, long, default_value = "10")]
         iterations: u32,
@@ -197,7 +179,16 @@ async fn main() {
         .map(|config| config.logging.clone())
         .unwrap_or_default();
 
-    init_logging(&logging, &cli.log_level);
+    // `bench` builds and tears down twenty applications to time a cold start,
+    // and each of them logs the same handful of startup lines. At the default
+    // level that buries the table the command exists to print under several
+    // hundred lines of its own scaffolding. `--log-level` still wins, for
+    // debugging the harness itself.
+    let level = match (&cli.command, std::env::var_os("RUST_LOG")) {
+        (Some(Commands::Bench { .. }), None) => "error",
+        _ => cli.log_level.as_str(),
+    };
+    init_logging(&logging, level);
 
     let file_config = match loaded_config {
         None => None,
@@ -254,31 +245,12 @@ async fn main() {
                 generate_config(output.as_deref());
                 return;
             }
-            Commands::Backup {
-                output,
-                data_dir,
-                compress,
-            } => {
-                backup_catalog(&data_dir, &output, compress);
+            Commands::Healthcheck { url } => {
+                let (_, port) = bind_address(cli.host.as_deref(), cli.port, file_config.as_ref());
+                run_healthcheck(url.as_deref(), port).await;
                 return;
             }
-            Commands::Restore {
-                input,
-                data_dir,
-                force,
-            } => {
-                restore_catalog(&input, &data_dir, force);
-                return;
-            }
-            Commands::ValidateBackup { input } => {
-                validate_backup(&input);
-                return;
-            }
-            Commands::Status { data_dir } => {
-                show_status(&data_dir);
-                return;
-            }
-            Commands::Benchmark { iterations } => {
+            Commands::Bench { iterations } => {
                 run_benchmarks(iterations).await;
                 return;
             }
@@ -465,9 +437,22 @@ async fn main() {
 
                 // Cedar policies. A policy file replaces the built-in defaults.
                 if let Some(ref path) = config.server.auth.policy_file {
-                    let policies = std::fs::read_to_string(path).unwrap_or_else(|e| {
-                        panic!("Failed to read policy file {}: {e}", path.display())
-                    });
+                    // Reported and exited like every other startup failure in
+                    // this function. A panic here aborts the process — the
+                    // release profile is `panic = "abort"` — so an operator with
+                    // a mistyped path gets a Rust backtrace instead of the
+                    // sentence naming the file.
+                    let policies = match std::fs::read_to_string(path) {
+                        Ok(policies) => policies,
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                path = %path.display(),
+                                "Failed to read the policy file named in [server.auth]"
+                            );
+                            std::process::exit(1);
+                        }
+                    };
                     builder = builder.with_policies(policies);
                 }
 
@@ -478,9 +463,16 @@ async fn main() {
                     .auth
                     .api_keys
                     .iter()
-                    .map(|k| {
-                        k.to_api_key()
-                            .unwrap_or_else(|e| panic!("Invalid API key configuration: {e}"))
+                    .map(|k| match k.to_api_key() {
+                        Ok(key) => key,
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "Invalid API key configuration; refusing to start rather \
+                                 than serving with a key set the operator did not describe"
+                            );
+                            std::process::exit(1);
+                        }
                     })
                     .collect();
 
@@ -532,6 +524,14 @@ async fn main() {
         host,
         port,
         tls: tls_config,
+        // Zero unless the operator asked for one, which is right everywhere
+        // nothing is routing to this process but whoever started it. See
+        // `server::wait_for_shutdown` for the deployment that needs it.
+        shutdown_delay: std::time::Duration::from_secs(cli.shutdown_delay.unwrap_or_else(|| {
+            file_config
+                .as_ref()
+                .map_or(0, |c| c.server.shutdown_delay_seconds)
+        })),
     };
 
     // Start the server
@@ -567,11 +567,6 @@ fn bind_host(cli_host: Option<&str>, file: Option<&rustberg::config::RustbergCon
         .unwrap_or_else(|| DEFAULT_HOST.to_string())
 }
 
-/// Builds the audit sink from configuration.
-///
-/// A sink that cannot be opened is fatal. A deployment that asked for an audit
-/// file and did not get one would otherwise serve unaudited while believing it
-/// had a trail.
 /// Applies the settings both startup paths share.
 ///
 /// Authenticated and `--no-auth` startups differ only in how a caller is
@@ -590,12 +585,14 @@ fn apply_shared_config(
         if let Some(ref warehouse) = config.storage.warehouse_location {
             builder = builder.with_warehouse_location(warehouse);
         }
+        builder = builder.with_location_scope(location_scope(Some(config)));
         if let Some(rate_config) =
             rustberg::auth::RateLimitConfig::from_file_config(&config.rate_limit)
         {
             builder = builder.with_rate_limit_config(rate_config);
         }
         builder = builder.with_cors_config(config.server.cors.clone());
+        builder = builder.with_trusted_proxies(config.server.trusted_proxies.clone());
         builder = builder.with_credentials_config(config.credentials.clone());
     }
 
@@ -604,6 +601,34 @@ fn apply_shared_config(
     }
 
     builder
+}
+
+/// How far inside the warehouse a client may put a resource's files.
+///
+/// Read in one place and handed to everything that needs it — the app builder,
+/// and every mount's own store — because the check runs on both sides of the
+/// `CatalogStore` boundary and a mount reading a different answer from the
+/// handler would be a bound that holds for a `createTable` and not for the
+/// `registerTable` beside it.
+///
+/// An unparseable value ends the process. Falling back to the tight scope breaks
+/// a deployment that meant the loose one; falling back to the loose one silently
+/// removes a security bound. Neither is something to guess at on a value an
+/// operator wrote down.
+fn location_scope(
+    file_config: Option<&rustberg::config::RustbergConfig>,
+) -> rustberg::location::LocationScope {
+    let Some(config) = file_config else {
+        return rustberg::location::LocationScope::default();
+    };
+
+    match rustberg::location::LocationScope::parse(&config.storage.location_scope) {
+        Ok(scope) => scope,
+        Err(e) => {
+            tracing::error!("❌ Failed to start: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Opens every configured mount, in a stable order.
@@ -623,7 +648,13 @@ async fn build_mounts(
 
     let mut mounts = Vec::with_capacity(names.len());
     for name in names {
-        match rustberg::AppBuilder::build_mount(name, &config.mount[name]).await {
+        match rustberg::AppBuilder::build_mount(
+            name,
+            &config.mount[name],
+            location_scope(file_config),
+        )
+        .await
+        {
             Ok(mount) => mounts.push(mount),
             Err(e) => {
                 tracing::error!("❌ Failed to start: {e}");
@@ -845,25 +876,6 @@ fn generate_config(output: Option<&std::path::Path>) {
     }
 }
 
-/// Mints a single admin key when a deployment has no other way in.
-///
-/// # Why this exists
-///
-/// Authentication is on by default, which is right. But a `rustberg serve` with
-/// no configuration file then had *no* accepted credential, so the server came up
-/// and answered `401` to every request — including `/v1/config`, the first call
-/// every Iceberg client makes. Nothing was broken and nothing worked, which is
-/// the worst of both: an operator's first experience was an unusable server with
-/// no message explaining why.
-///
-/// The alternatives were to refuse to start, or to default to no authentication.
-/// Refusing to start makes the quickstart a two-step, and defaulting to open
-/// authentication is how a development shortcut reaches production. Minting one
-/// key and printing it keeps the server secure *and* usable in one command, and
-/// the key's existence is impossible to miss in the log.
-///
-/// It is only ever called when nothing else is configured — a config file with
-/// API keys, or OIDC, suppresses it entirely.
 /// The base URL a reader can paste, given what this process is about to serve.
 ///
 /// A wildcard bind address is rendered as `localhost`: `0.0.0.0` is a valid
@@ -880,6 +892,26 @@ fn quickstart_base_url(host: &str, port: u16, tls: bool) -> String {
     format!("{scheme}://{host}:{port}")
 }
 
+/// Mints a single admin key when a deployment has no other way in.
+///
+/// # Why this exists
+///
+/// Authentication is on by default, which is right — but a `rustberg serve` with
+/// no configuration file would then have *no* accepted credential, so the server
+/// would come up and answer `401` to every request, including `/v1/config`, the
+/// first call every Iceberg client makes. Nothing broken and nothing working is
+/// the worst of both: an unusable server with no message explaining why.
+///
+/// The alternatives are to refuse to start, or to default to no authentication.
+/// Refusing to start makes the quickstart a two-step, and defaulting to open
+/// authentication is how a development shortcut reaches production. Minting one
+/// key and printing it keeps the server secure *and* usable in one command, and
+/// the key's existence is impossible to miss in the log.
+///
+/// Called only when nothing else is configured — a config file with API keys, or
+/// OIDC, suppresses it entirely. The key lives in memory, so a restart mints a
+/// new one; the banner says so, because a client that stops working after a
+/// restart otherwise looks like a bug.
 async fn bootstrap_admin_key(
     store: &Arc<InMemoryApiKeyStore>,
     tenant_id: &str,
@@ -921,422 +953,64 @@ async fn bootstrap_admin_key(
 }
 
 // ============================================================================
-// Backup & Restore Commands
+// Healthcheck
 // ============================================================================
 
-/// Creates a backup of the catalog.
-/// Archives the catalog directory.
+/// `rustberg healthcheck` — probes a running server and sets the exit status.
 ///
-/// # Consistency
+/// # Why the binary probes itself
 ///
-/// This copies files as they are on disk. redb commits are atomic, so a copy
-/// taken while the server is running captures a valid *past* state rather than a
-/// corrupt one — but it may miss commits made during the copy. For a backup that
-/// is exactly a known point in time, stop the server first; the deployment is
-/// single-writer anyway, so that is a short window.
-fn backup_catalog(data_dir: &str, output: &str, compress: bool) {
-    use std::fs::{self, File};
-    use std::io::{BufWriter, Write};
-    use std::path::Path;
-    use std::time::SystemTime;
+/// The published image is distroless: no shell, no `curl`, nothing else to write
+/// a `HEALTHCHECK` with. A probe that shells out cannot succeed there, and a
+/// check that fails the same way whether or not anything is wrong tells an
+/// operator nothing. Kubernetes needs none of this — an `httpGet` probe is made
+/// by the kubelet, outside the container.
+///
+/// # `/ready`, not `/health`
+///
+/// `/health` reports that the process is up, which is already implied by the
+/// check running at all. `/ready` reports that the catalog store and the policy
+/// set are actually usable, which is what "may this container receive traffic"
+/// means.
+async fn run_healthcheck(url: Option<&str>, port: u16) {
+    // Always loopback when the URL is not given. `--host` is a *bind* address,
+    // and the common value — `0.0.0.0` — is not one anything can connect to.
+    let url = url.map_or_else(|| format!("http://127.0.0.1:{port}/ready"), str::to_string);
 
-    let data_path = Path::new(data_dir);
-    let output_path = Path::new(output);
-
-    // Verify source exists
-    if !data_path.exists() {
-        eprintln!("❌ Data directory does not exist: {}", data_dir);
-        std::process::exit(1);
-    }
-
-    // Create output directory if needed
-    if let Some(parent) = output_path.parent()
-        && !parent.exists()
-        && let Err(e) = fs::create_dir_all(parent)
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
     {
-        eprintln!("❌ Failed to create output directory: {}", e);
-        std::process::exit(1);
-    }
-
-    println!("📦 Creating backup...");
-    println!("   Source: {}", data_dir);
-    println!("   Output: {}", output);
-
-    // Create tar archive
-    let file = match File::create(output_path) {
-        Ok(f) => f,
+        Ok(client) => client,
         Err(e) => {
-            eprintln!("❌ Failed to create output file: {}", e);
+            eprintln!("healthcheck: could not build an HTTP client: {e}");
             std::process::exit(1);
         }
     };
 
-    let writer: Box<dyn Write> = if compress {
-        println!("   Compression: gzip");
-        Box::new(flate2::write::GzEncoder::new(
-            BufWriter::new(file),
-            flate2::Compression::default(),
-        ))
-    } else {
-        Box::new(BufWriter::new(file))
-    };
-
-    let mut archive = tar::Builder::new(writer);
-
-    // Add all files from data directory
-    if let Err(e) = archive.append_dir_all("data", data_path) {
-        eprintln!("❌ Failed to create archive: {}", e);
-        std::process::exit(1);
-    }
-
-    // Finish archive
-    if let Err(e) = archive.finish() {
-        eprintln!("❌ Failed to finalize archive: {}", e);
-        std::process::exit(1);
-    }
-
-    // Get file size
-    let metadata = fs::metadata(output_path).ok();
-    let size = metadata.map(|m| m.len()).unwrap_or(0);
-
-    let timestamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    println!("\n✅ Backup completed successfully!");
-    println!("┌─────────────────────────────────────────────────────────┐");
-    println!("│ Backup Summary                                         │");
-    println!("├─────────────────────────────────────────────────────────┤");
-    println!("│ File:      {:<44}│", output);
-    println!("│ Size:      {:<44}│", format_bytes(size));
-    println!("│ Timestamp: {:<44}│", timestamp);
-    println!("└─────────────────────────────────────────────────────────┘");
-    println!("\n💡 To restore: rustberg restore --input {}", output);
-}
-
-/// Restores a catalog from backup.
-fn restore_catalog(input: &str, data_dir: &str, force: bool) {
-    use std::fs::{self, File};
-    use std::io::BufReader;
-    use std::path::Path;
-
-    let input_path = Path::new(input);
-    let data_path = Path::new(data_dir);
-
-    // Verify backup exists
-    if !input_path.exists() {
-        eprintln!("❌ Backup file does not exist: {}", input);
-        std::process::exit(1);
-    }
-
-    // Check if target directory exists
-    if data_path.exists() && !force {
-        eprintln!("❌ Target directory already exists: {}", data_dir);
-        eprintln!("   Use --force to overwrite");
-        std::process::exit(1);
-    }
-
-    println!("📥 Restoring backup...");
-    println!("   Source: {}", input);
-    println!("   Target: {}", data_dir);
-
-    // Remove existing data if force is set
-    if data_path.exists() && force {
-        println!("   ⚠️  Removing existing data directory...");
-        if let Err(e) = fs::remove_dir_all(data_path) {
-            eprintln!("❌ Failed to remove existing directory: {}", e);
-            std::process::exit(1);
+    match client.get(&url).send().await {
+        Ok(response) if response.status().is_success() => {
+            println!("healthcheck: {url} is ready");
         }
-    }
-
-    // Create target directory
-    if let Err(e) = fs::create_dir_all(data_path) {
-        eprintln!("❌ Failed to create target directory: {}", e);
-        std::process::exit(1);
-    }
-
-    // Open archive
-    let file = match File::open(input_path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("❌ Failed to open backup file: {}", e);
+        Ok(response) => {
+            // The body names which component is not ready, which is the only
+            // thing worth printing from a probe that runs every ten seconds.
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            eprintln!("healthcheck: {url} answered {status}: {}", body.trim());
             std::process::exit(1);
-        }
-    };
-
-    // Detect compression by file extension
-    let is_compressed = input.ends_with(".gz") || input.ends_with(".tgz");
-
-    let reader: Box<dyn std::io::Read> = if is_compressed {
-        println!("   Compression: gzip");
-        Box::new(flate2::read::GzDecoder::new(BufReader::new(file)))
-    } else {
-        Box::new(BufReader::new(file))
-    };
-
-    let mut archive = tar::Archive::new(reader);
-
-    // SECURITY: Prevent Zip Slip attacks by validating all paths before extraction
-    // We manually extract each entry with path validation instead of using unpack()
-    let extract_path = data_path.parent().unwrap_or(Path::new("."));
-    let canonical_extract = match extract_path.canonicalize() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("❌ Failed to resolve extract path: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let entries = match archive.entries() {
-        Ok(entries) => entries,
-        Err(e) => {
-            eprintln!("❌ Failed to read archive entries: {}", e);
-            eprintln!("   The backup file may be corrupted or in an unsupported format.");
-            std::process::exit(1);
-        }
-    };
-
-    for entry in entries {
-        let mut entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("❌ Failed to read archive entry: {}", e);
-                std::process::exit(1);
-            }
-        };
-
-        let entry_path = match entry.path() {
-            Ok(p) => p.into_owned(),
-            Err(e) => {
-                eprintln!("❌ Invalid path in archive: {}", e);
-                std::process::exit(1);
-            }
-        };
-
-        // Construct the full destination path
-        let dest_path = extract_path.join(&entry_path);
-
-        // SECURITY: Validate that the resolved path is within the extract directory
-        // This prevents path traversal attacks (Zip Slip) via paths like "../../../etc/passwd"
-        let canonical_dest = match dest_path.parent() {
-            Some(parent) => {
-                // Create parent directories first so we can canonicalize
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    eprintln!("❌ Failed to create directory: {}", e);
-                    std::process::exit(1);
-                }
-                match parent.canonicalize() {
-                    Ok(p) => p.join(dest_path.file_name().unwrap_or_default()),
-                    Err(_) => dest_path.clone(),
-                }
-            }
-            None => dest_path.clone(),
-        };
-
-        if !canonical_dest.starts_with(&canonical_extract) {
-            eprintln!("❌ SECURITY: Path traversal attempt detected in archive!");
-            eprintln!("   Malicious path: {:?}", entry_path);
-            eprintln!("   This backup file may be compromised.");
-            std::process::exit(1);
-        }
-
-        // Now it's safe to unpack this entry
-        if let Err(e) = entry.unpack(&dest_path) {
-            eprintln!("❌ Failed to extract {:?}: {}", entry_path, e);
-            std::process::exit(1);
-        }
-    }
-
-    println!("\n✅ Restore completed successfully!");
-    println!("┌─────────────────────────────────────────────────────────┐");
-    println!("│ Restore Summary                                        │");
-    println!("├─────────────────────────────────────────────────────────┤");
-    println!("│ Data restored to: {:<37}│", data_dir);
-    println!("└─────────────────────────────────────────────────────────┘");
-    println!("\n💡 Start server: rustberg --data-dir {}", data_dir);
-}
-
-/// Validates a backup file without restoring.
-fn validate_backup(input: &str) {
-    use std::fs::File;
-    use std::io::BufReader;
-    use std::path::Path;
-
-    let input_path = Path::new(input);
-
-    if !input_path.exists() {
-        eprintln!("❌ Backup file does not exist: {}", input);
-        std::process::exit(1);
-    }
-
-    println!("🔍 Validating backup: {}", input);
-
-    let file = match File::open(input_path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("❌ Failed to open backup file: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let is_compressed = input.ends_with(".gz") || input.ends_with(".tgz");
-
-    let reader: Box<dyn std::io::Read> = if is_compressed {
-        Box::new(flate2::read::GzDecoder::new(BufReader::new(file)))
-    } else {
-        Box::new(BufReader::new(file))
-    };
-
-    let mut archive = tar::Archive::new(reader);
-
-    let mut file_count = 0;
-    let mut total_size: u64 = 0;
-    let mut has_catalog_files = false;
-
-    match archive.entries() {
-        Ok(entries) => {
-            for entry in entries {
-                match entry {
-                    Ok(e) => {
-                        file_count += 1;
-                        total_size += e.size();
-
-                        let path = e.path().unwrap_or_default();
-                        let path_str = path.to_string_lossy();
-
-                        // The catalog is a single redb file, so this is the
-                        // only artifact that marks a backup as complete.
-                        if path_str.ends_with(".redb") {
-                            has_catalog_files = true;
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("❌ Corrupted entry in archive: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            }
         }
         Err(e) => {
-            eprintln!("❌ Failed to read archive: {}", e);
+            eprintln!("healthcheck: {url} is unreachable: {e}");
             std::process::exit(1);
         }
-    }
-
-    // Get compressed size
-    let compressed_size = std::fs::metadata(input_path).map(|m| m.len()).unwrap_or(0);
-
-    println!("\n✅ Backup is valid!");
-    println!("┌─────────────────────────────────────────────────────────┐");
-    println!("│ Backup Validation Summary                              │");
-    println!("├─────────────────────────────────────────────────────────┤");
-    println!("│ File:            {:<38}│", input);
-    println!("│ Compressed size: {:<38}│", format_bytes(compressed_size));
-    println!("│ Uncompressed:    {:<38}│", format_bytes(total_size));
-    println!("│ Files:           {:<38}│", file_count);
-    println!(
-        "│ Catalog data:    {:<38}│",
-        if has_catalog_files {
-            "✓ Present"
-        } else {
-            "✗ Missing"
-        }
-    );
-    println!("└─────────────────────────────────────────────────────────┘");
-
-    if !has_catalog_files {
-        eprintln!("\n⚠️  Warning: No catalog files detected in backup!");
-        eprintln!("   This backup may not contain catalog data.");
     }
 }
 
-/// Shows catalog status and statistics.
-fn show_status(data_dir: &str) {
-    use std::fs;
-    use std::path::Path;
+// ============================================================================
+// Benchmarks
+// ============================================================================
 
-    let data_path = Path::new(data_dir);
-
-    println!("📊 Rustberg Catalog Status");
-    println!("══════════════════════════════════════════════════════════\n");
-
-    // Version info
-    println!("Version:     {}", env!("CARGO_PKG_VERSION"));
-
-    // Check data directory
-    if !data_path.exists() {
-        println!("Data Dir:    {} (not found)", data_dir);
-        println!("\n⚠️  No catalog data found. Start the server to initialize.");
-        return;
-    }
-
-    // Calculate directory size
-    let mut total_size: u64 = 0;
-    let mut file_count: u64 = 0;
-
-    if let Ok(entries) = fs::read_dir(data_path) {
-        for entry in entries.flatten() {
-            if let Ok(metadata) = entry.metadata()
-                && metadata.is_file()
-            {
-                total_size += metadata.len();
-                file_count += 1;
-            }
-        }
-    }
-
-    println!("Data Dir:    {}", data_dir);
-    println!("Size:        {}", format_bytes(total_size));
-    println!("Files:       {}", file_count);
-
-    // Check for catalog files
-    let has_manifest = fs::read_dir(data_path)
-        .map(|entries| {
-            entries
-                .flatten()
-                .any(|e| e.file_name().to_string_lossy().contains("manifest"))
-        })
-        .unwrap_or(false);
-    let has_sst = fs::read_dir(data_path)
-        .map(|entries| {
-            entries
-                .flatten()
-                .any(|e| e.file_name().to_string_lossy().ends_with(".sst"))
-        })
-        .unwrap_or(false);
-
-    println!("\nCatalog Status:");
-    println!("  Manifest file: {}", if has_manifest { "✓" } else { "✗" });
-    println!("  SST files:     {}", if has_sst { "✓" } else { "✗" });
-
-    if has_manifest || has_sst {
-        println!("\n✅ Catalog appears healthy");
-    } else {
-        println!("\n⚠️  Catalog may be empty or uninitialized");
-    }
-
-    println!("\n💡 For detailed diagnostics, check /health and /ready endpoints");
-}
-
-/// Formats bytes into human-readable string.
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} bytes", bytes)
-    }
-}
-
-/// Runs startup and performance benchmarks.
 /// `rustberg bench` — the numbers this project claims, measured here.
 ///
 /// Deliberately the *same* measurements the CI gate asserts, through the same

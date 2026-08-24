@@ -82,7 +82,7 @@ and there is no such space here.
 
 ### Performance
 
-Verification takes **~0.55 µs**, measured with `rustberg benchmark` — cheap
+Verification takes **~0.55 µs**, measured with `rustberg bench` — cheap
 enough that caching results would only add a window in which a rotated key keeps
 working.
 
@@ -192,24 +192,71 @@ lifetime and revocation are then the identity provider's job, which is where tha
 responsibility belongs.
 ## JWT Authentication
 
-### JWKS Configuration
+### Naming the provider is enough
 
-Rustberg validates JWTs against a JWKS (JSON Web Key Set) endpoint:
+Rustberg validates JWTs against your identity provider's published signing keys,
+and finds them by reading the issuer's discovery document. Two values are
+required:
 
 ```toml
 [server.auth]
 jwt_enabled = true
 
 [server.auth.jwt]
-jwks_url = "https://auth.example.com/.well-known/jwks.json"
-issuer = "https://auth.example.com"
-audience = "rustberg-catalog"
+issuer    = "https://auth.example.com"
+audiences = ["rustberg-catalog"]
+```
+
+At the first token that needs a key, Rustberg fetches
+`https://auth.example.com/.well-known/openid-configuration` and takes `jwks_uri`
+from it. The document names the issuer it describes, and Rustberg **checks that
+it matches the one you configured**: taking signing keys from a document naming
+another issuer would make every token that issuer signs valid here. Redirects are
+not followed, for the same reason.
+
+Discovery is lazy, so a provider that is unreachable when the pod starts does not
+stop it starting.
+
+### More than one audience
+
+A token is accepted when its `aud` matches any entry. That is the ordinary case:
+an identity provider registers one client per application, so Spark, Trino and a
+notebook are three audiences reaching one catalog.
+
+The list must not be empty — that means *check nothing*, which accepts every
+token your issuer has minted, including ones addressed to other services.
+Rustberg refuses to start rather than accept it.
+
+### Setting the JWKS URL explicitly
+
+Skip discovery by naming the endpoint. Useful for a provider with a non-standard
+document layout, or where the discovery document is not reachable:
+
+```toml
+[server.auth]
+jwt_enabled = true
+
+[server.auth.jwt]
+issuer    = "https://auth.example.com"
+audiences = ["rustberg-catalog"]
+jwks_url  = "https://auth.example.com/.well-known/jwks.json"
 
 # Claims carrying tenant and roles. Shown with their defaults.
 tenant_claim = "tenant_id"
 roles_claim = "roles"
 jwks_cache_ttl_seconds = 3600
 ```
+
+### Signature algorithms
+
+The default is **RS256, ES256 and EdDSA**, so a provider that rotates from RSA
+onto elliptic-curve keys keeps working with no configuration change. The
+algorithm is taken from this list, never from the token's own header.
+
+No `HS*` algorithm can be enabled. An HMAC verifies with the same secret it signs
+with, so accepting one against a JWKS would turn the *public* key your provider
+publishes into a shared secret anyone could forge with. Configuring one is a
+startup error.
 
 ### Naming the claims
 
@@ -221,9 +268,8 @@ contain dots of their own:
 
 ```toml
 [server.auth.jwt]
-jwks_url = "https://auth.example.com/.well-known/jwks.json"
-issuer   = "https://auth.example.com"
-audience = "rustberg-catalog"
+issuer    = "https://auth.example.com"
+audiences = ["rustberg-catalog"]
 
 # Keycloak puts realm roles inside an object.
 roles_claim = "realm_access.roles"
@@ -241,6 +287,18 @@ number has no name for a Cedar group to match.
 yields an absent group, so such a principal matches only policies written about
 the principal itself. Deny-by-default reaches here too.
 
+**A role that cannot be a Cedar group id is dropped too**, and the principal
+keeps the rest. A role becomes `Group::"analysts"` and a policy matches that
+string byte for byte, so a role carrying a zero-width space is a group no policy
+names and no reviewer can distinguish from `analysts`. Roles are held to the same
+rendering rule as a [name](@/docs/security.md#and-from-the-identity-side):
+Unicode general category `C` refused, NFC, no surrounding whitespace, length
+bound. A warning names the offending code point rather than the role, since the
+role's rendering is the thing in question.
+
+A role in `[[server.auth.api_keys]]` is a **startup failure** instead — an
+operator wrote it, and can fix it.
+
 ### Key rotation
 
 An unknown `kid` triggers an immediate JWKS refetch, so a provider that rotates
@@ -253,12 +311,16 @@ Refreshing the JWKS also purges every cached decoding key, so a signing key the
 provider has withdrawn stops being honoured within one cache cycle
 (`jwks_cache_ttl_seconds`, default one hour).
 
+Keys are selected by `kid` **and** by purpose, so encryption keys (`"use":
+"enc"`) published in the same JWKS are skipped rather than handed to the verifier
+as signing keys.
+
 ### Token Requirements
 
 | Claim | Required | Description |
 |-------|----------|-------------|
 | `iss` | ✅ | Must match configured issuer |
-| `aud` | ✅ | Must match configured audience |
+| `aud` | ✅ | Must match one of the configured `audiences` |
 | `exp` | ✅ | Token expiration time |
 | `sub` | ✅ | User/service identifier |
 | `tenant_id` | ⚠️ | Required for multi-tenant; renameable with `tenant_claim` |
@@ -266,6 +328,32 @@ provider has withdrawn stops being honoured within one cache cycle
 
 The `Authorization` scheme is matched case-insensitively, so `bearer` and
 `Bearer` are both accepted.
+
+### A signed token is not a validated one
+
+Two claims are checked for their *content* once the signature verifies. A token
+failing either is rejected as an invalid token.
+
+**The tenant** gets the rule a namespace level gets, because it is one: a Cedar
+entity id begins with it — `Table::"acme␟analytics␟web␟events"`. A tenant reading
+`acme␟analytics` builds, for its *own* namespace `web`, the exact id of a table
+in tenant `acme`, so a policy scoped to `Namespace::"acme␟analytics"` would cover
+resources it was never written for.
+
+Refused: the unit separator and everything else in Unicode general category `C`,
+non-NFC spellings, `/` and `\`, `.` and `..`, surrounding whitespace, and
+anything past 255 characters. The rest of Unicode is fine — `分析` is a
+legitimate tenant.
+
+**The subject** becomes `User::"…"` and is never joined into a path, so `/` is
+allowed: `auth0|5f3c`, `alice@example.com` and `https://accounts.example/u/17`
+are all accepted. What is refused is anything that changes how it *renders*,
+because the subject is written into every audit record and log line — a newline
+forges an entry, `U+202E` reverses the rest of one. Category `C`, NFC and the
+length bound; nothing else.
+
+The tenant rule also applies to `[[server.auth.api_keys]]`, where it is a
+**startup failure** rather than a rejected credential.
 
 ### Example JWT Payload
 
@@ -289,9 +377,8 @@ The `Authorization` scheme is matched case-insensitively, so `bearer` and
 jwt_enabled = true
 
 [server.auth.jwt]
-jwks_url = "https://your-tenant.auth0.com/.well-known/jwks.json"
-issuer = "https://your-tenant.auth0.com/"
-audience = "rustberg-api"
+issuer    = "https://your-tenant.auth0.com/"
+audiences = ["rustberg-api"]
 ```
 
 #### Keycloak
@@ -303,11 +390,13 @@ Realm roles arrive inside `realm_access`, so the roles claim names the path:
 jwt_enabled = true
 
 [server.auth.jwt]
-jwks_url = "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/certs"
-issuer = "https://keycloak.example.com/realms/myrealm"
-audience = "rustberg"
+issuer      = "https://keycloak.example.com/realms/myrealm"
+audiences   = ["rustberg"]
 roles_claim = "realm_access.roles"
 ```
+
+The JWKS path here is `/protocol/openid-connect/certs`, which is Keycloak's own
+and changes with the realm — exactly the value discovery saves you writing.
 
 #### Okta
 
@@ -316,9 +405,8 @@ roles_claim = "realm_access.roles"
 jwt_enabled = true
 
 [server.auth.jwt]
-jwks_url = "https://your-org.okta.com/oauth2/default/v1/keys"
-issuer = "https://your-org.okta.com/oauth2/default"
-audience = "rustberg"
+issuer    = "https://your-org.okta.com/oauth2/default"
+audiences = ["rustberg"]
 ```
 
 ---
@@ -344,9 +432,8 @@ jwt_enabled = true
 api_key_enabled = true
 
 [server.auth.jwt]
-jwks_url = "https://auth.example.com/.well-known/jwks.json"
-issuer = "https://auth.example.com"
-audience = "rustberg"
+issuer    = "https://auth.example.com"
+audiences = ["rustberg"]
 ```
 
 ---
@@ -360,13 +447,57 @@ Protect against abuse with token bucket rate limiting:
 enabled = true
 requests_per_second = 100
 burst_size = 200
-trust_proxy_headers = false  # Set true behind load balancer
 ```
 
 Rate limiting is per client IP, applied before authentication so that unauthenticated
-floods are cheap to shed. There are no per-tenant limits: a limit keyed on the
+floods are cheap to shed.
+
+There are no per-tenant limits: a limit keyed on the
 tenant would have to authenticate the request first, which is the work being
 protected against.
+
+---
+
+## Trusted proxies
+
+Which address counts as "the client" is **not** a rate-limiting setting. The same
+answer decides three things — the rate-limit bucket, `context.source_ip` in a
+Cedar policy, and the address on an audit record — so it is configured once, in
+`[server]`:
+
+```toml
+[server]
+# The subnet the load balancer runs in. Empty (the default) trusts no proxy.
+trusted_proxies = ["10.0.0.0/8"]
+```
+
+**Empty is the default and it means headers are ignored.** The caller's address
+is the TCP peer, full stop. That is the only correct behaviour for a server that
+might be reachable directly.
+
+With ranges configured, Rustberg builds the forwarding chain as
+`X-Forwarded-For` left to right with the TCP peer appended, and walks it **from
+the right**, skipping hops inside a trusted range. The first address that is not
+a trusted proxy is the client.
+
+Reading the *leftmost* entry instead — which is all a "trust proxy headers"
+boolean can mean — is a spoof. `X-Forwarded-For` is appended to at each hop, so a
+client that sends `X-Forwarded-For: 10.0.0.1` arrives as
+`10.0.0.1, <real client>`: it would get to choose its own `context.source_ip`,
+defeating any policy conditioned on the address, and give itself a fresh
+rate-limit bucket on every request.
+
+A hop *count* would also work and is one number shorter. It is wrong the moment a
+request arrives by a second path — a health checker, a mesh sidecar, an internal
+caller going straight to the pod — and it is wrong in the direction that fails
+open.
+
+`X-Real-IP` is honoured only when the peer is itself a trusted proxy and no
+forwarding chain was sent.
+
+A range that does not parse is a **startup failure**. The alternative is
+attributing every request to the load balancer's own address while looking like
+working software.
 
 ---
 
@@ -437,6 +568,26 @@ All authentication decisions are logged:
 ## Troubleshooting
 
 ### "401 Unauthorized"
+
+**Every** way of failing authentication answers the same `401`, with the same
+type and the same sentence — missing, malformed, unknown, revoked, expired, bad
+signature. That is deliberate: *disabled* and *expired* are reachable only after
+the key's hash matches, so naming either would confirm to whoever sent a stolen
+key that it is a real one.
+
+So debug it from the **server side**, where the reason is kept:
+
+```bash
+# The audit trail names the specific reason, per request.
+jq -c 'select(.action == "authenticate" and .outcome == "denied")
+       | {reason: .details.reason, ip: .client_ip, request: .request_id}' \
+  /var/log/rustberg/audit.jsonl
+```
+
+`request_id` matches the `X-Request-Id` the client got back, so you can join a
+user's report to the exact record.
+
+From the client side, the checklist is unchanged:
 
 1. Verify the API key/JWT is correct
 2. Check the `Authorization` header format: `Bearer <token>`

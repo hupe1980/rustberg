@@ -12,7 +12,7 @@
 
 use axum::{
     extract::{FromRequest, FromRequestParts, Path, Request},
-    http::{StatusCode, request::Parts},
+    http::request::Parts,
 };
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
@@ -20,8 +20,8 @@ use std::ops::Deref;
 
 use iceberg::{NamespaceIdent, TableIdent};
 
-use super::validation::{validate_name, validate_namespace};
 use crate::error::AppError;
+use crate::names::{validate_name, validate_namespace};
 
 /// A JSON body extractor that reports failures in the Iceberg error shape.
 ///
@@ -57,9 +57,20 @@ where
 }
 
 /// Separator for the levels of a multi-level namespace in a path segment.
-const NAMESPACE_SEPARATOR: char = '\u{1F}';
+use crate::names::PART_SEPARATOR as NAMESPACE_SEPARATOR;
 
-type Rejection = (StatusCode, String);
+/// Path rejections go through [`AppError`] for the same reason [`Json`]'s do.
+///
+/// Axum's own rejection is plain text, and the Iceberg REST spec defines *every*
+/// error as `{"error": {"message", "type", "code"}}`. A client that parses the
+/// error body fails to parse a bare string, so "you sent an invalid namespace"
+/// arrives as an unhandled client-side error instead of the sentence it is.
+type Rejection = AppError;
+
+/// A path that could not be read, in the Iceberg error shape.
+fn bad_path(message: impl Into<String>) -> Rejection {
+    AppError::BadRequest(message.into())
+}
 
 async fn path_params<S: Send + Sync>(
     parts: &mut Parts,
@@ -68,16 +79,14 @@ async fn path_params<S: Send + Sync>(
     Path::<HashMap<String, String>>::from_request_parts(parts, state)
         .await
         .map(|p| p.0)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {e}")))
+        .map_err(|e| bad_path(format!("Invalid path: {e}")))
 }
 
 fn require<'a>(params: &'a HashMap<String, String>, key: &str) -> Result<&'a str, Rejection> {
-    params.get(key).map(String::as_str).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Missing path parameter: {key}"),
-        )
-    })
+    params
+        .get(key)
+        .map(String::as_str)
+        .ok_or_else(|| bad_path(format!("Missing path parameter: {key}")))
 }
 
 /// Decodes and validates a multi-level namespace from a path segment.
@@ -86,10 +95,11 @@ fn parse_namespace(raw: &str) -> Result<NamespaceIdent, Rejection> {
 
     // Rejects path traversal, null bytes, control characters, reserved names and
     // over-deep namespaces before any of it reaches storage.
-    validate_namespace(&parts).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    // Already an `AppError` with the right shape; passed through rather than
+    // restated, so the sentence a caller reads is the one the validator wrote.
+    validate_namespace(&parts)?;
 
-    NamespaceIdent::from_vec(parts)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid namespace: {e}")))
+    NamespaceIdent::from_vec(parts).map_err(|e| bad_path(format!("Invalid namespace: {e}")))
 }
 
 /// The `{namespace}` path segment, decoded and validated.
@@ -126,7 +136,7 @@ impl<S: Send + Sync> FromRequestParts<S> for TablePath {
         let namespace = parse_namespace(require(&params, "namespace")?)?;
         let name = require(&params, "table")?;
 
-        validate_name(name, "Table name").map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        validate_name(name, "Table name")?;
 
         Ok(TablePath(TableIdent::new(namespace, name.to_string())))
     }
@@ -154,7 +164,7 @@ impl<S: Send + Sync> FromRequestParts<S> for ViewPath {
         let namespace = parse_namespace(require(&params, "namespace")?)?;
         let name = require(&params, "view")?;
 
-        validate_name(name, "View name").map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        validate_name(name, "View name")?;
 
         Ok(ViewPath(TableIdent::new(namespace, name.to_string())))
     }
@@ -174,6 +184,7 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::http::Request;
+    use axum::http::StatusCode;
     use axum::routing::get;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -232,16 +243,40 @@ mod tests {
     // Rejection tests — security-relevant input validation
     // ========================================================================
 
+    /// A rejected path answers in the Iceberg error shape, like every other
+    /// error this server produces.
+    ///
+    /// Axum's own path rejection is plain text. A client parses `error.message`
+    /// out of a JSON envelope and gets a parse failure instead — turning "your
+    /// namespace has a `..` in it" into an unhandled client-side error. The body
+    /// extractor was fixed for this and the path extractors were not, which is
+    /// the half a caller reaches by typo rather than by writing wrong code.
+    #[tokio::test]
+    async fn a_rejected_path_answers_in_the_iceberg_error_shape() {
+        let router = test_router();
+        let (status, body) = call(&router, "/v1/namespaces/analytics%1F..").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or_else(|e| panic!("not JSON ({e}): {body}"));
+        assert_eq!(parsed["error"]["code"], 400, "{body}");
+        assert!(
+            parsed["error"]["message"].is_string(),
+            "an error carries a message: {body}"
+        );
+        assert!(
+            parsed["error"]["type"].is_string(),
+            "an error carries a type: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn test_path_traversal_rejected() {
         let router = test_router();
         // URL-encoded ".." = %2E%2E
         let (status, body) = call(&router, "/v1/namespaces/%2E%2E").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(
-            body.contains("traversal") || body.contains("dot"),
-            "body: {body}"
-        );
+        assert!(body.contains("directory"), "body: {body}");
     }
 
     #[tokio::test]
@@ -265,35 +300,31 @@ mod tests {
         assert!(body.contains("control"), "body: {body}");
     }
 
+    /// A path separator inside a segment would place the table somewhere other
+    /// than where the catalog recorded it.
     #[tokio::test]
-    async fn test_windows_reserved_name_rejected() {
+    async fn an_encoded_separator_inside_a_segment_is_rejected() {
         let router = test_router();
-        let (status, body) = call(&router, "/v1/namespaces/CON").await;
+        let (status, body) = call(&router, "/v1/namespaces/my%2Fns").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(
-            body.contains("reserved") || body.contains("Windows"),
-            "body: {body}"
-        );
+        assert!(body.contains("path separator"), "body: {body}");
     }
 
+    /// Names Iceberg permits reach the handler rather than being refused at the
+    /// door. An allowlist narrow enough to reject these protects nothing.
     #[tokio::test]
-    async fn test_hidden_name_rejected() {
+    async fn ordinary_names_other_catalogs_accept_are_not_refused() {
         let router = test_router();
-        let (status, body) = call(&router, "/v1/namespaces/.hidden").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.contains("dot"), "body: {body}");
-    }
-
-    #[tokio::test]
-    async fn test_invalid_chars_rejected() {
-        let router = test_router();
-        // Space in namespace
-        let (status, body) = call(&router, "/v1/namespaces/my%20ns").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(
-            body.contains("invalid") || body.contains("character"),
-            "body: {body}"
-        );
+        for (path, expected) in [
+            ("/v1/namespaces/my%20ns", "my ns"),
+            ("/v1/namespaces/CON", "CON"),
+            ("/v1/namespaces/.hidden", ".hidden"),
+            ("/v1/namespaces/%E5%88%86%E6%9E%90", "分析"),
+        ] {
+            let (status, body) = call(&router, path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(body, expected);
+        }
     }
 
     #[tokio::test]
@@ -302,10 +333,7 @@ mod tests {
         // db + \x1F + ..
         let (status, body) = call(&router, "/v1/namespaces/db%1F%2E%2E").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(
-            body.contains("traversal") || body.contains("dot"),
-            "body: {body}"
-        );
+        assert!(body.contains("directory"), "body: {body}");
     }
 
     #[tokio::test]

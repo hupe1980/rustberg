@@ -9,7 +9,7 @@ use super::namespace::{
     create_namespace, delete_namespace, get_namespace, list_namespaces, namespace_exists,
     update_namespace_properties,
 };
-use super::plan::{cancel_planning, fetch_planning_result, plan_table_scan};
+use super::plan::{cancel_planning, fetch_planning_result, fetch_scan_tasks, plan_table_scan};
 use super::sign::sign_request;
 use super::table::{
     commit_table, commit_transaction, create_table, drop_table, list_tables, load_table,
@@ -75,6 +75,14 @@ pub fn create_routes(app_state: AppState) -> Router {
         .route(
             "/namespaces/{namespace}/tables/{table}/plan/{plan_id}",
             get(fetch_planning_result).delete(cancel_planning),
+        )
+        // `fetchScanTasks`. Never reached by a client following this server's
+        // own responses — it issues no `plan-task` to exchange — but routed so
+        // that one which calls it gets the spec's `NoSuchPlanTaskException`
+        // rather than a router 404 with no Iceberg error body.
+        .route(
+            "/namespaces/{namespace}/tables/{table}/tasks",
+            post(fetch_scan_tasks),
         )
         // Remote signing: the engine holds no credential, and each object
         // request is authorized and signed individually.

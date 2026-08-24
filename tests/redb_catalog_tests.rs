@@ -1483,3 +1483,384 @@ async fn satisfies_the_shared_catalog_contract() {
     })
     .await;
 }
+
+// ============================================================================
+// Ordering
+// ============================================================================
+
+/// The order half of the two-backend conformance claim. `tests/postgres_
+/// catalog_tests.rs::listings_come_back_in_byte_order` asserts the same
+/// sequence against the same names, so a change to either backend's ordering
+/// fails here or there.
+///
+/// redb is a byte-ordered B-tree, so this is what it does by construction.
+/// Postgres has to be told, with `COLLATE "C"` on every key column — without it
+/// a locale collation sorts `Ä` beside `A`, ignores `_` and `-` at the primary
+/// level, and treats U+001F (the namespace-key separator) as invisible.
+#[tokio::test]
+async fn listings_come_back_in_byte_order() {
+    let (catalog, _tmp) = create_test_catalog().await;
+
+    let names = ["Zulu", "_underscore", "aa", "ab", "Ärger", "zz"];
+    for name in names {
+        catalog
+            .create_namespace(&NamespaceIdent::new(name.to_string()), HashMap::new())
+            .await
+            .expect("create namespace");
+    }
+
+    let listed: Vec<String> = catalog
+        .list_namespaces(None, &PageRequest::first(100))
+        .await
+        .expect("list")
+        .into_items()
+        .into_iter()
+        .map(|ns| ns.join("."))
+        .collect();
+
+    let mut expected: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+    expected.sort_unstable();
+
+    assert_eq!(
+        listed, expected,
+        "byte order, the order Postgres must match"
+    );
+}
+
+/// A namespace literally named `a.b` and the nested namespace `a` → `b` are
+/// distinct keys, and both listings must show exactly one of them. The
+/// separator that makes this true is U+001F, which a locale collation would
+/// treat as ignorable — see `PART_SEPARATOR`.
+#[tokio::test]
+async fn a_dotted_name_and_a_nested_namespace_are_distinct() {
+    let (catalog, _tmp) = create_test_catalog().await;
+
+    catalog
+        .create_namespace(&NamespaceIdent::new("a".to_string()), HashMap::new())
+        .await
+        .expect("create a");
+    catalog
+        .create_namespace(
+            &NamespaceIdent::from_vec(vec!["a".into(), "b".into()]).unwrap(),
+            HashMap::new(),
+        )
+        .await
+        .expect("create a.b nested");
+    catalog
+        .create_namespace(&NamespaceIdent::new("a.b".to_string()), HashMap::new())
+        .await
+        .expect("create the single namespace literally named 'a.b'");
+
+    let roots: Vec<String> = catalog
+        .list_namespaces(None, &PageRequest::first(100))
+        .await
+        .expect("list roots")
+        .into_items()
+        .into_iter()
+        .map(|ns| ns.join("\u{1F}"))
+        .collect();
+    assert_eq!(roots, vec!["a".to_string(), "a.b".to_string()]);
+
+    let children = catalog
+        .list_namespaces(
+            Some(&NamespaceIdent::new("a".to_string())),
+            &PageRequest::first(100),
+        )
+        .await
+        .expect("list children")
+        .into_items();
+    assert_eq!(children.len(), 1, "'a.b' is not a child of 'a'");
+}
+
+// ============================================================================
+// Purge stays inside the table
+// ============================================================================
+
+/// A purge deletes the table's own files and leaves a neighbour's alone.
+///
+/// The metadata a purge walks is written by whoever holds a credential for the
+/// table, and a manifest lists data files by path — so "delete everything this
+/// metadata names" is an instruction a caller can partly write. Upstream's
+/// `iceberg::drop_table_data` follows it literally, which is right for a client
+/// deleting its own table with its own credentials and wrong for a catalog
+/// deleting with the *server's* storage role.
+///
+/// This pins the boundary: the table's current metadata file goes, and a file
+/// sitting under a sibling table's prefix does not — even when this table's
+/// metadata points straight at it.
+#[tokio::test]
+async fn purge_deletes_the_tables_own_files_and_not_a_neighbours() {
+    let (catalog, temp_dir) = create_test_catalog().await;
+    let warehouse = temp_dir.path().join("warehouse");
+
+    let namespace = NamespaceIdent::new("purge_ns".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+
+    let victim = catalog
+        .create_table(
+            &namespace,
+            TableCreation::builder()
+                .name("victim".to_string())
+                .schema(test_schema())
+                .build(),
+        )
+        .await
+        .expect("create victim");
+    let doomed = catalog
+        .create_table(
+            &namespace,
+            TableCreation::builder()
+                .name("doomed".to_string())
+                .schema(test_schema())
+                .build(),
+        )
+        .await
+        .expect("create doomed");
+
+    // The neighbour's metadata file: a real file, under a prefix the doomed
+    // table does not own.
+    let victim_metadata = victim
+        .metadata_location()
+        .expect("a created table has a metadata pointer")
+        .to_string();
+    let victim_path = victim_metadata
+        .strip_prefix("file://")
+        .expect("local warehouse")
+        .to_string();
+    assert!(
+        std::path::Path::new(&victim_path).exists(),
+        "the neighbour's metadata should exist before the purge"
+    );
+
+    let doomed_path = doomed
+        .metadata_location()
+        .expect("a created table has a metadata pointer")
+        .strip_prefix("file://")
+        .expect("local warehouse")
+        .to_string();
+
+    // Point the doomed table's *previous metadata* at the neighbour's file. A
+    // purge deletes every entry in `metadata-log`, so an unconfined one would
+    // take the neighbour with it. Reached through the ordinary commit path,
+    // because that is how a caller would reach it.
+    let doomed_ident = TableIdent::new(namespace.clone(), "doomed".to_string());
+    let with_foreign_log = {
+        let mut metadata = serde_json::to_value(doomed.metadata()).expect("metadata to json");
+        metadata["metadata-log"] = serde_json::json!([
+            { "metadata-file": victim_metadata, "timestamp-ms": 1_700_000_000_000i64 }
+        ]);
+        metadata
+    };
+    // Written straight to storage rather than committed: the commit path now
+    // refuses locations outside the table, which is the *other* half of this
+    // defence. This test is about what happens when metadata naming a foreign
+    // file exists anyway — a manifest written by an engine can always do it.
+    std::fs::write(
+        &doomed_path,
+        serde_json::to_vec(&with_foreign_log).expect("serialise"),
+    )
+    .expect("rewrite the doomed table's metadata");
+
+    catalog.purge_table(&doomed_ident).await.expect("purge");
+
+    assert!(
+        !std::path::Path::new(&doomed_path).exists(),
+        "the purged table's own metadata file should be gone"
+    );
+    assert!(
+        std::path::Path::new(&victim_path).exists(),
+        "a purge must not delete a file belonging to another table, even when \
+         the purged table's metadata names it"
+    );
+    assert!(
+        warehouse.exists(),
+        "the warehouse itself is never removed by a purge"
+    );
+}
+
+/// A purge whose metadata names a manifest list that is gone still drops the
+/// table.
+///
+/// The order is forced: the metadata saying which files to delete is reachable
+/// only through the registry entry being removed, so the entry goes first and
+/// the walk follows. Aborting the walk therefore answers `500` for a drop that
+/// already happened, and the retry is told the table does not exist — a table
+/// that cannot be dropped, over a file somebody else removed. The ordinary way
+/// to reach this is a snapshot whose files were expired outside this catalog.
+///
+/// The answer is the one this module already gives a file it may not delete:
+/// leave it as an orphan and warn.
+#[tokio::test]
+async fn a_purge_survives_a_manifest_list_that_is_no_longer_there() {
+    let (catalog, _temp_dir) = create_test_catalog().await;
+
+    let namespace = NamespaceIdent::new("purge_gone".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+
+    let table = catalog
+        .create_table(
+            &namespace,
+            TableCreation::builder()
+                .name("t".to_string())
+                .schema(test_schema())
+                .build(),
+        )
+        .await
+        .expect("create table");
+
+    let metadata_path = table
+        .metadata_location()
+        .expect("a created table has a metadata pointer")
+        .strip_prefix("file://")
+        .expect("local warehouse")
+        .to_string();
+
+    // A snapshot pointing at a manifest list that was never written. Written
+    // straight to storage, because the commit path confines these locations and
+    // this test is about metadata that names a missing file however it got
+    // there.
+    let with_missing_list = {
+        let mut metadata = serde_json::to_value(table.metadata()).expect("metadata to json");
+        let list = format!("{}/metadata/snap-1-gone.avro", table.metadata().location());
+        metadata["snapshots"] = serde_json::json!([{
+            "snapshot-id": 1i64,
+            "sequence-number": 1i64,
+            "timestamp-ms": 1_700_000_000_000i64,
+            "manifest-list": list,
+            "summary": { "operation": "append" },
+            "schema-id": 0
+        }]);
+        metadata["current-snapshot-id"] = serde_json::json!(1i64);
+        metadata["last-sequence-number"] = serde_json::json!(1i64);
+        metadata
+    };
+    std::fs::write(
+        &metadata_path,
+        serde_json::to_vec(&with_missing_list).expect("serialise"),
+    )
+    .expect("rewrite the table's metadata");
+
+    let ident = TableIdent::new(namespace.clone(), "t".to_string());
+    catalog
+        .purge_table(&ident)
+        .await
+        .expect("a purge must not fail over a manifest list it cannot read");
+
+    assert!(
+        !catalog.table_exists(&ident).await.expect("exists"),
+        "the table is dropped even though one of its manifest lists was unreadable"
+    );
+    assert!(
+        !std::path::Path::new(&metadata_path).exists(),
+        "the files the purge *could* account for are still deleted"
+    );
+}
+
+/// A catalog file written by a build with a different schema is refused.
+///
+/// Opening a redb file cannot reshape it, so a relation this build expects is
+/// empty and a record whose shape moved is misread — which surfaces as missing
+/// tables rather than as a schema error. The stamp turns that into one sentence
+/// naming both versions, and it covers every future change rather than the one
+/// somebody remembered to detect.
+#[tokio::test]
+async fn a_catalog_file_from_another_schema_version_is_refused() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let path = temp_dir.path().join("catalog.redb");
+    let warehouse = format!("file://{}/warehouse", temp_dir.path().display());
+
+    // A first open stamps the file and creates a table in it.
+    {
+        let catalog = RedbCatalog::open(&path, warehouse.clone())
+            .await
+            .expect("first open");
+        catalog
+            .create_namespace(&NamespaceIdent::new("ns".to_string()), HashMap::new())
+            .await
+            .expect("create namespace");
+    }
+
+    // Restamp it to a version this build does not read, which is what a file
+    // written by a different build looks like from here.
+    {
+        let db = redb::Database::open(&path).expect("reopen for restamp");
+        let txn = db.begin_write().expect("write txn");
+        {
+            let definition: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("meta");
+            let mut meta = txn.open_table(definition).expect("meta");
+            let encoded = serde_json::to_vec(&9_999u32).expect("encode");
+            meta.insert("schema_version", encoded.as_slice())
+                .expect("restamp");
+        }
+        txn.commit().expect("commit restamp");
+    }
+
+    let err = RedbCatalog::open(&path, warehouse)
+        .await
+        .expect_err("a file this build does not describe must be refused");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("9999") && message.contains("schema"),
+        "the refusal must name both versions so an operator knows what happened, got: \
+         {message}"
+    );
+}
+
+/// `write.data.path` is not a second root, even inside the warehouse.
+///
+/// It looks like the considerate thing to honour — a table that separates data
+/// from metadata would otherwise keep its data after a purge. It is refused
+/// anyway, because a table may point the property anywhere: honouring it lets
+/// one table name another's prefix, and confining it to the *warehouse* does not
+/// help, because the warehouse is where the other tables are.
+#[tokio::test]
+async fn purge_does_not_follow_a_write_path_outside_the_table() {
+    let (catalog, temp_dir) = create_test_catalog().await;
+    let warehouse = temp_dir.path().join("warehouse");
+
+    let namespace = NamespaceIdent::new("wp_ns".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+
+    // A file under a *sibling* prefix inside the warehouse, standing in for
+    // another table's data.
+    let elsewhere = warehouse.join("shared-data");
+    std::fs::create_dir_all(&elsewhere).expect("create the sibling prefix");
+    let foreign = elsewhere.join("someone-elses.parquet");
+    std::fs::write(&foreign, b"not this table's").expect("write");
+
+    catalog
+        .create_table(
+            &namespace,
+            TableCreation::builder()
+                .name("t".to_string())
+                .schema(test_schema())
+                .properties(HashMap::from([(
+                    "write.data.path".to_string(),
+                    format!("file://{}", elsewhere.to_string_lossy()),
+                )]))
+                .build(),
+        )
+        .await
+        .expect("create table");
+
+    catalog
+        .purge_table(&TableIdent::new(namespace, "t".to_string()))
+        .await
+        .expect("purge");
+
+    assert!(
+        foreign.exists(),
+        "a purge must not follow write.data.path outside the table's location, \
+         even when the path is inside the warehouse"
+    );
+}

@@ -2,10 +2,10 @@
 //!
 //! Every handler resolves the same three things before it acts: which tenant owns
 //! the namespace, whether the caller may perform the action, and what obligations
-//! the grant carries. Doing that inline in each handler produced fifteen copies
-//! that had already drifted — some authorized against the caller's own tenant
-//! instead of the recorded owner, some leaked existence through the status code,
-//! some skipped the check for listings entirely.
+//! the grant carries. Inline in each handler that is fifteen copies free to
+//! drift: authorizing against the caller's own tenant instead of the recorded
+//! owner, leaking existence through the status code, skipping the check for
+//! listings entirely.
 //!
 //! # Ownership before authorization
 //!
@@ -100,16 +100,55 @@ pub struct Authorized {
 }
 
 impl Authorized {
-    /// Whether `action` is also permitted on the same resource.
+    /// The resource this request was authorized against, spelled as every audit
+    /// record about it spells it.
     ///
-    /// A denial here is an ordinary answer rather than a security event, so it is
-    /// not audited: the caller is asking on its own behalf to decide how to serve
-    /// a request that was already permitted.
-    pub async fn also_permits(&self, state: &AppState, action: Action) -> bool {
-        state
-            .authorizer
-            .permits(&self.context.for_action(action))
-            .await
+    /// Exposed so a record written *outside* the guard — the credential a
+    /// `loadTable` vended, the signature a `/sign` minted — names the resource
+    /// the same way the decision above it did. Two spellings of one table make
+    /// the trail unjoinable exactly where the join matters.
+    pub fn resource_path(&self) -> String {
+        self.context.resource.path()
+    }
+
+    /// Who the caller is.
+    pub fn principal(&self) -> &Principal {
+        &self.context.principal
+    }
+
+    /// The request facts, for a record written outside the guard.
+    pub fn request(&self) -> &RequestContext {
+        &self.context.request
+    }
+
+    /// Whether `action` is also permitted on the same resource, recorded either
+    /// way.
+    ///
+    /// # Why this records when [`Authorizer::permits`] does not
+    ///
+    /// `permits` answers a question the *server* asks on its own behalf — should
+    /// this row appear in a page, is this resource visible enough that a denial
+    /// can say `403` instead of `404`. Nothing the caller receives gets wider
+    /// either way, and one record per row scanned would bury the rest.
+    ///
+    /// This widens the grant: its answer decides whether a vended credential
+    /// carries `s3:PutObject` and whether a signature covers a `DeleteObjects`.
+    /// Unrecorded, the trail holds a permitted `Read` of a table and no evidence
+    /// of the credential that could overwrite it, so *who could have written
+    /// this file* has no answer in it.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::ServiceUnavailable`] when a permitted mutation could not be
+    /// recorded and the auditor fails closed.
+    ///
+    /// [`Authorizer::permits`]: crate::auth::Authorizer::permits
+    pub async fn also_permits(&self, state: &AppState, action: Action) -> Result<bool> {
+        let context = self.context.for_action(action);
+        let outcome = state.authorizer.decide(&context).await;
+        let allowed = outcome.is_allowed();
+        record_decision(state, &context, &outcome)?;
+        Ok(allowed)
     }
 }
 
@@ -149,7 +188,7 @@ pub async fn authorize(
     let outcome = state.authorizer.decide(&context).await;
     let allowed = outcome.is_allowed();
 
-    record_decision(state, principal, request, &context, &action, &outcome)?;
+    record_decision(state, &context, &outcome)?;
 
     if !allowed {
         // Does the caller have any visibility at all? If not, saying "forbidden"
@@ -186,32 +225,44 @@ pub async fn authorize(
 
 /// Writes the audit record for one decision.
 ///
-/// Mutations fail closed: if the record cannot be written, the request is
-/// refused with `503` rather than performing an unrecorded change. Reads and
-/// listings are recorded best-effort — refusing them because a disk filled turns
-/// an observability problem into an outage, and a lost read record is not a lost
-/// change.
+/// # What fails closed
+///
+/// A *permitted mutation*, and only that: an unrecorded change to the catalog is
+/// exactly the event the audit exists to capture, so losing the record and
+/// keeping the change is the one outcome a governance product cannot offer.
+///
+/// The two exclusions are different arguments. Reads and listings degrade
+/// because refusing them when a disk fills turns an observability problem into
+/// an outage, and a lost read record is not a lost change. A *denied* mutation
+/// degrades because it changed nothing: there is no unrecorded change to refuse,
+/// and `503` would answer a policy question with an availability one — telling a
+/// caller to retry when what it needs is a permit.
 ///
 /// # Errors
 ///
-/// Returns [`AppError::ServiceUnavailable`] when a mutating request could not be
-/// recorded and the auditor is configured to fail closed.
-fn record_decision(
+/// Returns [`AppError::ServiceUnavailable`] when a permitted mutating request
+/// could not be recorded and the auditor is configured to fail closed.
+pub(super) fn record_decision(
     state: &AppState,
-    principal: &Principal,
-    request: &RequestContext,
     context: &AuthzContext,
-    action: &Action,
     outcome: &crate::auth::AuthzOutcome,
 ) -> Result<()> {
-    let mut event = crate::auth::AuditEvent::decision(
-        &action.to_string(),
+    // Read off the context rather than passed alongside it: separate parameters
+    // make it possible to record one context's provenance against another's
+    // principal.
+    let action = &context.action;
+    let event = crate::auth::AuditEvent::decision(
+        // The Cedar spelling, so a record joins to the policy file that
+        // produced it. See `Action::cedar_name`.
+        action.cedar_name(),
         &context.resource.resource_type.to_string(),
         &context.resource.path(),
         outcome.is_allowed(),
     )
-    .with_principal_id(principal.id())
-    .with_tenant_id(principal.tenant_id())
+    .with_principal_id(context.principal.id())
+    .with_tenant_id(context.principal.tenant_id())
+    .with_optional_client_ip(context.request.source_ip)
+    .with_optional_request_id(context.request.request_id.as_deref())
     // Which rule decided, and which policy set it came from. Without these the
     // record says what happened but never why, which is the half an operator
     // actually needs.
@@ -220,14 +271,7 @@ fn record_decision(
         state.authorizer.policy_set_version(),
     );
 
-    if let Some(ip) = request.source_ip {
-        event = event.with_client_ip_addr(ip);
-    }
-    if let Some(id) = request.request_id.as_deref() {
-        event = event.with_request_id(id);
-    }
-
-    if is_mutating(action) {
+    if is_mutating(action) && outcome.is_allowed() {
         state.auditor.record(&event).map_err(|_| {
             AppError::ServiceUnavailable(
                 "The audit trail is unavailable, so this change was not made.".to_string(),
@@ -270,7 +314,7 @@ pub async fn authorize_catalog(
     )
     .with_request(request.clone());
 
-    authorize_context(state, principal, request, context).await
+    authorize_context(state, context).await
 }
 
 /// Authorizes a resource that has no recorded owner yet.
@@ -292,23 +336,17 @@ pub async fn authorize_new(
 ) -> Result<AuthzContext> {
     let context =
         AuthzContext::new(principal.clone(), resource, action).with_request(request.clone());
-    authorize_context(state, principal, request, context).await
+    authorize_context(state, context).await
 }
 
 /// Decides a prepared context, records it, and reports a denial as `403`.
 ///
 /// Used where there is no resource to hide: the caller named its own tenant, so
 /// a denial reveals nothing it did not already supply.
-async fn authorize_context(
-    state: &AppState,
-    principal: &Principal,
-    request: &RequestContext,
-    context: AuthzContext,
-) -> Result<AuthzContext> {
-    let action = context.action.clone();
+async fn authorize_context(state: &AppState, context: AuthzContext) -> Result<AuthzContext> {
     let outcome = state.authorizer.decide(&context).await;
 
-    record_decision(state, principal, request, &context, &action, &outcome)?;
+    record_decision(state, &context, &outcome)?;
 
     match outcome.decision {
         AuthzDecision::Allow => Ok(context),

@@ -126,10 +126,15 @@ curl -H "Authorization: Bearer rb_..." \
 **Check 2: API key validity**
 
 ```bash
-# Check if key was rotated or expired
-# Verify in audit logs
-grep "auth_failure" /var/log/rustberg/audit.jsonl | tail -10
+# Every rejected credential is in the audit trail, with the reason.
+jq -c 'select(.action == "authenticate" and .outcome == "denied")
+       | {time: .timestamp, from: .client_ip, why: .details.reason}' \
+  /var/log/rustberg/audit.jsonl | tail -10
 ```
+
+A request carrying **no** credential is deliberately absent from this: it is an
+unconfigured client rather than a failed authentication, and it answers `401`
+without a record.
 
 **Check 3: JWT configuration**
 
@@ -162,9 +167,14 @@ cedar evaluate \
 
 ```bash
 # Verify tenant_id in JWT/API key matches resource
-# Check audit log for specific denial reason
-grep "authz_deny" /var/log/rustberg/audit.jsonl | tail -10 | jq
+jq -c 'select(.action == "decision" and .outcome == "denied")
+       | {who: .principal_id, tenant: .tenant_id,
+          did: .operation, what: .resource_id, rules: .matched_policies}' \
+  /var/log/rustberg/audit.jsonl | tail -10
 ```
+
+`operation` is spelled the way the policy file spells it, so a denial naming
+`Update` greps straight against `Rustberg::Action::"Update"`.
 
 **Check 3: Role assignment**
 
@@ -282,6 +292,21 @@ du -sh /var/lib/rustberg/*
 
 ## Catalog Issues
 
+### Refuses to start: "schema v… and this binary serves v…"
+
+**Symptom:** startup fails naming two schema versions.
+
+The catalog store was created by a build whose schema differs from this one's.
+Both backends stamp their store — a `rustberg_schema_version` row in Postgres, a
+`meta` entry in the redb file — and refuse one carrying another version.
+
+Point `catalog.url` at a fresh database or file, or drop the `rustberg_*`
+relations and start again. Rustberg is pre-release and ships no migrations.
+
+The check is there because `CREATE TABLE IF NOT EXISTS` cannot reshape an
+existing store: a relation added by a newer build is created empty while the old
+rows stay as they are, which surfaces as tables reporting themselves missing.
+
 ### 404 during an outage
 
 **Symptom:** tables that exist report `404`, and a retry a moment later works.
@@ -296,7 +321,9 @@ something is dropping and recreating it, or a policy is being edited. Check the
 audit stream for the decision, which names the rule:
 
 ```bash
-grep '"decision"' audit.jsonl | tail -20 | jq '{principal_id, resource, decision, matched_policies}'
+jq -c 'select(.action == "decision")
+       | {principal_id, operation, resource_id, outcome, matched_policies}' \
+  audit.jsonl | tail -20
 ```
 
 If instead you are seeing `500`s or `503`s, that *is* the backend — see the
@@ -344,6 +371,22 @@ This is normal behavior with optimistic concurrency. Solutions:
    - Multiple processes updating same table
    - Consider serializing updates
 
+### 409 on a view commit
+
+**Symptom:** `409 CommitFailedException` from `POST …/views/{view}`, saying the
+view was modified concurrently.
+
+Another writer committed between your `loadView` and your commit. Reload and
+re-apply — the same answer a table commit gets.
+
+`assert-view-uuid` does not prevent it: it pins the view's *identity*, catching
+one dropped and recreated under the same name, and every version of a view shares
+a UUID. What prevents the lost update is the pointer swap, which is conditional
+on the metadata location the load returned.
+
+Seeing it constantly on a view nothing else writes usually means two replicas of
+your own job.
+
 ### Namespace Already Exists
 
 **Symptom:** `AlreadyExistsException` when creating namespace.
@@ -356,30 +399,79 @@ curl -H "Authorization: Bearer $API_KEY" \
 # If exists, use it or choose different name
 ```
 
-### "Row filter references non-partition columns"
+### "Row filter references columns this table does not partition on by identity"
 
 **Symptom:** a `WARN` at table load naming a table and some columns.
 
 Not an error — a statement about what your policy can actually enforce. A row
-filter is enforced by withholding files, which only separates rows when the
-filter's columns are partition columns. On a non-partition column, permitted and
-forbidden rows share Parquet row groups and no file-level decision separates
-them.
+filter is enforced by withholding files, which separates rows only when the
+filter's columns are partitioned with an **identity** transform. Otherwise
+permitted and forbidden rows share Parquet row groups and no file-level decision
+separates them.
 
 ```bash
-# Which columns is the table actually partitioned on?
+# Which columns is the table partitioned on, and with which transform?
 curl -H "Authorization: Bearer $API_KEY" \
      http://localhost:8000/v1/namespaces/analytics/tables/events \
   | jq '.metadata."partition-specs"'
 ```
 
-Either partition on the column the filter uses, or accept that this table is
-protected only by Rustberg withholding credentials — an engine with its own
-storage credentials reads it unfiltered. See
+A transformed partition counts as *not* aligned: `days(ts)` holds a whole day in
+one file, so a filter on `ts` still leaves forbidden rows in the files it
+selects. The check is deliberately conservative, so a range filter falling
+exactly on a transform's boundaries is warned about too.
+
+Either partition on the column the filter uses with `identity`, or accept that
+this table is protected only by Rustberg withholding credentials — an engine with
+its own storage credentials reads it unfiltered. See
 [authorization](@/docs/authorization.md#partition-on-the-security-boundary).
 
 The warning appears once per table per policy set; editing your policies makes
 it report again.
+
+### 403 from `planTableScan` naming a policy row filter
+
+**Symptom:** `403 Forbidden`: *"Policy attaches a row filter to this table that
+cannot be applied to it (…). Planning is refused rather than returning files the
+filter was meant to withhold."*
+
+The `@row_filter` on the permit that matched cannot be **bound to this table**.
+Three things cause it, and the message names which:
+
+| In the message | Means |
+|---|---|
+| *"the filter names 'X', which this table has no"* | the column is missing, or spelled differently — check case, and check nested paths are dotted in full |
+| *"a filter literal for a … column must be …"* | the value does not fit the column's type; a date is `"2023-01-01"`, a decimal and a UUID are strings, binary is hex |
+
+A `403` and not a `400`: the request is fine, the *policy* is what does not apply
+here. Refused and not ignored, because widening a restriction removes it —
+`@row_filter("region = 'EU'")` would become "everything" at the moment it was
+supposed to bite. The same term in a filter a **client** sent is widened away,
+where a superset only costs time.
+
+Only those two reach this point. A filter naming a transform, `apply`, a
+field-id reference or an operator this catalog does not read cannot bind against
+*any* table, so it is refused when the policy set **loads** — see below. What is
+left here is the two questions that need a table in hand, and one policy covers
+tables that do not exist yet. If the filter is meant for some tables and not
+others, scope the permit to the namespace subtree they live in.
+
+### Startup fails naming a `@row_filter`
+
+**Symptom:** the server refuses to start: *"policy 'X' has a @row_filter that is
+not a predicate: '…' is not an operator this catalog binds"* — or *"… is a
+transform, a function application or a field id, none of which this catalog can
+bind"*.
+
+The filter is well-formed JSON and is not an expression this catalog can ever
+apply. Usually a typo in the operator (`equals` for `eq`, `greater-than` for
+`gt`), or a term wrapped in a `transform`.
+
+It is a startup failure rather than a warning for the same reason a policy that
+does not typecheck is: the alternative is a policy set that installs cleanly and
+then answers `403` to every `planTableScan` against every table, at whichever
+query happens to hit it first. The [accepted grammar](@/docs/api.md#the-filter)
+is the one the plan endpoint reads.
 
 ### My policy file change did not apply
 
@@ -414,12 +506,15 @@ curl -H "Authorization: Bearer $ADMIN_KEY" \
 | Status | Meaning | Fix |
 |---|---|---|
 | `400`, "not usable" | The Cedar text does not parse or typecheck | Read the message; it names the rule |
-| `400`, "no longer be permitted" | The new rules would leave you unable to change policy again | Include a rule granting yourself `Manage` on the policy set |
+| `400`, "no longer be permitted" | The new rules would leave you unable to change policy again | Include a rule granting yourself `Manage` on the policy set. The check runs against *this* request, so a grant conditioned on `context.source_ip` is judged by the address you are calling from |
 | `403` | You may not administer policy | You need `Manage` on `Rustberg::PolicySet` |
 | `501` | This deployment evaluates no policy | You are running `--no-auth` |
+| `503` | The revision was appended but could not be audited, so it was not put into force | Fix the audit sink and retry; the revision is already in the history |
 
-Nothing is installed when a change is refused, and no revision is appended — the
-previous policy set is untouched.
+Nothing is installed when a change is refused. A `400` or `403` appends no
+revision either, so the previous policy set is untouched; a `503` leaves the
+revision in the history but not enforced, which `GET /management/v1/policies`
+shows as an enforced sequence behind the store's latest.
 
 To undo a change that *was* applied:
 
@@ -449,15 +544,23 @@ into a total one.
 Every audit record names the rule that decided it:
 
 ```bash
-grep '"outcome":"denied"' /var/log/rustberg/audit.jsonl \
-  | jq '{resource: .resource_id, principal: .principal_id,
-         rules: .matched_policies, policies: .policy_set_version}'
+jq -c 'select(.action == "decision" and .outcome == "denied")
+       | {resource: .resource_id, principal: .principal_id, action: .operation,
+          rules: .matched_policies, policies: .policy_set_version}' \
+  /var/log/rustberg/audit.jsonl
 ```
 
 | `matched_policies` | Meaning |
 |---|---|
 | Names one or more policies | An explicit `forbid` matched — go read that rule |
 | Empty or absent | **Deny by default**: nothing forbade it and nothing permitted it. You are missing a `permit` |
+
+A third shape shows up only in the server log, not in the record: an `ERROR`
+saying *"A policy failed to evaluate"*, naming the policy and the reason. That
+policy typechecked at load and raises at run time, and Cedar's own rule is to
+skip such a policy — which would silently drop a `forbid`. Rustberg denies the
+request instead. Fix the named policy; see [When a policy cannot be
+evaluated](@/docs/authorization.md#when-a-policy-cannot-be-evaluated).
 
 If `policy_set_version` differs between records, they were decided under
 different policy files — which on a multi-replica deployment usually means one
@@ -471,6 +574,31 @@ curl -s -H "Authorization: Bearer $ADMIN_KEY" \
 `enforcing` below `latest` means that replica has not converged. If it stays
 behind, it cannot reach the store — look for the warning in *Replicas disagree
 about policy* above.
+
+### Who could have written this file?
+
+A decision record says a caller was permitted to `Read` a table. It does not say
+what it walked away with. The storage-access records do:
+
+```bash
+# Every credential that could write, and who got it.
+jq -c 'select(.action == "vend_credentials" and .operation == "read-write")
+       | {time: .timestamp, who: .principal_id, table: .resource_id}' \
+  /var/log/rustberg/audit.jsonl
+
+# Every signature over a write, and the objects it covered.
+jq -c 'select(.action == "sign_request" and .operation == "write")
+       | {time: .timestamp, who: .principal_id, objects: .details.locations}' \
+  /var/log/rustberg/audit.jsonl
+```
+
+A `vend_credentials` record marks the *start* of a window, not a single access:
+the credential lives until it expires, and the object reads inside that window are
+in the cloud provider's own trail, attributed to the principal because the STS
+session name carries it. A signature is one request, so `sign_request` is exact.
+
+An `outcome` of `denied` on either is worth reading; on a signature,
+`details.locations` names what the caller reached for.
 
 ### A remote (`rest`) mount will not start
 
@@ -513,6 +641,50 @@ An empty list there is the answer. A remote that predates the `endpoints` field
 returns nothing at all, and Rustberg assumes the spec baseline — which includes
 views — rather than hiding views that are there.
 
+### 400 naming a storage location this catalog "keeps elsewhere"
+
+**Symptom:** `400 Bad Request`: *"Storage location '…' is outside
+'<warehouse>/<namespace>/<name>', which is where this catalog keeps this
+resource's files."*
+
+A client-supplied location — the `location` on `createTable` or `createView`,
+the file `registerTable` names, or `set-location` on a commit — points somewhere
+other than the prefix the resource's own name puts it in.
+
+A security boundary rather than a layout rule — see
+[security](@/docs/security.md#the-storage-boundary-is-the-policy-boundary).
+
+| Why it happens | What to do |
+|---|---|
+| A client sends a location it invented rather than one this catalog assigned | Omit `location` and let the catalog assign it — every reference client does |
+| `registerTable` over a lake whose files are not where a name would put them | Set `storage.location_scope = "warehouse"`, having read [what that costs](@/docs/configuration.md#where-a-client-may-put-a-table-s-files) |
+| A table really should move | It may move anywhere *under its own prefix*; elsewhere means creating it there and registering it |
+
+A second, differently-worded refusal comes from the same rule: *"This commit
+names the file '…', which is outside the table's own storage."* That one is
+about `add-snapshot`, `set-statistics` or `set-partition-statistics` naming a
+file the table does not own — a manifest list or Puffin file under some other
+table's prefix. A commit records files the table owns; one it does not own would
+be read by a scan plan and deleted by a purge.
+
+Laying a table out underneath its own prefix is always fine —
+`.../events/data/dt=2024-01-01/` needs nothing configured.
+
+### 409 saying a table already exists, when you created a view
+
+**Symptom:** `409 Conflict`: *"Table already exists: db.events"* from
+`createView`, `renameView`, or the reverse from `createTable`.
+
+A namespace holds one thing per name. Both kinds live at
+`<warehouse>/<namespace>/<name>`, so a table and a view sharing a name would
+share a directory — and `?purgeRequested=true` on the table would delete the
+view's metadata. The spec asks for the same answer on all four of
+`createTable`, `createView`, `renameTable` and `renameView`.
+
+Rename or drop whichever you no longer want, or pick a different name. The error
+names the identifier, not the kind that holds it; `HEAD .../tables/{name}` and
+`HEAD .../views/{name}` say which.
+
 ### A mount refuses an operation with 501
 
 **Symptom:** `501 Not Implemented`: *"Mount 'legacy' does not support writing"*.
@@ -539,12 +711,19 @@ non-atomic version of what Rustberg refuses to do implicitly.
 
 ### `/v1/config` advertises fewer endpoints than expected
 
-**Symptom:** writes work, but `endpoints` lists only `GET` and `HEAD`.
+**Symptom:** writes work, but `endpoints` lists only `GET` and `HEAD`. Or
+`POST …/plan` works and `/plan` is not in the list.
 
 One mount is read-only, and the list is the **intersection** of what every mount
-supports. Those operations still work on the mounts that support them; what the
-intersection governs is only what the catalog promises, because a client
-feature-detects from that list once.
+supports. Those operations still work on the mounts that support them — a
+refusal is decided per request, against the backend the namespace routes to —
+and what the intersection governs is only what the catalog *promises*, because a
+client feature-detects from that list once.
+
+Scan planning is the case that surprises people, because a `rest` mount can
+never plan: its manifests are in storage this server does not manage. One such
+mount removes `/plan` from the list while every native table beside it goes on
+planning normally.
 
 ```bash
 curl -s localhost:8000/v1/config | jq '.endpoints'
@@ -620,8 +799,8 @@ not a dot.
 
 ### Storage location is outside the warehouse
 
-**Symptom:** `400 Bad Request` on `createTable`, `createView` or
-`registerTable`: *"Storage location '…' is outside this catalog's warehouse"*.
+**Symptom:** `400 Bad Request` on `createTable`, `createView`, `registerTable`
+**or a commit**: *"Storage location '…' is outside this catalog's warehouse"*.
 
 A catalog only manages locations inside its own warehouse, because the
 credentials it vends are scoped to them. Check what the warehouse actually is:
@@ -639,9 +818,42 @@ Common causes:
 | A different bucket, or a typo in it | Correct the location |
 | A sibling prefix — `s3://bucket/wh-2` against warehouse `s3://bucket/wh` | These are different prefixes; containment is segment-wise, not textual |
 | The metadata file's own `location` field points elsewhere | The file's path is checked *and* the `location` it declares; both must be inside |
+| A **commit** carrying a path | `set-location`, `add-snapshot` (manifest list), `set-statistics` and `set-partition-statistics` (Puffin files) all name a location, and all four are checked |
 
 To serve a location genuinely outside, widen `storage.warehouse_location` — but
 note it also widens what credential vending may be scoped to.
+
+**Why a commit is checked at all.** Storage access is scoped to *the table's
+location*, so a caller able to move a table can point it at another tenant's
+prefix in the same warehouse and be correctly credentialed — for the location it
+chose. Nothing else about the request would look wrong. Engines do not hit this
+in normal operation: PyIceberg, Spark and Trino all write manifest lists and
+Puffin files under the table they belong to.
+
+### A purge left files behind
+
+**Symptom:** a `WARN` after `DELETE …?purgeRequested=true`: *"A purge skipped
+files outside the table's own storage"*, and the named files are still there.
+
+A purge deletes only what lives under the table's own `location`. Anything else
+the metadata names is skipped and logged by path.
+
+Two causes, and they want different responses:
+
+- **The table sets `write.data.path` or `write.metadata.path` outside its
+  location.** A second warning names the property. Delete the files yourself, or
+  write data under the table's location so a purge covers it. Honouring the
+  property would let one table name another's prefix, and confining it to the
+  warehouse does not help — the warehouse is where the other tables are.
+- **A manifest names a file the table does not own.** Manifests are written by
+  the engine and are the one set of paths a catalog cannot check on commit.
+  Deleting them would let a caller destroy another table's data by dropping its
+  own. Remove them by hand once you have confirmed what they are.
+
+- **A manifest could not be read.** A separate warning, *"A purge could not read
+  every manifest this table referenced"*: the data files it names were not
+  enumerated, so they were left. Usually a snapshot expired outside this catalog.
+  If it names *every* manifest, check the catalog's read access to its warehouse.
 
 ### 501 on the credentials endpoint
 
@@ -650,6 +862,20 @@ storage location …"*.
 
 Almost always: no `[credentials]` section is configured, which is the default.
 Add one — see [configuration](@/docs/configuration.md#credentials).
+
+While no provider covers this catalog's warehouses, the endpoint is also absent
+from `/v1/config`, so a client that feature-detects will not call it — a `501`
+here means something called it anyway:
+
+```bash
+curl -s localhost:8000/v1/config | jq '.endpoints[] | select(endswith("credentials"))'
+```
+
+Nothing there and a `501` from the endpoint are the same fact stated twice. It is
+advertised only when the provider covers **every** warehouse the catalog serves,
+so a federated deployment whose mount points at a bucket the provider does not
+know about drops the advertisement for all of them while continuing to vend where
+it can.
 
 If a section *is* configured, the server would have refused to start, so check
 that the running process actually loaded the file you edited:
@@ -680,6 +906,26 @@ A `403` naming the table location usually means `url_style` is wrong for your
 endpoint: the bucket is read from the wrong part of the URI, so containment does
 not match the table. That failure direction is deliberate — a mis-read bucket is
 refused rather than signed.
+
+A `400` naming an operation means the request is not one this endpoint signs.
+Object access, multipart upload, `DeleteObjects` and `ListObjectsV2` are signed;
+sub-resources that change who may reach an object (`?acl`, `?tagging`,
+`?retention`, …) and access-granting headers (`x-amz-acl`, `x-amz-grant-*`) are
+not. A `x-amz-copy-source` pointing outside the table is a `403` like any other
+location outside it.
+
+A `400` naming a **repeated query parameter** means the URI sent the same
+parameter twice. Which value S3 acts on is not specified, so the one this
+endpoint checked would not necessarily be the one that takes effect — for
+`prefix` on a listing that is the difference between one table and the whole
+bucket. No AWS SDK emits a duplicate key, so this is worth reading as a bug in
+whatever built the URI.
+
+**`SignatureDoesNotMatch` from S3, on a request this endpoint signed.** Send the
+`uri` from the response, not the one you asked about: the endpoint resolves the
+URI, checks containment against the resolved form, and signs that. The two differ
+whenever the URI carries a `.` or `..` segment, a backslash, or an escape written
+differently. PyIceberg and the Java `S3V4RestSignerClient` already use it.
 
 ### The server stops responding under load
 
@@ -855,7 +1101,8 @@ level = "debug"
 # Liveness
 curl http://localhost:8000/health
 
-# Readiness (includes storage health)
+# Readiness — catalog and storage, the two things that can be unreachable.
+# Cached for two seconds, so probing harder does not probe more.
 curl http://localhost:8000/ready
 
 # Metrics

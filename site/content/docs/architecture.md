@@ -531,7 +531,7 @@ catalog.
 ```mermaid
 graph TB
     subgraph Layers["Defense in Depth"]
-        L1[Network Security<br/>TLS 1.3]
+        L1[Network Security<br/>TLS 1.2/1.3]
         L2[Authentication<br/>OIDC/JWT, API keys]
         L3[Authorization<br/>Cedar ABAC]
         L4[Audit logging<br/>Structured events]

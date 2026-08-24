@@ -12,7 +12,7 @@ catalog your organisation owns — a single Rust binary, and an embeddable crate
 [API reference](https://hupe1980.github.io/rustberg/docs/api/) ·
 [Security](https://hupe1980.github.io/rustberg/docs/security/)
 
-<img src="https://img.shields.io/badge/tests-904%20%2B%2069%20client-brightgreen" alt="904 Rust tests, 69 client conformance tests">
+<img src="https://img.shields.io/badge/tests-1073%20%2B%2070%20client-brightgreen" alt="1073 Rust tests, 70 client conformance tests">
 <img src="https://img.shields.io/badge/unsafe-forbidden-brightgreen" alt="unsafe forbidden">
 <img src="https://img.shields.io/badge/binary-~24%20MB-blue" alt="~24 MB binary">
 <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="Apache 2.0">
@@ -89,8 +89,11 @@ ends up holding real metadata.
 <summary><strong>🐳 Docker, Helm, and building from source</strong></summary>
 
 ```bash
-# Docker — take the key from the startup log
+# Docker — take the key from the startup log. `-v` because the image's catalog
+# lives in a declared volume; without one it works and is discarded with the
+# container.
 docker run -d -p 8000:8000 --name rustberg \
+  -v rustberg-data:/var/lib/rustberg \
   -e RUSTBERG_INSECURE_HTTP=true ghcr.io/hupe1980/rustberg:latest
 docker logs rustberg 2>&1 | grep X-API-Key
 
@@ -122,14 +125,40 @@ decision correct, fast and auditable.
   credential scoped to one table prefix — STS session policies, GCS credential
   access boundaries, Azure user-delegation SAS, each a real downscoping exchange.
   Or hand the engine *nothing* and sign every object request, so a revoked grant
-  takes effect on the next read rather than at the next expiry.
+  takes effect on the next read rather than at the next expiry. A signature is
+  confined by *every* location the request touches — a `DeleteObjects` body, a
+  list prefix in the query string, a copy source in a header — and to an
+  allowlist of operations, because `PUT …/f.parquet?acl` is inside the table and
+  publishes it to the internet.
+- **The storage boundary is the policy boundary.** A grant is written over the
+  namespace tree; storage access is scoped to a path. Those are one hierarchy
+  only while a table's files stay where its name puts them — so a
+  client-supplied location is confined to `<warehouse>/<namespace>/<name>`, on
+  `createTable`, `registerTable` and `set-location` alike. Otherwise a caller
+  permitted to write *one* table can point it at a prefix its policy never
+  mentioned and be handed a correctly-scoped credential for it.
+- **Identity by naming your provider.** OIDC issuer and audiences; signing keys
+  discovered from the issuer's own metadata, whose `issuer` is checked before it
+  is believed. RS256, ES256 and EdDSA, chosen by configuration rather than by the
+  token, and no `HS*` against a JWKS. API keys stay configuration, not stored
+  state.
 - **Scan planning that knows the policy.** `planTableScan` conjoins a permit's
   `@row_filter` with the client's own, so a restricted caller is told about fewer
   files. A filter this catalog cannot bind is *widened*, never dropped — pruning
-  against a predicate nobody wrote returns too few files.
-- **The audit trail is a deliverable.** Every decision names the policy that made
-  it and the version of the policy set it came from. When the sink fails,
-  mutating requests fail with it.
+  against a predicate nobody wrote returns too few files. A *policy* filter
+  inverts that and is refused instead, at the moment the policy set loads, since
+  a widened restriction is no restriction.
+- **The audit trail is a deliverable.** Authentication, decisions, credential
+  vending, request signing and rate limiting go to one sink. Every decision names
+  the policy that made it and the version of the policy set it came from; every
+  grant of storage access says whether the credential could *write* and which
+  objects a signature covered. When the sink fails, a permitted mutation fails
+  with it — including a policy change, which is recorded before it is installed
+  so that failing is honest.
+- **Deletion protection.** `rustberg.protected = "true"` on a table, view or
+  namespace refuses a drop or purge with `409` until it is cleared. A guard
+  against the `DROP TABLE` typed at the wrong catalog, not against an adversary —
+  for that, write a `forbid`.
 - **Federation under one identity.** Mount several catalogs — your own, or
   somebody else's Iceberg REST catalog — routed by top-level namespace. The mount
   is invisible on the wire, so a cross-catalog join is ordinary SQL.
@@ -203,10 +232,21 @@ partial success.
 - **A table under a row filter or column mask is refused a credential and a
   signature** rather than handed prefix-wide access. Planning still applies the
   filter, but a plan is advice: nothing makes an unplanned file unfetchable, so
-  this is selection rather than enforcement against a hostile engine.
+  this is selection rather than enforcement against a hostile engine. A filter is
+  real enforcement only where the column is partitioned with an **identity**
+  transform — `days(ts)` and `bucket(16, id)` put permitted and forbidden rows in
+  the same file — and Rustberg warns at table load when it is not.
 - **Asynchronous and incremental scan planning** are not implemented. Every plan
   is answered inline, and an incremental scan is declined with `501` rather than
   answered as a full one.
+- **Table maintenance — compaction, orphan-file cleanup, manifest rewriting —
+  is not built, and will not be.** It is data rewriting, which would put a
+  catalog in the data path. Apache Polaris settled the same question the same
+  way and delegates to an external maintenance system; Lakekeeper emits events
+  for one to react to. The metadata half already works here: `expireSnapshots`
+  and statistics removal arrive as ordinary table updates, and
+  `?purgeRequested=true` deletes the files a dropped table referenced — with a
+  compare-and-swap commit, a policy decision and an audit record each time.
 - **Glue, Hive Metastore and S3 Tables** mounts are not built. `native` (redb,
   Postgres) and `rest` are.
 - **SQL UDFs** (`…/namespaces/{ns}/functions`) are not built.

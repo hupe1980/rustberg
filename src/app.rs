@@ -26,6 +26,98 @@ use crate::observability::metrics::MetricsRegistry;
 use crate::utils::temp_path;
 
 // ============================================================================
+// Error shape
+// ============================================================================
+
+/// Gives an error produced *below* the handlers the same envelope they use.
+///
+/// # Why this is a layer and not a fallback
+///
+/// The Iceberg REST spec defines every error as
+/// `{"error": {"message", "type", "code"}}`, and this server's own errors —
+/// [`AppError`](crate::error::AppError) — are already that shape. The ones that
+/// are not come from *underneath* the handlers, where nothing knows about
+/// Iceberg: the router answering `404` for an unrouted path or `405` for the
+/// wrong method, the body-limit layer answering `413`, the timeout layer
+/// answering `408`. Each of those sends a bare status with an empty body.
+///
+/// A client reads `error.message` out of JSON. Given an empty body it reports a
+/// parse failure, so "you sent a `PUT` where this endpoint takes `POST`" arrives
+/// as an unhandled client-side error.
+///
+/// A router fallback would cover the router's two cases and none of the layers'.
+/// Sitting outermost covers whatever any of them produced, including layers
+/// added later.
+///
+/// # Only a body-less response is filled in
+///
+/// Presence of `Content-Type` is what distinguishes the two, and it is exact
+/// rather than a heuristic: everything this server writes deliberately sets one —
+/// `AppError` sets `application/json`, `/health` and `/ready` their own JSON,
+/// `/metrics` the Prometheus text type — and the bare statuses a router or a
+/// tower layer produces set none, because they have nothing to describe. So a
+/// response that already says what it is passes through untouched.
+async fn iceberg_error_envelope(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::body::Body;
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+
+    let response = next.run(request).await;
+    let status = response.status();
+
+    if !status.is_client_error() && !status.is_server_error() {
+        return response;
+    }
+    if response.headers().contains_key(header::CONTENT_TYPE) {
+        return response;
+    }
+
+    // Named from the status, because that is all there is to go on: the layer
+    // that produced it is gone by now. The message says what the caller can do
+    // about it, which for the two router cases means pointing at the list that
+    // answers "what does this server serve".
+    let (error_type, message) = match status {
+        StatusCode::NOT_FOUND => (
+            crate::error::NOT_FOUND_TYPE,
+            "This path is not part of this catalog's API. `GET /v1/config` lists the \
+             endpoints this server implements.",
+        ),
+        StatusCode::METHOD_NOT_ALLOWED => (
+            crate::error::METHOD_NOT_ALLOWED_TYPE,
+            "This path exists but does not accept that method. `GET /v1/config` lists \
+             each endpoint with the verb it takes.",
+        ),
+        StatusCode::PAYLOAD_TOO_LARGE => (
+            "BadRequestException",
+            "The request body is larger than this catalog accepts.",
+        ),
+        StatusCode::REQUEST_TIMEOUT => (
+            "ServiceUnavailableException",
+            "The request took longer than this catalog allows. Retrying is reasonable.",
+        ),
+        _ => ("InternalServerError", "The request could not be served."),
+    };
+
+    let body = serde_json::json!({
+        "error": { "message": message, "type": error_type, "code": status.as_u16() }
+    });
+
+    // The original headers are kept — a request id, the security headers, the
+    // CORS headers a browser needs to *read* this error at all — and only the
+    // body and its content type are replaced.
+    let (mut parts, _) = response.into_parts();
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    (parts, Body::from(body.to_string())).into_response()
+}
+
+// ============================================================================
 // App State
 // ============================================================================
 
@@ -34,9 +126,9 @@ use crate::utils::temp_path;
 /// A newtype rather than a `String`, and deliberately without `Display` or
 /// `Deref`, so it cannot be passed anywhere a warehouse is expected. Under
 /// federation there is no such thing as *the* warehouse — each mount has its
-/// own — and reaching for this one has twice produced a bug that compiled
-/// perfectly: once checking a client-supplied location against the wrong
-/// warehouse, once building a view's default location in it.
+/// own — and reaching for this one compiles perfectly while checking a
+/// client-supplied location against the wrong warehouse, or building a view's
+/// default location in it.
 ///
 /// The two accessors name the only situations where "this server's own" is the
 /// right question. Anything else wants [`AppState::warehouse_for`], and now has
@@ -112,8 +204,27 @@ pub struct AppState {
     pub request_signer: Arc<dyn crate::credentials::RequestSigner>,
     /// How the sign endpoint reads storage addresses, and whether it is served.
     pub signing: crate::catalog::v1::sign::SigningEndpointConfig,
+    /// Whether `GET …/tables/{table}/credentials` can succeed anywhere in this
+    /// catalog.
+    ///
+    /// True only when the credential provider covers **every** warehouse this
+    /// server serves, because `endpoints` in the config response is one list
+    /// describing one catalog and a client feature-detects from it once — the
+    /// same intersection rule [`Capabilities`] follows across mounts.
+    ///
+    /// It gates advertisement only. The endpoint stays routed and still answers
+    /// per request, so a deployment whose provider covers some warehouses and
+    /// not others keeps working on the ones it covers; what it stops doing is
+    /// *promising* an endpoint that fails on the rest.
+    ///
+    /// [`Capabilities`]: crate::catalog::Capabilities
+    pub vending: bool,
     /// Rate limiter for protecting against DoS and brute-force attacks.
     pub rate_limiter: Arc<RateLimiter>,
+    /// How the caller's address is worked out from the connection and its
+    /// forwarding headers. One answer, read by rate limiting, by
+    /// `context.source_ip`, and by the audit trail.
+    pub remote_ip: crate::remote_ip::RemoteIp,
     /// Idempotency cache for preventing duplicate request processing.
     pub idempotency_cache: Arc<IdempotencyCache>,
     /// Prometheus metrics registry for observability.
@@ -138,8 +249,24 @@ pub struct AppState {
     pub oauth2_server_uri: Option<String>,
     /// Runtime policy administration, when this deployment evaluates policy.
     pub policy_admin: Option<PolicyAdmin>,
-    /// What every mount supports, which is what `/v1/config` advertises.
+    /// What every mount supports: the **intersection**, and the only thing
+    /// `/v1/config` may honestly advertise.
+    ///
+    /// **Not what a handler refuses on.** A refusal is per-request, so the set
+    /// that governs one is
+    /// [`CatalogStore::capabilities_for`](crate::catalog::CatalogStore::capabilities_for)
+    /// for the namespace being addressed. Reading this instead compiles, is one
+    /// line shorter, and makes a single read-only `rest` mount switch an
+    /// operation off for every native table in the catalog — which is the
+    /// opposite of what the intersection rule promises.
     pub capabilities: crate::catalog::Capabilities,
+    /// How far inside the warehouse a client may put a resource's files.
+    ///
+    /// Read through [`location_bound`](Self::location_bound), never directly:
+    /// the scope is half the rule and the warehouse governing the namespace is
+    /// the other half, and a caller that assembled them itself would be a second
+    /// place for the two to disagree.
+    pub location_scope: crate::location::LocationScope,
 }
 
 impl AppState {
@@ -158,6 +285,73 @@ impl AppState {
             .warehouse_for(namespace)
             .await
             .unwrap_or_else(|| self.default_warehouse.as_fallback().to_string())
+    }
+
+    /// The prefix a client-supplied location for `name` in `namespace` must sit
+    /// inside.
+    ///
+    /// The single entry point for every location a request carries: the
+    /// `location` on `createTable` and `createView`, the four a `commitTable`
+    /// carries, the one a `commitView` does, and the location a registered
+    /// metadata document declares. One value, built once per request, so those
+    /// callers cannot each decide the rule for themselves.
+    ///
+    /// See [`LocationScope`](crate::location::LocationScope) for what the bound
+    /// is and why its default is the tight one.
+    pub async fn location_bound(
+        &self,
+        namespace: &iceberg::NamespaceIdent,
+        name: &str,
+    ) -> crate::location::LocationBound {
+        let warehouse = self.warehouse_for(namespace).await;
+        // Routed, because a mount lays out the namespace it holds without the
+        // mount name this server addresses it by. A backend that stores nothing
+        // — a `rest` mount — answers `None`, and this server's own layout is the
+        // honest fallback: such a mount refuses every write on capability
+        // grounds long before a location reaches a check.
+        let prefix = self
+            .catalog
+            .namespace_prefix_for(namespace)
+            .unwrap_or_else(|| crate::location::namespace_prefix(&warehouse, namespace.as_ref()));
+
+        crate::location::LocationBound::new(self.location_scope, &warehouse, &prefix, name)
+    }
+
+    /// Whether `location` is storage this server manages **for this namespace**.
+    ///
+    /// # Why the question is per-namespace and not per-server
+    ///
+    /// Storage access — a vended credential, a signed request — is scoped to a
+    /// table's `location`, and that location is whatever the catalog holding the
+    /// table reported. For the native catalog that is this server's own record.
+    /// For a **mount** it is somebody else's catalog, which §7 treats as
+    /// untrusted input because it sits on the request path of every call into
+    /// its subtree.
+    ///
+    /// Asking only "is this inside *a* warehouse I manage" is not enough, and the
+    /// gap is exactly the confused deputy one layer out: a remote that reported a
+    /// table whose location points into **this** server's warehouse would have a
+    /// credential minted for it, scoped to another tenant's prefix, for a caller
+    /// who only ever had `Read` on the mount. The union of managed warehouses
+    /// passes that; the warehouse governing *that namespace* does not.
+    ///
+    /// # A namespace with no declared warehouse gets nothing
+    ///
+    /// [`Self::warehouse_for`] falls back to this server's own warehouse, which
+    /// is right for building a default location and wrong here — the fallback is
+    /// the whole hole. A `rest` mount stores nothing and declares no warehouse,
+    /// so the honest answer for its tables is that this server manages none of
+    /// their storage, which is also what §8.2 already says about signing for a
+    /// mount.
+    pub async fn manages_storage_for(
+        &self,
+        namespace: &iceberg::NamespaceIdent,
+        location: &str,
+    ) -> bool {
+        self.catalog
+            .warehouse_for(namespace)
+            .await
+            .is_some_and(|warehouse| crate::location::is_within(&warehouse, location))
     }
 
     /// Returns the default tenant ID.
@@ -216,10 +410,15 @@ impl App {
         use tower_http::set_header::SetResponseHeaderLayer;
         use tower_http::timeout::TimeoutLayer;
 
+        // The middleware writes through the *same* auditor the catalog guard
+        // does. One trail: a deployment must not have to read two files to
+        // learn who authenticated and what they were then allowed to do.
         let auth_state = AuthState::with_rate_limiter(
             self.app_state.authenticator.clone(),
             self.app_state.rate_limiter.clone(),
-        );
+        )
+        .with_remote_ip(self.app_state.remote_ip.clone())
+        .with_auditor(self.app_state.auditor.clone());
 
         let catalog_routes = catalog::create_routes(self.app_state.clone());
         let config_routes = config::create_routes(self.app_state.clone());
@@ -319,6 +518,13 @@ impl App {
             // Request ID propagation for distributed tracing
             .layer(PropagateRequestIdLayer::new(x_request_id.clone()))
             .layer(SetRequestIdLayer::new(x_request_id, MakeRequestUuid))
+            // Outside `SetRequestIdLayer`, which leaves an existing header alone
+            // and only mints when there is none. An inbound id this server will
+            // not carry is removed here so a fresh one is minted — otherwise the
+            // response echoes the caller's and the audit record names nothing,
+            // and a caller could unjoin its own requests from the trail by
+            // sending a two-kilobyte request id.
+            .layer(middleware::from_fn(crate::auth::strip_unusable_request_id))
             // Response compression (gzip, deflate, br)
             .layer(CompressionLayer::new())
             // Security headers (applied to all responses)
@@ -332,6 +538,8 @@ impl App {
                     .make_span_with(trace::DefaultMakeSpan::new().level(Level::INFO))
                     .on_response(trace::DefaultOnResponse::new().level(Level::INFO)),
             )
+            // Outermost, so it sees what every layer beneath it produced.
+            .layer(middleware::from_fn(iceberg_error_envelope))
     }
 
     /// Builds the CORS layer from the configuration.
@@ -419,14 +627,29 @@ impl App {
 
 /// Builds the Cedar authorizer from an optional policy source.
 ///
-/// Panics on invalid policies: serving with an authorization policy the operator
-/// believes is active but which does not typecheck is strictly worse than
-/// refusing to start.
-fn build_authorizer(policies: Option<&str>) -> CedarAuthorizer {
-    match policies {
-        Some(src) => CedarAuthorizer::new(src).expect("Cedar policies must validate"),
-        None => CedarAuthorizer::with_default_policies().expect("default policies must validate"),
-    }
+/// # Errors
+///
+/// [`AppError::Internal`] carrying Cedar's own diagnostic when the policies do
+/// not parse, do not typecheck, or carry a `@row_filter` that is not a
+/// predicate. Serving with an authorization policy the operator believes is
+/// active but which does not validate is strictly worse than refusing to start.
+///
+/// It refuses by *returning* rather than by panicking. `build()` is fallible and
+/// `async`, so a panic would reach an embedding host as a thread unwinding out of
+/// a future, with Cedar's message — the one naming the line and the reason —
+/// flattened into a panic payload. For a validation error the report is most of
+/// the value.
+fn build_authorizer(policies: Option<&str>) -> Result<CedarAuthorizer, crate::error::AppError> {
+    let built = match policies {
+        Some(source) => CedarAuthorizer::new(source),
+        None => CedarAuthorizer::with_default_policies(),
+    };
+
+    built.map_err(|e| {
+        crate::error::AppError::Internal(format!(
+            "The authorization policies do not validate, so this catalog will not start: {e}"
+        ))
+    })
 }
 
 // ============================================================================
@@ -438,11 +661,13 @@ fn build_authorizer(policies: Option<&str>) -> CedarAuthorizer {
 pub struct AppBuilder {
     catalog: Option<Arc<dyn CatalogStore>>,
     warehouse_location: Option<String>,
+    location_scope: crate::location::LocationScope,
     authenticator: Option<Arc<dyn Authenticator>>,
     authorizer: Option<Arc<dyn Authorizer>>,
     credential_provider: Option<Arc<dyn StorageCredentialProvider>>,
     request_signer: Option<Arc<dyn crate::credentials::RequestSigner>>,
     rate_limit_config: Option<RateLimitConfig>,
+    trusted_proxies: Vec<String>,
     idempotency_ttl: Option<Duration>,
     default_tenant_id: Option<String>,
     enable_auth: bool,
@@ -477,6 +702,16 @@ impl AppBuilder {
     /// Sets the warehouse location for table storage.
     pub fn with_warehouse_location<S: Into<String>>(mut self, location: S) -> Self {
         self.warehouse_location = Some(location.into());
+        self
+    }
+
+    /// Sets how far inside the warehouse a client may put a resource's files.
+    ///
+    /// Defaults to [`LocationScope::Table`](crate::location::LocationScope::Table),
+    /// which is what keeps a location-scoped credential a faithful enforcement
+    /// of a namespace-scoped grant. Read that type before widening it.
+    pub fn with_location_scope(mut self, scope: crate::location::LocationScope) -> Self {
+        self.location_scope = scope;
         self
     }
 
@@ -557,6 +792,21 @@ impl AppBuilder {
     /// Sets rate limiting configuration.
     ///
     /// Use this to configure per-IP and per-tenant rate limits.
+    /// Trusts the given address ranges as forwarding infrastructure.
+    ///
+    /// Without this, the caller's address is always the TCP peer and
+    /// `X-Forwarded-For` is ignored — the only correct default for a server
+    /// that may be exposed directly. See [`crate::remote_ip`] for why the chain
+    /// is walked from the right rather than read from the left.
+    pub fn with_trusted_proxies<I, S>(mut self, ranges: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.trusted_proxies = ranges.into_iter().map(Into::into).collect();
+        self
+    }
+
     pub fn with_rate_limit_config(mut self, config: RateLimitConfig) -> Self {
         self.rate_limit_config = Some(config);
         self
@@ -708,6 +958,7 @@ impl AppBuilder {
     async fn create_all_stores(
         catalog_url: Option<&str>,
         warehouse_location: &str,
+        location_scope: crate::location::LocationScope,
     ) -> Result<
         (
             Arc<dyn CatalogStore>,
@@ -729,7 +980,8 @@ impl AppBuilder {
                     crate::error::AppError::Internal(format!(
                         "Failed to open Postgres catalog: {e}"
                     ))
-                })?;
+                })?
+                .with_location_scope(location_scope);
             // One handle serving all three traits, so a deployment has one
             // database to configure, back up and make durable.
             let catalog = Arc::new(catalog);
@@ -772,7 +1024,8 @@ impl AppBuilder {
             .await
             .map_err(|e| {
                 crate::error::AppError::Internal(format!("Failed to open redb catalog: {e}"))
-            })?;
+            })?
+            .with_location_scope(location_scope);
 
         let catalog = Arc::new(catalog);
         // No shared idempotency store: redb takes an exclusive file lock, so a
@@ -799,6 +1052,7 @@ impl AppBuilder {
     pub async fn build_mount(
         name: &str,
         config: &crate::config::server_config::MountConfig,
+        location_scope: crate::location::LocationScope,
     ) -> Result<crate::catalog::Mount, crate::error::AppError> {
         use crate::catalog::{Capabilities, Mount};
 
@@ -808,6 +1062,7 @@ impl AppBuilder {
                     let (store, _policy, _idempotency) = Self::create_all_stores(
                         Some(&config.catalog_url),
                         &config.warehouse_location,
+                        location_scope,
                     )
                     .await
                     .map_err(|e| {
@@ -819,8 +1074,15 @@ impl AppBuilder {
                     // A read-only native mount is refused every mutation rather than
                     // trusted not to attempt one. The point of the flag is that
                     // another system owns that catalog.
+                    //
+                    // `read_only_native`, not `read_only`: the second is the
+                    // preset for a mount over somebody else's *catalog*, and the
+                    // one field they differ on — scan planning — is false there
+                    // because the manifests are in storage this server does not
+                    // manage. That is not true of a local catalog somebody else
+                    // writes to, and planning is a read.
                     let capabilities = if config.read_only {
-                        Capabilities::read_only()
+                        Capabilities::read_only_native()
                     } else {
                         Capabilities::full()
                     };
@@ -1033,7 +1295,12 @@ impl AppBuilder {
         let (catalog, opened_policy_store, shared_idempotency) = match self.catalog {
             Some(catalog) => (catalog, None, None),
             None => {
-                Self::create_all_stores(self.catalog_url.as_deref(), &warehouse_location).await?
+                Self::create_all_stores(
+                    self.catalog_url.as_deref(),
+                    &warehouse_location,
+                    self.location_scope,
+                )
+                .await?
             }
         };
         let policy_store = self.policy_store.or(opened_policy_store);
@@ -1130,13 +1397,18 @@ impl AppBuilder {
                 // Cedar without a store: policy is whatever was configured,
                 // and changing it is a restart.
                 None => (
-                    Arc::new(build_authorizer(self.policies.as_deref())) as Arc<dyn Authorizer>,
+                    Arc::new(build_authorizer(self.policies.as_deref())?) as Arc<dyn Authorizer>,
                     None,
                 ),
             },
             // Unauthenticated development mode.
             None => (Arc::new(AllowAllAuthorizer), None),
         };
+
+        // Parsed here rather than at first use: a range nobody can read is a
+        // startup failure, because the alternative is attributing every request
+        // to the proxy's own address and looking like working software.
+        let remote_ip = crate::remote_ip::RemoteIp::behind(&self.trusted_proxies)?;
 
         let rate_limiter = Arc::new(RateLimiter::new(self.rate_limit_config.unwrap_or_else(
             || {
@@ -1193,6 +1465,15 @@ impl AppBuilder {
             fallback_region: signing_config.region.clone(),
         };
 
+        // Advertised only where it works everywhere — see `AppState::vending`.
+        // A provider that covers no warehouse at all is the ordinary
+        // uncredentialed deployment, and `all` over an empty list would call
+        // that one supported.
+        let vending = !managed_warehouses.is_empty()
+            && managed_warehouses
+                .iter()
+                .all(|warehouse| credential_provider.supports_location(warehouse));
+
         let app_state = AppState {
             authenticator,
             authorizer,
@@ -1200,7 +1481,9 @@ impl AppBuilder {
             credential_provider,
             request_signer,
             signing,
+            vending,
             rate_limiter,
+            remote_ip,
             idempotency_cache: Arc::new({
                 let cache = IdempotencyCache::new(
                     self.idempotency_ttl.unwrap_or(crate::catalog::DEFAULT_TTL),
@@ -1215,6 +1498,7 @@ impl AppBuilder {
                 .auditor
                 .unwrap_or_else(|| Arc::new(crate::auth::Auditor::disabled())),
             default_warehouse: DefaultWarehouse::new(warehouse_location),
+            location_scope: self.location_scope,
             default_tenant_id,
             oauth2_server_uri: self.oauth2_server_uri,
             policy_admin,
@@ -1261,8 +1545,8 @@ mod tests {
     fn jwt_config() -> crate::auth::JwtConfig {
         crate::auth::JwtConfig {
             issuer: "https://issuer.example.com".to_string(),
-            audience: "rustberg-api".to_string(),
-            jwks_url: "https://issuer.example.com/.well-known/jwks.json".to_string(),
+            audiences: vec!["rustberg-api".to_string()],
+            jwks_url: Some("https://issuer.example.com/.well-known/jwks.json".to_string()),
             ..Default::default()
         }
     }
@@ -1326,7 +1610,7 @@ mod tests {
         let err = App::builder()
             .with_warehouse_location(crate::utils::temp_path())
             .with_jwt_config(crate::auth::JwtConfig {
-                audience: String::new(), // required
+                audiences: Vec::new(), // required
                 ..jwt_config()
             })
             .build()

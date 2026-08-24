@@ -387,3 +387,191 @@ async fn planning_is_advertised() {
             .contains(&"DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}/plan/{plan-id}")
     );
 }
+
+// ── What a plan cannot hide ─────────────────────────────────────────────
+
+/// A partitioned table whose partition column policy also masks.
+///
+/// Built separately from the shared fixture because it needs a partition spec,
+/// and the spec is the whole point of the test.
+async fn partitioned_fixture() -> Fixture {
+    let warehouse = tempfile::tempdir().expect("warehouse");
+    let catalog = tempfile::tempdir().expect("catalog");
+
+    let (writer_key, writer) = ApiKeyBuilder::new("writer", "acme")
+        .with_role("writer")
+        .build();
+    let (restricted_key, restricted) = ApiKeyBuilder::new("restricted", "acme")
+        .with_role("restricted")
+        .build();
+
+    let (app, _keys) = App::builder()
+        .with_catalog_url(format!("file://{}", catalog.path().display()))
+        .with_warehouse_location(format!("file://{}", warehouse.path().display()))
+        .with_default_tenant_id("acme")
+        .with_policies(POLICY)
+        .with_api_keys(vec![writer_key, restricted_key])
+        .build_with_api_keys()
+        .await
+        .expect("build app");
+
+    let fixture = Fixture {
+        app,
+        writer: writer.to_string(),
+        restricted: restricted.to_string(),
+        _warehouse: warehouse,
+        _catalog: catalog,
+    };
+
+    let (status, body) = call(
+        &fixture.app,
+        Method::POST,
+        "/v1/namespaces",
+        &fixture.writer,
+        Some(json!({ "namespace": ["db"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = call(
+        &fixture.app,
+        Method::POST,
+        "/v1/namespaces/db/tables",
+        &fixture.writer,
+        Some(json!({
+            "name": "by_region",
+            "schema": { "type": "struct", "fields": [
+                { "id": 1, "name": "id", "required": true, "type": "long" },
+                { "id": 2, "name": "region", "required": false, "type": "string" }
+            ]},
+            "partition-spec": { "spec-id": 0, "fields": [
+                { "source-id": 2, "field-id": 1000, "name": "region",
+                  "transform": "identity" }
+            ]}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    fixture
+}
+
+/// A mask over a *partition* column cannot be honoured by a plan: every content
+/// file carries its partition tuple, and Iceberg writes the value into the
+/// object key as well. So the plan is refused, rather than served with the
+/// masked column in every row of the response.
+#[tokio::test]
+async fn a_plan_is_refused_when_a_mask_covers_a_partition_column() {
+    let f = partitioned_fixture().await;
+
+    let (status, body) = call(
+        &f.app,
+        Method::POST,
+        "/v1/namespaces/db/tables/by_region/plan",
+        &f.restricted,
+        Some(json!({})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body.contains("region"),
+        "the refusal must name the column: {body}"
+    );
+    assert!(
+        body.contains("partition"),
+        "and say why a plan cannot withhold it: {body}"
+    );
+}
+
+/// The same mask over a column the table is *not* partitioned on plans normally.
+/// The refusal above is narrow on purpose.
+#[tokio::test]
+async fn a_mask_over_an_ordinary_column_still_plans() {
+    let f = fixture().await;
+
+    let (status, body) = call(
+        &f.app,
+        Method::POST,
+        "/v1/namespaces/db/tables/events/plan",
+        &f.restricted,
+        Some(json!({})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A writer is unrestricted, so the partitioned table plans for it. Without this
+/// the test above could pass because the table was unplannable for everyone.
+#[tokio::test]
+async fn a_partitioned_table_plans_for_an_unrestricted_caller() {
+    let f = partitioned_fixture().await;
+
+    let (status, body) = call(
+        &f.app,
+        Method::POST,
+        "/v1/namespaces/db/tables/by_region/plan",
+        &f.writer,
+        Some(json!({})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+// ── stats-fields and the case-sensitive flag ────────────────────────────
+
+/// `case-sensitive: false` is what the flag exists to allow, and it governs
+/// `stats-fields` like every other column reference in a plan. This used to
+/// answer `400` for a name that differed only in case.
+#[tokio::test]
+async fn stats_fields_honours_the_case_sensitive_flag() {
+    let f = fixture().await;
+
+    let (status, body) = call(
+        &f.app,
+        Method::POST,
+        "/v1/namespaces/db/tables/events/plan",
+        &f.writer,
+        Some(json!({ "case-sensitive": false, "stats-fields": ["REGION"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // And still refuses a column that does not exist in any case.
+    let (status, body) = call(
+        &f.app,
+        Method::POST,
+        "/v1/namespaces/db/tables/events/plan",
+        &f.writer,
+        Some(json!({ "case-sensitive": false, "stats-fields": ["nosuch"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// The mask is matched on the resolved column, without regard to case — so
+/// relaxing the binding above cannot be turned into a way to ask for a masked
+/// column's minimum and maximum under a different spelling.
+#[tokio::test]
+async fn a_mask_is_not_escaped_by_spelling_the_column_differently() {
+    let f = fixture().await;
+
+    for (case_sensitive, name) in [(false, "REGION"), (true, "region")] {
+        let (status, body) = call(
+            &f.app,
+            Method::POST,
+            "/v1/namespaces/db/tables/events/plan",
+            &f.restricted,
+            Some(json!({ "case-sensitive": case_sensitive, "stats-fields": [name] })),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "stats for a masked column were served for {name:?}: {body}"
+        );
+    }
+}

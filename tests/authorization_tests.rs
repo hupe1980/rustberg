@@ -1126,3 +1126,530 @@ async fn config_advertises_no_token_endpoint_when_none_is_configured() {
     let config: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(config["overrides"].get("oauth2-server-uri").is_none());
 }
+
+// ── Namespace ownership is inherited, not asserted ──────────────────────
+
+/// A tenant must not be able to plant a namespace inside another tenant's tree.
+///
+/// Authorizing a *nested* namespace against the caller's own tenant is right for
+/// a root namespace and wrong here: the parent already has an owner. Otherwise a
+/// principal in `other` creates `finance.secret` under `acme`'s `finance` —
+/// invisible to `acme`, undeletable by `acme` (the parent is no longer empty),
+/// and with no error naming why.
+#[tokio::test]
+async fn a_nested_namespace_cannot_be_planted_in_another_tenants_tree() {
+    let policies = r#"
+        permit(principal in Rustberg::Group::"admin", action, resource)
+          when { resource.tenant == principal.tenant };
+    "#;
+    let (acme_key, acme) = key("acme-admin", "acme", &["admin"]);
+    let (other_key, other) = key("other-admin", "other", &["admin"]);
+    let (app, _store) = app_with(policies, vec![acme_key, other_key]).await;
+
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces",
+        &acme,
+        Some(serde_json::json!({ "namespace": ["finance"] })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "acme creates its own root namespace"
+    );
+
+    // `other` cannot see `acme`'s namespace, so the parent is a 404 — the same
+    // answer it gets for a namespace that does not exist, which is the point.
+    let (status, body) = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces",
+        &other,
+        Some(serde_json::json!({ "namespace": ["finance", "secret"] })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "another tenant's subtree must not accept a child: {body}"
+    );
+
+    // And nothing was created, so `acme` can still drop its namespace.
+    let (status, body) = request(&app, Method::DELETE, "/v1/namespaces/finance", &acme, None).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the namespace is still empty: {body}"
+    );
+}
+
+/// The inherited owner is the parent's, not the creator's.
+///
+/// A principal permitted to create inside another tenant's subtree — which a
+/// policy may legitimately grant — creates something that belongs to that
+/// subtree. Otherwise the Cedar hierarchy is a fiction: ancestors are derived by
+/// truncating an entity id that begins with the owning tenant, so a child owned
+/// by `other` under a parent owned by `acme` would sit beneath a namespace that
+/// does not exist.
+#[tokio::test]
+async fn a_nested_namespace_inherits_its_parents_tenant() {
+    // `other` is granted create rights inside acme's tree, deliberately.
+    let policies = r#"
+        permit(principal in Rustberg::Group::"admin", action, resource)
+          when { resource.tenant == principal.tenant };
+        permit(
+          principal in Rustberg::Group::"acme-partner",
+          action in [Rustberg::Action::"Read", Rustberg::Action::"Create"],
+          resource in Rustberg::Tenant::"acme"
+        );
+    "#;
+    let (acme_key, acme) = key("acme-admin", "acme", &["admin"]);
+    let (partner_key, partner) = key("partner-admin", "other", &["acme-partner"]);
+    let (app, _store) = app_with(policies, vec![acme_key, partner_key]).await;
+
+    request(
+        &app,
+        Method::POST,
+        "/v1/namespaces",
+        &acme,
+        Some(serde_json::json!({ "namespace": ["finance"] })),
+    )
+    .await;
+
+    let (status, body) = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces",
+        &partner,
+        Some(serde_json::json!({ "namespace": ["finance", "shared"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the grant permits this: {body}");
+
+    // The namespace belongs to acme, so acme's admin can read it...
+    let (status, _) = request(
+        &app,
+        Method::GET,
+        "/v1/namespaces/finance%1Fshared",
+        &acme,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the child was stamped with the parent's tenant"
+    );
+
+    // ...and the creator, whose only grant is the one above, still sees it
+    // through that grant rather than through its own tenant.
+    let (status, _) = request(
+        &app,
+        Method::GET,
+        "/v1/namespaces/finance%1Fshared",
+        &partner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// The same guarantee for the `parent` query parameter, which is the one that
+/// reaches the store without naming a resource in the path.
+///
+/// `GET /v1/namespaces?parent=X` authorizes "may you enumerate your own
+/// catalog" and then asks the backend for X's children. The backend answers
+/// `NoSuchNamespace` for an X that does not exist and an empty page for one that
+/// does — and every child of a foreign X is filtered out, so the *page* reveals
+/// nothing while the *status code* separates "not there" from "not yours".
+///
+/// That is the enumeration oracle the path-based handlers close, reached through
+/// a query parameter instead. It is worse than the path version, because a
+/// caller can walk a whole tree with it: a `200` says the guess was a real
+/// namespace, and its children can then be guessed the same way.
+#[tokio::test]
+async fn a_forbidden_parent_is_indistinguishable_from_a_missing_one() {
+    let policies = r#"
+        permit(principal in Rustberg::Group::"admin", action, resource)
+          when { resource.tenant == principal.tenant };
+    "#;
+
+    let (admin_key, admin_secret) = key("admin", "acme", &["admin"]);
+    let (outsider_key, outsider_secret) = key("outsider", "other", &["admin"]);
+    let (app, _store) = app_with(policies, vec![admin_key, outsider_key]).await;
+
+    seed(&app, &admin_secret, "secret_ns", &[]).await;
+    // A child, so a leak would hand over a name rather than only a status.
+    let (status, body) = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces",
+        &admin_secret,
+        Some(serde_json::json!({ "namespace": ["secret_ns", "inner"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (existing, existing_body) = request(
+        &app,
+        Method::GET,
+        "/v1/namespaces?parent=secret_ns",
+        &outsider_secret,
+        None,
+    )
+    .await;
+    let (missing, _) = request(
+        &app,
+        Method::GET,
+        "/v1/namespaces?parent=no_such_ns",
+        &outsider_secret,
+        None,
+    )
+    .await;
+
+    assert!(
+        !existing_body.contains("inner"),
+        "a child of a foreign namespace must never be listed: {existing_body}"
+    );
+    assert_eq!(
+        existing, missing,
+        "the status code for `?parent=` is an oracle for enumerating other \
+         tenants' namespaces: existing={existing}, missing={missing}"
+    );
+    assert_eq!(existing, StatusCode::NOT_FOUND);
+}
+
+/// And the parameter still works for a parent the caller *can* see.
+#[tokio::test]
+async fn listing_a_parent_the_caller_owns_still_works() {
+    let policies = r#"
+        permit(principal in Rustberg::Group::"admin", action, resource)
+          when { resource.tenant == principal.tenant };
+    "#;
+
+    let (admin_key, admin_secret) = key("admin", "acme", &["admin"]);
+    let (app, _store) = app_with(policies, vec![admin_key]).await;
+
+    seed(&app, &admin_secret, "mine", &[]).await;
+    let (status, body) = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces",
+        &admin_secret,
+        Some(serde_json::json!({ "namespace": ["mine", "inner"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = request(
+        &app,
+        Method::GET,
+        "/v1/namespaces?parent=mine",
+        &admin_secret,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("inner"), "{body}");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// The storage boundary is the policy boundary
+// ════════════════════════════════════════════════════════════════════════════
+
+/// A caller must not be able to reach a prefix its policy never mentioned by
+/// pointing a table it *does* own at that prefix.
+///
+/// # The sequence this prevents
+///
+/// Every guarantee in this crate is written over the namespace tree: a policy
+/// names `Namespace::"acme␟finance"`, and a caller either may reach what is
+/// under it or may not. Storage access is written over a *path*: a vended
+/// credential is scoped to the location the table declares.
+///
+/// Those are the same hierarchy only while a table's files stay where its name
+/// puts them. Confine a location to the *warehouse* and they come apart in one
+/// move:
+///
+/// 1. `alice` may write `public.mine` and cannot even see `finance.secret`.
+/// 2. She commits `set-location` on her own table, naming `finance/secret`'s
+///    prefix. Permitted caller, own table, location inside the warehouse.
+/// 3. She loads her own table asking for `vended-credentials` and is handed a
+///    correctly-scoped credential — for the other namespace's data.
+///
+/// Nothing there is a bug in the authorizer. Every step is permitted. The
+/// location was simply not hers to choose, which is why the bound is the prefix
+/// the table's own name puts it in.
+#[tokio::test]
+async fn a_caller_cannot_move_its_table_onto_a_namespace_it_cannot_see() {
+    const POLICY: &str = r#"
+        permit(principal in Rustberg::Group::"admin", action, resource);
+        permit(
+          principal in Rustberg::Group::"alice",
+          action,
+          resource in Rustberg::Namespace::"acme\u{1F}public"
+        );
+    "#;
+
+    let (admin_key, admin) = key("admin", "acme", &["admin"]);
+    let (alice_key, alice) = key("alice", "acme", &["alice"]);
+    let (app, _) = app_with(POLICY, vec![admin_key, alice_key]).await;
+
+    seed(&app, &admin, "public", &[]).await;
+    seed(&app, &admin, "finance", &["secret"]).await;
+
+    let (status, body) = request(
+        &app,
+        Method::GET,
+        "/v1/namespaces/finance/tables/secret",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let secret_location =
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["metadata"]["location"]
+            .as_str()
+            .expect("a table names its location")
+            .to_string();
+
+    let (status, body) = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/public/tables",
+        &alice,
+        Some(serde_json::json!({
+            "name": "mine",
+            "schema": { "type": "struct", "fields": [
+                { "id": 1, "name": "id", "required": true, "type": "long" }
+            ]}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The premise: she cannot see the other namespace's table at all.
+    let (status, _) = request(
+        &app,
+        Method::GET,
+        "/v1/namespaces/finance/tables/secret",
+        &alice,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the premise of this test is that alice cannot reach finance"
+    );
+
+    // Route 1: move her own table onto it.
+    let (status, body) = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/public/tables/mine",
+        &alice,
+        Some(serde_json::json!({
+            "requirements": [],
+            "updates": [{ "action": "set-location", "location": secret_location }]
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "set-location reached a prefix alice's policy never mentioned: {body}"
+    );
+
+    // Route 2: create a new table there outright.
+    let (status, body) = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/public/tables",
+        &alice,
+        Some(serde_json::json!({
+            "name": "copy",
+            "location": secret_location,
+            "schema": { "type": "struct", "fields": [
+                { "id": 1, "name": "id", "required": true, "type": "long" }
+            ]}
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "createTable claimed a prefix alice's policy never mentioned: {body}"
+    );
+
+    // Route 3: register the other table's metadata under a name of her own.
+    let (status, body) = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/public/register",
+        &alice,
+        Some(serde_json::json!({
+            "name": "registered",
+            "metadata-location": format!("{secret_location}/metadata/v1.metadata.json")
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "registerTable named a prefix alice's policy never mentioned: {body}"
+    );
+}
+
+/// A view carries the same hazard through the same three routes, and the view
+/// handlers are a separate code path from the table ones.
+#[tokio::test]
+async fn a_view_cannot_claim_a_namespace_the_caller_cannot_see() {
+    const POLICY: &str = r#"
+        permit(principal in Rustberg::Group::"admin", action, resource);
+        permit(
+          principal in Rustberg::Group::"alice",
+          action,
+          resource in Rustberg::Namespace::"acme\u{1F}public"
+        );
+    "#;
+
+    let (admin_key, admin) = key("admin", "acme", &["admin"]);
+    let (alice_key, alice) = key("alice", "acme", &["alice"]);
+    let (app, _) = app_with(POLICY, vec![admin_key, alice_key]).await;
+
+    seed(&app, &admin, "public", &[]).await;
+    seed(&app, &admin, "finance", &[]).await;
+
+    let elsewhere = "memory://test/finance/payroll";
+
+    let (status, body) = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/public/views",
+        &alice,
+        Some(serde_json::json!({
+            "name": "v",
+            "location": elsewhere,
+            "schema": { "type": "struct", "fields": [
+                { "id": 1, "name": "id", "required": true, "type": "long" }
+            ]},
+            "view-version": {
+                "version-id": 1,
+                "timestamp-ms": 1_700_000_000_000i64,
+                "schema-id": 0,
+                "summary": {},
+                "default-namespace": ["public"],
+                "representations": [
+                    { "type": "sql", "sql": "SELECT 1", "dialect": "spark" }
+                ]
+            },
+            "properties": {}
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "createView claimed another namespace's prefix: {body}"
+    );
+
+    let (status, body) = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/public/register-view",
+        &alice,
+        Some(serde_json::json!({
+            "name": "rv",
+            "metadata-location": format!("{elsewhere}/metadata/v1.metadata.json")
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "registerView named another namespace's prefix: {body}"
+    );
+}
+
+/// The escape hatch does what it says, and the test says what it costs.
+///
+/// `storage.location_scope = "warehouse"` exists so a deployment can adopt a
+/// lake whose layout predates this catalog — `registerTable` there has to name
+/// files that are not where a name would put them. This asserts both halves:
+/// the loose scope accepts what the default refuses, and the reason the default
+/// is the default is that a caller with one grant is then credentialed for the
+/// whole warehouse.
+#[tokio::test]
+async fn the_loose_location_scope_accepts_what_the_default_refuses() {
+    const POLICY: &str = r#"
+        permit(principal in Rustberg::Group::"admin", action, resource);
+        permit(
+          principal in Rustberg::Group::"alice",
+          action,
+          resource in Rustberg::Namespace::"acme\u{1F}public"
+        );
+    "#;
+
+    let (admin_key, admin) = key("admin", "acme", &["admin"]);
+    let (alice_key, alice) = key("alice", "acme", &["alice"]);
+
+    let app = App::builder()
+        .with_warehouse_location("memory://test")
+        .with_default_tenant_id("acme")
+        .with_location_scope(rustberg::location::LocationScope::Warehouse)
+        .with_policies(POLICY)
+        .with_api_keys(vec![admin_key, alice_key])
+        .build_with_api_keys()
+        .await
+        .expect("build app")
+        .0;
+
+    seed(&app, &admin, "public", &[]).await;
+
+    let create = |name: &str, location: &str| {
+        serde_json::json!({
+            "name": name,
+            "location": location,
+            "schema": { "type": "struct", "fields": [
+                { "id": 1, "name": "id", "required": true, "type": "long" }
+            ]}
+        })
+    };
+
+    // Anywhere in the warehouse, including a namespace alice cannot see.
+    let (status, body) = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/public/tables",
+        &alice,
+        Some(create("mine", "memory://test/finance/payroll")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the loose scope confines to the warehouse and nothing narrower: {body}"
+    );
+
+    // The warehouse is still a boundary; the loose scope is not "anywhere".
+    let (status, body) = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/public/tables",
+        &alice,
+        Some(create("outside", "memory://someone-else/secrets")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "even the loose scope stops at the warehouse: {body}"
+    );
+    assert!(
+        body.contains("outside this catalog's warehouse"),
+        "the refusal names the boundary it did apply: {body}"
+    );
+}

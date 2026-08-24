@@ -21,14 +21,15 @@ use super::delegation::AccessDelegation;
 use super::extract::{Json, NamespacePath, TablePath};
 use super::freshness;
 use super::guard::{self, Authorized, Target};
-use super::idempotency::{CachedResponse, IDEMPOTENCY_KEY_USED_HEADER, IdempotencyKey};
+use super::idempotency::{CachedResponse, IdempotencyKey};
+use super::ownership;
 use super::pagination::{PaginationQuery, collect_page};
 use super::snapshots::{self, SnapshotScope, SnapshotsQuery};
-use super::validation::{validate_namespace, validate_properties, validate_table_name};
 use crate::app::AppState;
-use crate::auth::{Action, AuthenticatedPrincipal, Obligations, Principal, RequestFacts};
+use crate::auth::{Action, AuthenticatedPrincipal, Obligations, RequestFacts};
 use crate::credentials::{StorageCredential, StorageCredentialRequest};
 use crate::error::{AppError, Result};
+use crate::names::{validate_namespace, validate_properties, validate_table_name};
 
 /// Outcome of deciding what storage access to hand a client.
 ///
@@ -72,8 +73,26 @@ struct CredentialTarget<'a> {
     table_name: &'a str,
     /// The table's storage location, which becomes the credential's prefix.
     location: &'a str,
-    /// Whether the credential should permit writes. See [`wants_write_access`].
-    write_access: bool,
+    /// How wide the credential should be.
+    access: AccessLevel,
+}
+
+/// How wide a vended credential should be.
+///
+/// An enum rather than a `bool` because one of the answers is *not yet known*,
+/// and finding it out costs a policy decision and an audit record. A `bool`
+/// forces every call site to answer before it knows whether a credential is
+/// wanted at all — which for a plain uncredentialed `loadTable`, the most common
+/// request in the protocol, is a decision about a credential nobody asked for.
+#[derive(Debug, Clone, Copy)]
+enum AccessLevel {
+    /// The caller just created or registered this table, so it is writing to it.
+    /// No second decision: `Create` already carried the answer.
+    Write,
+    /// Follows the caller's own `Update` grant — decided inside
+    /// [`vend_table_credentials`], once it is known that a credential is
+    /// actually going to be issued.
+    FromPolicy,
 }
 
 /// Vends storage credentials for a table, subject to policy.
@@ -87,24 +106,28 @@ struct CredentialTarget<'a> {
 /// vended credential and a row filter are contradictory — whichever the policy
 /// says, the engine reads everything.
 ///
-/// Enforcing the filter itself would need server-side scan planning paired with
-/// remote signing, so that the engine never holds a credential and every fetch is
-/// checked against the plan. Rustberg implements neither. Between vending a broad
-/// credential while claiming the filter is enforced, and declining to vend, only
-/// the second is honest — so that is what happens, and the response says so.
+/// Rustberg does apply the filter where it can: a scan plan is built from it, so
+/// a restricted caller is told about fewer files, and the residual comes back on
+/// every task. But a plan is advice to a cooperating engine — nothing makes an
+/// unplanned file unfetchable — and a signature is confined to the whole table
+/// rather than to the files one plan named. Neither closes the gap a credential
+/// opens. Between vending a broad credential while claiming the filter is
+/// enforced, and declining to vend, only the second is honest — so that is what
+/// happens, and the response says so.
 async fn vend_table_credentials(
     state: &AppState,
-    principal: &Principal,
+    authorized: &Authorized,
     target: CredentialTarget<'_>,
     delegation: AccessDelegation,
-    obligations: &Obligations,
-) -> Delegated {
+) -> Result<Delegated> {
     let CredentialTarget {
         namespace,
         table_name,
         location: table_location,
-        write_access,
+        access,
     } = target;
+    let principal = authorized.principal();
+    let obligations = &authorized.obligations;
 
     // Delegation is something a client asks for. A client running with its own
     // storage credentials does not want the catalog minting more, and vending
@@ -114,7 +137,7 @@ async fn vend_table_credentials(
             table = %table_name,
             "Client did not request vended credentials; none returned"
         );
-        return Delegated::None;
+        return Ok(Delegated::None);
     }
 
     // Checked before consulting the provider: a table under row or column policy
@@ -132,7 +155,31 @@ async fn vend_table_credentials(
             restrictions = %obligations.describe(),
             "Withholding storage credentials: table is under row or column policy"
         );
-        return Delegated::Withheld(reason);
+        record_vend(
+            state,
+            authorized,
+            &Delegated::Withheld(reason.clone()),
+            None,
+        )?;
+        return Ok(Delegated::Withheld(reason));
+    }
+
+    // The location came from whichever catalog holds the table, and for a mount
+    // that is somebody else's server. A remote reporting a location inside
+    // *this* server's warehouse would otherwise be credentialed for it — see
+    // `AppState::manages_storage_for`.
+    let namespace_ident = NamespaceIdent::from_vec(namespace.to_vec())?;
+    if !state
+        .manages_storage_for(&namespace_ident, table_location)
+        .await
+    {
+        tracing::debug!(
+            location = table_location,
+            namespace = %namespace_ident.join("."),
+            "Not vending: the table's location is not inside the warehouse governing \
+             its namespace"
+        );
+        return Ok(Delegated::None);
     }
 
     if !state.credential_provider.supports_location(table_location) {
@@ -140,8 +187,16 @@ async fn vend_table_credentials(
             location = table_location,
             "Storage credential provider does not support location"
         );
-        return Delegated::None;
+        return Ok(Delegated::None);
     }
+
+    // Asked here and not before: every return above hands out nothing, so an
+    // earlier question would spend a decision and a record on the width of a
+    // credential that is never issued.
+    let write_access = match access {
+        AccessLevel::Write => true,
+        AccessLevel::FromPolicy => authorized.also_permits(state, Action::Update).await?,
+    };
 
     let request = if write_access {
         StorageCredentialRequest::with_write_access(
@@ -160,7 +215,7 @@ async fn vend_table_credentials(
     }
     .for_principal(principal.id());
 
-    match state.credential_provider.vend_credentials(&request).await {
+    let outcome = match state.credential_provider.vend_credentials(&request).await {
         Ok(credentials) if !credentials.is_empty() => {
             tracing::debug!(
                 tenant_id = principal.tenant_id(),
@@ -196,6 +251,72 @@ async fn vend_table_credentials(
                  decision — the server log names the cause. Retrying is reasonable."
             ))
         }
+    };
+
+    record_vend(state, authorized, &outcome, Some(write_access))?;
+    Ok(outcome)
+}
+
+/// Records what storage access a request walked away with.
+///
+/// # Why this is its own record and not a field on the decision
+///
+/// The decision records say the caller was permitted to `Read`, and to `Update`.
+/// Neither says whether a credential was minted, how wide it was, or whether the
+/// exchange with the cloud provider worked. "Who was allowed to read this table"
+/// and "who holds a credential that can overwrite it" are different questions,
+/// and only the second names the blast radius.
+///
+/// [`Delegated::None`] is not recorded: nothing was handed over, and a record per
+/// uncredentialed `loadTable` would be one per read, saying nothing.
+///
+/// # Errors
+///
+/// [`AppError::ServiceUnavailable`] when a *granted write* credential could not
+/// be recorded and the auditor fails closed. A read credential degrades like a
+/// read decision; a withheld or failed one granted nothing, so there is no
+/// unrecorded grant to refuse.
+fn record_vend(
+    state: &AppState,
+    authorized: &Authorized,
+    outcome: &Delegated,
+    write_access: Option<bool>,
+) -> Result<()> {
+    let (result, error) = match outcome {
+        Delegated::None => return Ok(()),
+        Delegated::Granted(_) => (crate::auth::AuditOutcome::Success, None),
+        Delegated::Withheld(reason) => (crate::auth::AuditOutcome::Denied, Some(reason.clone())),
+        Delegated::Failed(reason) => (crate::auth::AuditOutcome::Failure, Some(reason.clone())),
+    };
+
+    // What the caller walked away with. `None` is not "read": a withheld
+    // credential never had a width decided, and recording one would put a width
+    // in the trail beside a grant that did not happen.
+    let access = match write_access {
+        Some(true) => "read-write",
+        Some(false) => "read",
+        None => "none",
+    };
+    let granted_write = matches!(outcome, Delegated::Granted(_)) && write_access == Some(true);
+    let mut event =
+        crate::auth::AuditEvent::credential_vend(access, &authorized.resource_path(), result)
+            .with_principal_id(authorized.principal().id())
+            .with_tenant_id(authorized.principal().tenant_id())
+            .with_optional_client_ip(authorized.request().source_ip)
+            .with_optional_request_id(authorized.request().request_id.as_deref());
+    if let Some(reason) = error {
+        event = event.with_detail("reason", reason);
+    }
+
+    if granted_write {
+        state.auditor.record(&event).map_err(|_| {
+            AppError::ServiceUnavailable(
+                "The audit trail is unavailable, so no write credential was issued.".to_string(),
+            )
+        })
+    } else {
+        state.auditor.record_lossy(&event);
+        Ok(())
     }
 }
 
@@ -290,20 +411,6 @@ const RESERVED_TABLE_PROPERTIES: &[&str] = &[
     "default-partition-spec",
     "default-sort-order",
 ];
-
-/// Decides whether a vended credential should carry write permission.
-///
-/// Write access follows the caller's own authorization: a principal permitted to
-/// `Update` the table is writing to it, and needs to put objects under its
-/// prefix. One permitted to `Read` only receives a credential with no
-/// `s3:PutObject`.
-///
-/// A hardcoded read-only credential would make vended-credential writes
-/// impossible: a writer would receive a credential unable to put the data files
-/// its own commit references.
-async fn wants_write_access(state: &AppState, authorized: &Authorized) -> bool {
-    authorized.also_permits(state, Action::Update).await
-}
 
 // ============================================================================
 // Request/Response Types
@@ -789,10 +896,15 @@ pub async fn create_table(
     }
 
     // A client-supplied location becomes the prefix of any credential vended for
-    // this table, so it is confined to the warehouse before it is recorded. See
-    // `crate::location` for the confused-deputy hole this closes.
+    // this table, so it is confined before it is recorded — to the prefix this
+    // table's *name* puts it in, not merely to the warehouse. See
+    // `crate::location::LocationScope` for the confused-deputy hole that
+    // distinction closes.
     if let Some(ref location) = payload.location {
-        crate::location::ensure_within_warehouse(&state.warehouse_for(&namespace).await, location)?;
+        state
+            .location_bound(&namespace, &payload.name)
+            .await
+            .ensure(location)?;
     }
 
     let staged = payload.stage_create == Some(true);
@@ -831,8 +943,8 @@ pub async fn create_table(
     let delegation = AccessDelegation::from_headers(&headers);
 
     if payload.schema.schema_type != "struct" {
-        return Err(AppError::InvalidSchema(
-            "Schema type must be 'struct'".into(),
+        return Err(AppError::BadRequest(
+            "A table schema must have \"type\": \"struct\" at its root.".into(),
         ));
     }
 
@@ -885,17 +997,16 @@ pub async fn create_table(
     // carries write access without needing a second decision.
     let storage_credentials = vend_table_credentials(
         &state,
-        &principal,
+        &authorized,
         CredentialTarget {
             namespace: namespace.as_ref(),
             table_name: &table_name,
             location: table.metadata().location(),
-            write_access: true,
+            access: AccessLevel::Write,
         },
         delegation,
-        &authorized.obligations,
     )
-    .await
+    .await?
     .into_response_credentials()?;
 
     let (signing_config, remote_signing_config) = signing_response(
@@ -936,7 +1047,16 @@ pub async fn create_table(
     // Not for a staged table: there is no table to load conditionally, and a tag
     // naming a version the catalog does not acknowledge would be a promise about
     // state that does not exist.
-    if !staged && let Some(tag) = freshness::etag_for(table.metadata_location(), SnapshotScope::All)
+    // Delegation is passed in for the same reason it is on `loadTable`: a
+    // response carrying a freshly minted credential has no stable identity, and
+    // `etag_for` answers `None` rather than naming one.
+    if !staged
+        && let Some(tag) = freshness::etag_for(
+            table.metadata_location(),
+            SnapshotScope::All,
+            delegation,
+            !authorized.obligations.is_empty(),
+        )
     {
         insert_etag(&mut response, &tag);
     }
@@ -956,10 +1076,6 @@ pub async fn create_table(
             CachedResponse::from_json(StatusCode::OK, &response_body.without_credentials())
     {
         state.idempotency_cache.set(key, cached).await;
-        response.headers_mut().insert(
-            IDEMPOTENCY_KEY_USED_HEADER,
-            axum::http::HeaderValue::from_static("true"),
-        );
     }
 
     Ok(response)
@@ -970,7 +1086,8 @@ pub async fn create_table(
 /// The credential's access level follows the caller's own permissions: a
 /// principal that may also `Update` this table receives a credential that can
 /// write under its prefix, and a read-only principal receives one that cannot.
-/// See [`wants_write_access`].
+/// See [`AccessLevel`], and note that the question is asked only once it is
+/// known that a credential is going to be issued at all.
 ///
 /// GET /v1/namespaces/{namespace}/tables/{table}
 pub async fn load_table(
@@ -1019,11 +1136,15 @@ pub async fn load_table(
     // exists and is unchanged, which is exactly as much as `200` would, so it
     // must be gated by the same decision. Answering it earlier would turn the
     // cache into a way to probe for tables the caller may not see.
-    if freshness::is_conditional(&headers) {
+    if freshness::is_revalidatable(&headers, delegation) {
         let pointer = state.catalog.metadata_pointer(&table_ident).await?;
 
-        if let Some(tag) = freshness::etag_for(pointer.as_deref(), scope)
-            && freshness::matches(&headers, &tag)
+        if let Some(tag) = freshness::etag_for(
+            pointer.as_deref(),
+            scope,
+            delegation,
+            !authorized.obligations.is_empty(),
+        ) && freshness::matches(&headers, &tag)
         {
             state.metrics.catalog_load_table_not_modified.inc();
             let mut response = StatusCode::NOT_MODIFIED.into_response();
@@ -1033,7 +1154,12 @@ pub async fn load_table(
     }
 
     let table = state.catalog.load_table(&table_ident).await?;
-    let etag = freshness::etag_for(table.metadata_location(), scope);
+    let etag = freshness::etag_for(
+        table.metadata_location(),
+        scope,
+        delegation,
+        !authorized.obligations.is_empty(),
+    );
 
     // A row filter over a non-partition column cannot be enforced by
     // withholding files, and looks identical in the policy file to one that
@@ -1046,20 +1172,18 @@ pub async fn load_table(
         state.authorizer.policy_set_version().as_deref(),
     );
 
-    let write_access = wants_write_access(&state, &authorized).await;
     let storage_credentials = vend_table_credentials(
         &state,
-        &principal,
+        &authorized,
         CredentialTarget {
             namespace: namespace.as_ref(),
             table_name: &table_name,
             location: table.metadata().location(),
-            write_access,
+            access: AccessLevel::FromPolicy,
         },
         delegation,
-        &authorized.obligations,
     )
-    .await
+    .await?
     .into_response_credentials()?;
 
     let metadata = snapshots::apply_scope(table.metadata().clone(), scope)?;
@@ -1094,11 +1218,31 @@ pub async fn load_table(
 /// client's next load is unconditional. The tag is hex inside quotes, so this
 /// cannot actually happen — which is why it must not be an error path.
 fn insert_etag(response: &mut axum::response::Response, tag: &str) {
-    if let Ok(value) = axum::http::HeaderValue::from_str(tag) {
-        response
-            .headers_mut()
-            .insert(axum::http::header::ETAG, value);
-    }
+    let Ok(value) = axum::http::HeaderValue::from_str(tag) else {
+        return;
+    };
+    response
+        .headers_mut()
+        .insert(axum::http::header::ETAG, value);
+
+    // `private, no-cache`, and both halves are the point.
+    //
+    // The catalog-wide default is `no-store`, which is right for a response
+    // carrying a credential and self-defeating on one carrying a validator: a
+    // client that honours it keeps no copy, so it never sends `If-None-Match`.
+    //
+    // `no-cache` does not mean "do not cache" — it means the stored copy may not
+    // be reused without revalidating here first, which is what conditional
+    // loading is, and why the authorization decision still runs on every
+    // request. `private` keeps the response, which is scoped to one principal,
+    // out of shared caches.
+    //
+    // Set by the handler because the layer supplying the default is
+    // `if_not_present`.
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, no-cache"),
+    );
 }
 
 /// Checks if a table exists.
@@ -1176,20 +1320,18 @@ pub async fn load_table_credentials(
     let table = state.catalog.load_table(&table_ident).await?;
     let table_location = table.metadata().location();
 
-    let write_access = wants_write_access(&state, &authorized).await;
     let delegated = vend_table_credentials(
         &state,
-        &principal,
+        &authorized,
         CredentialTarget {
             namespace: namespace.as_ref(),
             table_name: &table_name,
             location: table_location,
-            write_access,
+            access: AccessLevel::FromPolicy,
         },
         delegation,
-        &authorized.obligations,
     )
-    .await;
+    .await?;
 
     match delegated {
         Delegated::Granted(storage_credentials) => Ok(AxumJson(LoadCredentialsResponse {
@@ -1247,6 +1389,17 @@ pub async fn drop_table(
         Action::Delete,
     )
     .await?;
+
+    // Read after authorizing, so an unauthorized caller learns nothing about
+    // whether the table exists or how it is configured.
+    let properties = state
+        .catalog
+        .load_table(&table_ident)
+        .await?
+        .metadata()
+        .properties()
+        .clone();
+    ownership::reject_if_protected(&properties, &format!("Table '{table_ident}'"))?;
 
     // Record metric
     state.metrics.catalog_delete_table.inc();
@@ -1392,7 +1545,7 @@ pub async fn commit_table(
     let namespace = NamespaceIdent::from_vec(namespace_parts)?;
     let final_table_name = table_name;
 
-    guard::authorize(
+    let authorized = guard::authorize(
         &state,
         &principal,
         &request,
@@ -1410,12 +1563,20 @@ pub async fn commit_table(
         return Ok(cached.into_axum_response());
     }
 
+    // The four locations a commit carries are confined by the *backend*, where
+    // the table's current metadata is already in hand — see
+    // `crate::location::LocationBound::ensure_commit` for why the bound needs it
+    // and why loading the table a second time here to get it would be the wrong
+    // trade on the hottest write path.
+
     let table_ident = TableIdent::new(namespace, final_table_name);
 
     // Validate that we have at least one update
     if payload.updates.is_empty() {
-        return Err(AppError::ValidationError(
-            "Commit must include at least one update".into(),
+        return Err(AppError::BadRequest(
+            "A commit must carry at least one update. A request with none changes \
+             nothing, so it is a mistake rather than a no-op."
+                .into(),
         ));
     }
 
@@ -1445,7 +1606,14 @@ pub async fn commit_table(
     let mut response = (StatusCode::OK, AxumJson(&response_body)).into_response();
     // The committer already holds the new version; tagging it here saves the
     // full re-read that otherwise follows every write.
-    if let Some(tag) = freshness::etag_for(updated_table.metadata_location(), SnapshotScope::All) {
+    // A commit response is metadata only — no delegation is negotiated on this
+    // path — so the plain representation is the one being tagged.
+    if let Some(tag) = freshness::etag_for(
+        updated_table.metadata_location(),
+        SnapshotScope::All,
+        AccessDelegation::default(),
+        !authorized.obligations.is_empty(),
+    ) {
         insert_etag(&mut response, &tag);
     }
     response.headers_mut().insert(
@@ -1458,10 +1626,6 @@ pub async fn commit_table(
         && let Some(cached) = CachedResponse::from_json(StatusCode::OK, &response_body)
     {
         state.idempotency_cache.set(key, cached).await;
-        response.headers_mut().insert(
-            IDEMPOTENCY_KEY_USED_HEADER,
-            axum::http::HeaderValue::from_static("true"),
-        );
     }
 
     Ok(response)
@@ -1489,11 +1653,11 @@ pub async fn register_table(
 
     // Registration is the sharpest form of the problem: the caller names a
     // metadata file directly, and the table location read out of it becomes the
-    // prefix of a *write* credential below. Confined to the warehouse first.
-    crate::location::ensure_within_warehouse(
-        &state.warehouse_for(&namespace).await,
-        &payload.metadata_location,
-    )?;
+    // prefix of a *write* credential below. Confined first.
+    state
+        .location_bound(&namespace, &payload.name)
+        .await
+        .ensure(&payload.metadata_location)?;
 
     // Build the endpoint path for idempotency scoping
     let endpoint_path = format!(
@@ -1553,17 +1717,16 @@ pub async fn register_table(
 
     let storage_credentials = vend_table_credentials(
         &state,
-        &principal,
+        &authorized,
         CredentialTarget {
             namespace: namespace.as_ref(),
             table_name: &table_name,
             location: table.metadata().location(),
-            write_access: true,
+            access: AccessLevel::Write,
         },
         delegation,
-        &authorized.obligations,
     )
-    .await
+    .await?
     .into_response_credentials()?;
 
     let (signing_config, remote_signing_config) = signing_response(
@@ -1595,10 +1758,6 @@ pub async fn register_table(
             CachedResponse::from_json(StatusCode::OK, &response_body.without_credentials())
     {
         state.idempotency_cache.set(key, cached).await;
-        response.headers_mut().insert(
-            IDEMPOTENCY_KEY_USED_HEADER,
-            axum::http::HeaderValue::from_static("true"),
-        );
     }
 
     Ok(response)
@@ -1672,8 +1831,8 @@ pub async fn commit_transaction(
     let idempotency_key = IdempotencyKey::from_headers(&headers, "POST", endpoint_path, &principal);
 
     if payload.table_changes.is_empty() {
-        return Err(AppError::ValidationError(
-            "Transaction must include at least one table commit".into(),
+        return Err(AppError::BadRequest(
+            "A transaction must carry at least one table commit.".into(),
         ));
     }
 
@@ -1683,8 +1842,8 @@ pub async fn commit_transaction(
     for commit_req in &payload.table_changes {
         // Each commit must have an identifier for multi-table commits
         let ident = commit_req.identifier.as_ref().ok_or_else(|| {
-            AppError::ValidationError(
-                "Each table commit in a transaction must include an identifier".into(),
+            AppError::BadRequest(
+                "Each table commit in a transaction must name the table it applies to.".into(),
             )
         })?;
 
@@ -1723,7 +1882,7 @@ pub async fn commit_transaction(
             .iter()
             .any(|(existing, _, _): &(TableIdent, _, _)| existing == &table_ident)
         {
-            return Err(AppError::ValidationError(format!(
+            return Err(AppError::BadRequest(format!(
                 "Table '{table_ident}' appears more than once in this transaction. \
                  List each table at most once, combining its updates into a single entry."
             )));
@@ -1804,7 +1963,11 @@ fn build_sort_order(write_order: &Option<WriteOrder>) -> Result<Option<SortOrder
 
         for field in &order.fields {
             let transform = Transform::from_str(&field.transform).map_err(|e| {
-                AppError::InvalidSchema(format!("Invalid transform '{}': {}", field.transform, e))
+                AppError::BadRequest(format!(
+                    "Sort order names the transform '{}', which is not one this catalog \
+                     reads: {}",
+                    field.transform, e
+                ))
             })?;
 
             let sort_field = SortField::builder()
@@ -2124,11 +2287,11 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         match err {
-            AppError::InvalidSchema(msg) => {
-                assert!(msg.contains("Invalid transform"));
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("transform"));
                 assert!(msg.contains("invalid_transform_xyz"));
             }
-            _ => panic!("Expected InvalidSchema error"),
+            other => panic!("expected a bad request, got {other:?}"),
         }
     }
 

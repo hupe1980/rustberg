@@ -51,6 +51,19 @@
 //! point for an empty page and costs nothing on the ordinary path. If even that
 //! fails to move the cursor, the source cannot make progress and the listing
 //! ends: repetition a client can see is bad, and a hang is worse.
+//!
+//! That closes the *non-advancing* empty page and not the advancing one. A
+//! remote answering `{[], "1"}`, `{[], "2"}`, `{[], "3"}`, … forever advances
+//! its cursor every time, so the check above never fires, no row is ever
+//! scanned, and [`MAX_SCAN`] — which counts rows — never trips either. One
+//! `listTables` then runs until the request times out, at the remote's
+//! discretion rather than this server's.
+//!
+//! A row budget cannot bound a loop that consumes no rows, so [`MAX_FETCHES`]
+//! bounds the round trips instead. Both ceilings end the same way: a short page
+//! *with* a cursor, which is the "keep going" signal — no result is lost, and
+//! the cost of an uncooperative source is paid one request at a time by the
+//! client that asked.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
@@ -64,6 +77,15 @@ use crate::error::{AppError, Result};
 /// makes progress — each request advances the cursor by up to this many rows —
 /// without any single request scanning an entire catalog.
 pub const MAX_SCAN: usize = MAX_PAGE_SIZE * 10;
+
+/// Most backend round trips one request may make before yielding a short page.
+///
+/// [`MAX_SCAN`] counts rows, so it cannot bound a source that returns none —
+/// see the module docs. This counts fetches, which every source pays for
+/// whatever it answers with. Twenty is far more than the ordinary path needs:
+/// an unfiltered listing fills its page on the first fetch, and even a policy
+/// hiding nineteen rows in twenty finishes inside it.
+pub const MAX_FETCHES: usize = 20;
 
 /// Pagination query parameters, as the Iceberg REST spec spells them.
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -170,6 +192,7 @@ where
     let mut cursor = request.after.clone();
     let mut kept: Vec<T> = Vec::new();
     let mut scanned = 0usize;
+    let mut fetches = 0usize;
 
     loop {
         let batch = PageRequest {
@@ -177,6 +200,7 @@ where
             limit,
         };
         let page = fetch(batch).await?;
+        fetches += 1;
         let exhausted = page.is_exhausted();
         let page_next = page.next.clone();
 
@@ -235,12 +259,18 @@ where
             }
         }
 
-        if scanned >= MAX_SCAN {
+        if scanned >= MAX_SCAN || fetches >= MAX_FETCHES {
             // Short page, but a cursor: the caller must keep going. Without the
             // cursor this would look like the end of the list.
+            //
+            // `cursor` is `None` only when nothing has advanced it, which means
+            // every fetch answered with no rows and no usable next token — and
+            // that case returned above. Falling back to the incoming cursor
+            // keeps the client's own position rather than restarting it.
+            let resume = cursor.as_deref().or(request.after.as_deref());
             return Ok(FilteredPage {
                 items: kept,
-                next_page_token: cursor.as_deref().map(encode_token),
+                next_page_token: resume.map(encode_token),
             });
         }
     }
@@ -398,6 +428,43 @@ mod tests {
     /// entry cursor exists so the next fetch repeats the last byte for byte. A
     /// `rest` mount forwards exactly this shape whenever a remote answers an
     /// empty page with a token.
+    /// A remote answering `{[], "1"}`, `{[], "2"}`, … advances its cursor every
+    /// time, so the non-advancing check never fires and no row is ever scanned.
+    /// Only a bound on *fetches* ends it.
+    #[tokio::test]
+    async fn an_endlessly_advancing_empty_source_is_bounded() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+
+        let out = collect_page(
+            PageRequest::first(10),
+            move |_req| {
+                let calls = calls.clone();
+                async move {
+                    let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Page::<String> {
+                        entries: Vec::new(),
+                        next: Some(format!("cursor-{n}")),
+                    })
+                }
+            },
+            |item: String| async move { (true, item) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_FETCHES,
+            "the loop must stop after MAX_FETCHES round trips"
+        );
+        assert!(out.items.is_empty());
+        assert!(
+            out.next_page_token.is_some(),
+            "a bounded page is a short page with a cursor, never the end of the list"
+        );
+    }
+
     #[tokio::test]
     async fn an_empty_batch_resumes_from_the_page_cursor() {
         let out = run(

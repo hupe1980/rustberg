@@ -186,7 +186,7 @@ impl AzureSasCredentialProvider {
 
         Ok(Self {
             config,
-            http: reqwest::Client::new(),
+            http: super::provider::exchange_client(),
             cached_key: RwLock::new(None),
         })
     }

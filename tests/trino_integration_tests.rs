@@ -56,6 +56,7 @@ impl RustbergTestServer {
             host: "127.0.0.1".to_string(),
             port,
             tls: None,
+            shutdown_delay: std::time::Duration::ZERO,
         };
 
         let handle = tokio::spawn(async move {

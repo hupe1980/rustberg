@@ -1,13 +1,13 @@
 //! Where two features meet.
 //!
-//! Every bug the audit rounds found lived here rather than inside a feature:
-//! conditional loading was correct and federation was correct, and together they
-//! doubled every remote read; location confinement was correct and mounts were
-//! correct, and together they rejected every federated table. Each feature's own
-//! tests passed throughout.
+//! Conditional loading is correct and federation is correct, and together they
+//! can double every remote read. Location confinement is correct and mounts are
+//! correct, and together they can reject every federated table. Each feature's
+//! own tests pass throughout — which is why these exercise *combinations* on
+//! purpose.
 //!
-//! So these exercise *combinations* on purpose. The suite is organised by pair,
-//! and a new feature should gain a section here rather than only its own file.
+//! Organised by pair. A new feature should gain a section here rather than only
+//! its own file.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -399,13 +399,148 @@ async fn a_mounted_table_gets_credentials_vended() {
     );
 
     // And the prefix asked about was the mount's, not the server's.
-    let asked = asked.lock().unwrap();
+    {
+        let asked = asked.lock().unwrap();
+        assert!(
+            asked
+                .iter()
+                .any(|location| rustberg::location::is_within(&asked_warehouse, location)),
+            "the provider should have been asked about the mount's warehouse \
+             ({asked_warehouse}), got: {asked:?}"
+        );
+    }
+
+    // A deployment that can vend says so, so a client feature-detecting from
+    // `/v1/config` knows the endpoint is there.
+    let config = send(&app, Method::GET, "/v1/config", None).await;
+    let advertised = parse(&config.1);
     assert!(
-        asked
+        advertised["endpoints"]
+            .as_array()
+            .unwrap()
             .iter()
-            .any(|location| rustberg::location::is_within(&asked_warehouse, location)),
-        "the provider should have been asked about the mount's warehouse \
-         ({asked_warehouse}), got: {asked:?}"
+            .any(|e| e.as_str().is_some_and(|e| e.ends_with("/credentials"))),
+        "a catalog whose provider covers every warehouse must advertise \
+         loadCredentials: {}",
+        config.1
+    );
+}
+
+/// A mount cannot borrow this server's warehouse by reporting a location in it.
+///
+/// A mount is somebody else's catalog, sitting on the request path of every call
+/// into its subtree, and the table `location` it returns is a string *it* chose.
+/// The credential provider's allowed prefixes are the union of every warehouse
+/// this deployment manages — so a remote that reported a table whose location
+/// points into this server's own warehouse would have a credential minted for it,
+/// scoped to another tenant's prefix, for a caller who only ever had `Read` on
+/// the mount.
+///
+/// The bound is per-namespace: a location must be inside the warehouse governing
+/// the namespace the table is in, not merely inside one this server manages
+/// somewhere.
+#[tokio::test]
+async fn a_mount_cannot_be_credentialed_for_the_servers_own_warehouse() {
+    let (native, _n, native_warehouse) = catalog("native").await;
+    let (rogue, _r, rogue_warehouse) = catalog("rogue").await;
+
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(RecordingProvider {
+        // Exactly what the builder derives: every managed warehouse. The
+        // server's own is in here, which is the whole point.
+        allowed: vec![native_warehouse.clone(), rogue_warehouse.clone()],
+        asked: asked.clone(),
+    });
+
+    let app = App::builder()
+        .with_catalog(native)
+        .with_warehouse_location(native_warehouse.clone())
+        .with_default_tenant_id(TENANT)
+        .with_credential_provider(provider)
+        .with_mounts(vec![Mount {
+            name: "rogue".to_string(),
+            store: rogue,
+            capabilities: Capabilities::full(),
+            owner: TENANT.to_string(),
+            warehouse: Some(rogue_warehouse.clone()),
+        }])
+        .build()
+        .await
+        .expect("build app");
+
+    send(
+        &app,
+        Method::POST,
+        "/v1/namespaces",
+        Some(json!({ "namespace": ["rogue", "db"] })),
+    )
+    .await;
+
+    // The table is created with a location inside the *server's* warehouse
+    // rather than the mount's — which is what a compromised remote would report.
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/v1/namespaces/rogue%1Fdb/tables",
+        Some(json!({
+            "name": "borrowed",
+            "schema": schema(),
+            "location": format!("{native_warehouse}/someone-elses-table")
+        })),
+    )
+    .await;
+    // Creating it is refused outright, because a client-supplied location is
+    // confined to the mount's warehouse.
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a location outside the mount's warehouse must not be recorded: {body}"
+    );
+
+    // And the deeper guarantee, for a location this server never got to check:
+    // even a table whose recorded location points at the server's warehouse is
+    // not credentialed, because the check is against the namespace's warehouse.
+    let native_table = format!("{native_warehouse}/someone-elses-table");
+    let ns = iceberg::NamespaceIdent::from_vec(vec!["rogue".into(), "db".into()]).unwrap();
+    assert!(
+        !app.state().manages_storage_for(&ns, &native_table).await,
+        "a mounted namespace must not manage storage in the server's own warehouse"
+    );
+    assert!(
+        app.state()
+            .manages_storage_for(&ns, &format!("{rogue_warehouse}/db/t"))
+            .await,
+        "the mount's own warehouse is still its own"
+    );
+}
+
+/// The other half of the same rule.
+///
+/// With no credential provider, `loadCredentials` can only ever answer `501`.
+/// Advertising it anyway is the lie the intersection rule exists to prevent, one
+/// layer up from the mounts: a client feature-detects once and then assumes.
+#[tokio::test]
+async fn a_catalog_that_cannot_vend_does_not_advertise_credentials() {
+    let (native, _n, warehouse) = catalog("native").await;
+
+    let app = App::builder()
+        .with_catalog(native)
+        .with_warehouse_location(warehouse)
+        .with_default_tenant_id(TENANT)
+        .build()
+        .await
+        .expect("build app");
+
+    let config = send(&app, Method::GET, "/v1/config", None).await;
+    let advertised = parse(&config.1);
+    assert!(
+        !advertised["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e.as_str().is_some_and(|e| e.ends_with("/credentials"))),
+        "no provider means loadCredentials cannot succeed: {}",
+        config.1
     );
 }
 

@@ -53,7 +53,26 @@ use iceberg::{
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use super::store::{CatalogStore, Entry, Page, PageRequest, StorageHealthStatus};
+use super::store::{
+    CatalogStore, Entry, NAME_SEPARATOR, PART_SEPARATOR, Page, PageRequest, StorageHealthStatus,
+};
+
+/// The layout of the records in this file, as this binary reads them.
+///
+/// Bumped by any change to what is stored — a new relation, a renamed field, a
+/// different key encoding. Symmetric with the Postgres backend's stamp, and for
+/// the same reason: opening a database written by another build cannot reshape
+/// it, so a relation this build expects is silently empty and a record whose
+/// shape moved is silently misread or fails to parse deep inside a request.
+///
+/// redb being a *file* makes this more likely rather than less. The file
+/// outlives the binary that wrote it, sitting in a volume somebody mounts into
+/// the next image, and nothing about "table not found" points at the schema.
+///
+/// Not a migration target. Rustberg is pre-release and ships none; what the
+/// stamp buys is a sentence naming both versions instead of a catalog that
+/// appears to have lost its tables.
+const SCHEMA_VERSION: u32 = 1;
 
 /// How many times a conflicting commit is retried before answering 409.
 const COMMIT_MAX_RETRIES: u32 = 10;
@@ -63,12 +82,6 @@ const COMMIT_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_milli
 
 /// Upper bound on commit retry backoff.
 const COMMIT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(320);
-
-/// Separator between namespace levels inside a key.
-const PART_SEPARATOR: char = '\u{1F}';
-
-/// Separator between a namespace and a table name inside a key.
-const NAME_SEPARATOR: char = '\u{1E}';
 
 /// Namespace registry: key → JSON [`NamespaceRecord`].
 const NAMESPACES: TableDefinition<&str, &[u8]> = TableDefinition::new("namespaces");
@@ -99,6 +112,14 @@ const STAGED: TableDefinition<&str, &[u8]> = TableDefinition::new("staged_tables
 /// in a namespace that is concurrently being removed.
 const VIEWS: TableDefinition<&str, &[u8]> = TableDefinition::new("views");
 
+/// Bookkeeping about the file itself, keyed by name.
+///
+/// One key so far: `schema_version`. See [`SCHEMA_VERSION`].
+const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+
+/// The key under which [`SCHEMA_VERSION`] is stamped.
+const SCHEMA_VERSION_KEY: &str = "schema_version";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NamespaceRecord {
     namespace: Vec<String>,
@@ -127,6 +148,7 @@ pub struct RedbCatalog {
     db: Arc<Database>,
     file_io: FileIO,
     warehouse_location: String,
+    location_scope: crate::location::LocationScope,
     runtime: Runtime,
 }
 
@@ -136,6 +158,44 @@ impl std::fmt::Debug for RedbCatalog {
             .field("warehouse_location", &self.warehouse_location)
             .finish_non_exhaustive()
     }
+}
+
+/// Refuses a name already held in this namespace, by a table **or** a view.
+///
+/// # Why one namespace holds one kind of thing per name
+///
+/// The spec says so on four endpoints — `createTable`, `createView`,
+/// `renameTable` and `renameView` each answer `409` for *"the identifier already
+/// exists as a table or view"* — and here it is more than an interoperability
+/// rule. Both kinds are laid out at `<warehouse>/<namespace>/<name>`, so a
+/// collision puts two different metadata documents in one directory, and a purge
+/// of the table deletes the view's files along with its own. Two callers each
+/// see a resource that works, right up until one of them drops theirs.
+///
+/// # Sound inside a write transaction, and only there
+///
+/// redb serialises writers, so nothing can take the name between this read and
+/// the insert that follows it in the same transaction. Called outside one it
+/// would be exactly the check-then-act race that the Postgres backend spends a
+/// shared primary key to avoid — see `rustberg_object_names` there, which is the
+/// same rule expressed as a constraint because that backend has no serialisation
+/// to lean on.
+fn reject_taken_name(txn: &redb::WriteTransaction, key: &str, display: &str) -> Result<()> {
+    let taken = {
+        let tables = txn.open_table(TABLES).map_err(db_err)?;
+        tables.get(key).map_err(db_err)?.is_some()
+    } || {
+        let views = txn.open_table(VIEWS).map_err(db_err)?;
+        views.get(key).map_err(db_err)?.is_some()
+    };
+
+    if taken {
+        return Err(Error::new(
+            ErrorKind::TableAlreadyExists,
+            display.to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn db_err(e: impl std::fmt::Display) -> Error {
@@ -179,16 +239,33 @@ impl RedbCatalog {
         txn.open_table(VIEWS).map_err(db_err)?;
         txn.open_table(STAGED).map_err(db_err)?;
         txn.open_table(POLICIES).map_err(db_err)?;
+        // Inside the same transaction that creates the relations, so the file is
+        // never half-initialised: either it carries this build's layout and says
+        // so, or it carries neither.
+        Self::stamp_or_check_schema(&txn)?;
         txn.commit().map_err(db_err)?;
 
         Ok(Self {
             db: Arc::new(db),
             file_io,
             warehouse_location,
+            location_scope: crate::location::LocationScope::default(),
             // Captured once so a catalog built outside a runtime fails here
             // rather than on the first table operation.
             runtime: Runtime::try_current()?,
         })
+    }
+
+    /// Sets how far inside the warehouse a **registered** resource may declare
+    /// its location.
+    ///
+    /// Defaults to [`LocationScope::Table`](crate::location::LocationScope::Table),
+    /// which is what keeps a location-scoped credential a faithful enforcement
+    /// of a namespace-scoped grant. Read that type before widening it.
+    #[must_use]
+    pub fn with_location_scope(mut self, scope: crate::location::LocationScope) -> Self {
+        self.location_scope = scope;
+        self
     }
 
     async fn get_staged_record(&self, table: &TableIdent) -> Result<Option<TableRecord>> {
@@ -254,6 +331,49 @@ impl RedbCatalog {
     }
 
     /// Normalises a warehouse location, creating the directory for local paths.
+    /// Stamps a fresh database with this build's schema version, or refuses one
+    /// stamped with another.
+    ///
+    /// Runs inside the caller's write transaction. redb serialises write
+    /// transactions, so the read and the write below cannot be raced by a second
+    /// process — and a second process cannot open the file at all, which is the
+    /// whole reason this backend is the embedded one.
+    ///
+    /// An **unstamped** file is treated as this version rather than refused. A
+    /// database with no relations in it is a database this call is about to
+    /// create, and refusing one would make the first start fail. A file that
+    /// predates the stamp and *does* hold data is the one case this cannot tell
+    /// apart, and it is the pre-release case the release notes cover.
+    fn stamp_or_check_schema(txn: &redb::WriteTransaction) -> Result<()> {
+        let mut meta = txn.open_table(META).map_err(db_err)?;
+
+        let found: Option<u32> = match meta.get(SCHEMA_VERSION_KEY).map_err(db_err)? {
+            Some(value) => serde_json::from_slice(value.value()).map_err(json_err)?,
+            None => None,
+        };
+
+        match found {
+            Some(version) if version != SCHEMA_VERSION => Err(Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "This catalog file was written with Rustberg catalog schema v{version}, \
+                     and this binary reads v{SCHEMA_VERSION}. Opening it cannot reshape it, \
+                     so relations this build expects would be empty and records whose shape \
+                     moved would be misread — which shows up as missing tables rather than \
+                     as a schema error. Rustberg is pre-release and ships no migrations: \
+                     point `catalog.url` at a new file, or move this one aside."
+                ),
+            )),
+            Some(_) => Ok(()),
+            None => {
+                let encoded = serde_json::to_vec(&SCHEMA_VERSION).map_err(json_err)?;
+                meta.insert(SCHEMA_VERSION_KEY, encoded.as_slice())
+                    .map_err(db_err)?;
+                Ok(())
+            }
+        }
+    }
+
     fn normalize_warehouse(location: &str) -> Result<String> {
         if location.contains("://") && !location.starts_with("file://") {
             return Ok(location.to_string());
@@ -290,7 +410,13 @@ impl RedbCatalog {
     }
 
     fn namespace_key(ns: &NamespaceIdent) -> String {
-        ns.as_ref().join(&PART_SEPARATOR.to_string())
+        Self::namespace_key_of(ns.as_ref())
+    }
+
+    /// The same key, from parts that are not yet a validated identifier — a
+    /// parent path sliced off the front of one, for instance.
+    fn namespace_key_of(parts: &[String]) -> String {
+        parts.join(&PART_SEPARATOR.to_string())
     }
 
     /// Prefix matching every namespace strictly beneath `ns`.
@@ -390,6 +516,26 @@ impl RedbCatalog {
     fn prefix_end(prefix: &str) -> String {
         // `\u{FFFF}` sorts above every character a validated name may contain.
         format!("{prefix}\u{FFFF}")
+    }
+
+    /// The prefix a resource registered into this catalog may declare.
+    ///
+    /// The check lives here rather than in the handler for one reason: what a
+    /// vended credential is later scoped to is the location recorded *inside*
+    /// the metadata document, not the path the caller handed in. So the file
+    /// being at a legitimate path proves nothing — a file at one may declare any
+    /// location it likes. Checking after the pointer is published leaves a window
+    /// in which a table declaring somebody else's prefix is loadable; checking
+    /// before it, from the handler, reads a file the caller controls and can
+    /// change in between. There is exactly one read that is safe to check: the
+    /// one the registry is about to record, which happens here.
+    fn declared_bound(&self, namespace: &[String], name: &str) -> crate::location::LocationBound {
+        crate::location::LocationBound::new(
+            self.location_scope,
+            &self.warehouse_location,
+            &crate::location::namespace_prefix(&self.warehouse_location, namespace),
+            name,
+        )
     }
 
     fn table_location(&self, table: &TableIdent) -> String {
@@ -536,15 +682,16 @@ impl CatalogStore for RedbCatalog {
     ) -> Result<Namespace> {
         // A nested namespace needs its parent, or it would never appear in any
         // listing and be reachable only by exact path.
-        if namespace.len() > 1 {
-            let parent = Self::ident(namespace.as_ref()[..namespace.len() - 1].to_vec())?;
-            if self.get_namespace_record(&parent).await?.is_none() {
-                return Err(Error::new(
-                    ErrorKind::NamespaceNotFound,
-                    format!("Parent namespace not found: {}", parent.join(".")),
-                ));
-            }
-        }
+        //
+        // Checked *inside* the write transaction, alongside the insert. redb
+        // serialises write transactions, so that is the whole concurrency
+        // control: a parent read before `begin_write` could be dropped between
+        // the read and the insert, and the hole this refuses to create would
+        // appear anyway. The Postgres backend gets the same guarantee from a
+        // foreign key, which is why the two agree.
+        let parent_key = (namespace.len() > 1)
+            .then(|| Self::namespace_key_of(&namespace.as_ref()[..namespace.len() - 1]));
+        let parent_display = namespace.as_ref()[..namespace.len().saturating_sub(1)].join(".");
 
         let key = Self::namespace_key(namespace);
         let record = NamespaceRecord {
@@ -558,6 +705,16 @@ impl CatalogStore for RedbCatalog {
             let txn = db.begin_write().map_err(db_err)?;
             {
                 let mut table = txn.open_table(NAMESPACES).map_err(db_err)?;
+
+                if let Some(parent_key) = &parent_key
+                    && table.get(parent_key.as_str()).map_err(db_err)?.is_none()
+                {
+                    return Err(Error::new(
+                        ErrorKind::NamespaceNotFound,
+                        format!("Parent namespace not found: {parent_display}"),
+                    ));
+                }
+
                 if table.get(key.as_str()).map_err(db_err)?.is_some() {
                     return Err(Error::new(
                         ErrorKind::NamespaceAlreadyExists,
@@ -772,13 +929,8 @@ impl CatalogStore for RedbCatalog {
         self.blocking(move |db| {
             let txn = db.begin_write().map_err(db_err)?;
             {
+                reject_taken_name(&txn, &key, &display)?;
                 let mut table = txn.open_table(TABLES).map_err(db_err)?;
-                if table.get(key.as_str()).map_err(db_err)?.is_some() {
-                    return Err(Error::new(
-                        ErrorKind::TableAlreadyExists,
-                        display.to_string(),
-                    ));
-                }
                 table
                     .insert(key.as_str(), value.as_slice())
                     .map_err(db_err)?;
@@ -900,10 +1052,11 @@ impl CatalogStore for RedbCatalog {
         // Load before dropping: the metadata says which files this table owns.
         let loaded = self.load_table(table).await?;
         self.drop_table(table).await?;
-        // Deletes exactly the files this table's manifests reference, and skips
-        // data files unless `gc.enabled` — a table's location may share a prefix
-        // with others, so a recursive delete could destroy unrelated data.
-        iceberg::drop_table_data(&loaded).await
+        // Deletes exactly the files this table's metadata names, and only those
+        // that live under storage the table owns. See `catalog::purge` for why
+        // a catalog cannot use `iceberg::drop_table_data`: it deletes with the
+        // *server's* role, from paths a caller wrote.
+        crate::catalog::purge::purge_table_data(&loaded).await
     }
 
     async fn table_exists(&self, table: &TableIdent) -> Result<bool> {
@@ -935,7 +1088,7 @@ impl CatalogStore for RedbCatalog {
         self.blocking(move |db| {
             let txn = db.begin_write().map_err(db_err)?;
             {
-                let mut tables = txn.open_table(TABLES).map_err(db_err)?;
+                let tables = txn.open_table(TABLES).map_err(db_err)?;
 
                 let mut record: TableRecord = match tables.get(src_key.as_str()).map_err(db_err)? {
                     Some(v) => serde_json::from_slice(v.value()).map_err(json_err)?,
@@ -947,12 +1100,15 @@ impl CatalogStore for RedbCatalog {
                     }
                 };
 
-                if tables.get(dest_key.as_str()).map_err(db_err)?.is_some() {
-                    return Err(Error::new(
-                        ErrorKind::TableAlreadyExists,
-                        format!("Destination table already exists: {dest_display}"),
-                    ));
-                }
+                // Checked against both kinds: renaming onto a *view*'s name is
+                // the same collision, and the spec answers it the same way.
+                drop(tables);
+                reject_taken_name(
+                    &txn,
+                    &dest_key,
+                    &format!("Destination table already exists: {dest_display}"),
+                )?;
+                let mut tables = txn.open_table(TABLES).map_err(db_err)?;
 
                 record.namespace = dest_ns;
                 record.name = dest_name;
@@ -990,10 +1146,8 @@ impl CatalogStore for RedbCatalog {
         // pointer to an out-of-warehouse table is ever published, not even for
         // the microseconds a check-after-publish would leave.
         let metadata = self.read_metadata(&metadata_location).await?;
-        crate::location::confine_declared_location(
-            Some(&self.warehouse_location),
-            metadata.location(),
-        )?;
+        self.declared_bound(table.namespace.as_ref(), &table.name)
+            .ensure_iceberg(metadata.location())?;
 
         let record = TableRecord {
             namespace: table.namespace.as_ref().clone(),
@@ -1008,13 +1162,8 @@ impl CatalogStore for RedbCatalog {
         self.blocking(move |db| {
             let txn = db.begin_write().map_err(db_err)?;
             {
+                reject_taken_name(&txn, &key, &display)?;
                 let mut tables = txn.open_table(TABLES).map_err(db_err)?;
-                if tables.get(key.as_str()).map_err(db_err)?.is_some() {
-                    return Err(Error::new(
-                        ErrorKind::TableAlreadyExists,
-                        display.to_string(),
-                    ));
-                }
                 tables
                     .insert(key.as_str(), value.as_slice())
                     .map_err(db_err)?;
@@ -1100,6 +1249,26 @@ impl CatalogStore for RedbCatalog {
         Some(self.warehouse_location.clone())
     }
 
+    /// `<warehouse>/<levels…>`, the same formula this backend uses to *assign* a
+    /// location — read from `crate::location` so the side that checks one and
+    /// the side that assigns one cannot drift apart.
+    fn namespace_prefix_for(&self, namespace: &NamespaceIdent) -> Option<String> {
+        Some(crate::location::namespace_prefix(
+            &self.warehouse_location,
+            namespace.as_ref(),
+        ))
+    }
+
+    /// A native registry does everything the protocol defines. A deployment
+    /// that wants one of these subtracted says so on the *mount*, which is
+    /// where `read_only` lives — the store itself has no opinion.
+    fn capabilities_for(
+        &self,
+        _namespace: Option<&NamespaceIdent>,
+    ) -> crate::catalog::Capabilities {
+        crate::catalog::Capabilities::full()
+    }
+
     async fn storage_health_check(&self) -> Result<StorageHealthStatus> {
         use std::time::Instant;
         let start = Instant::now();
@@ -1170,10 +1339,8 @@ impl CatalogStore for RedbCatalog {
         // Read, never rewrite: registration adopts the caller's metadata, and
         // writing a fresh file would discard the version history being adopted.
         let metadata = self.read_view_metadata(&metadata_location).await?;
-        crate::location::confine_declared_location(
-            Some(&self.warehouse_location),
-            metadata.location(),
-        )?;
+        self.declared_bound(view.namespace.as_ref(), &view.name)
+            .ensure_iceberg(metadata.location())?;
 
         let record = ViewRecord {
             namespace: view.namespace.as_ref().clone(),
@@ -1188,13 +1355,8 @@ impl CatalogStore for RedbCatalog {
         self.blocking(move |db| {
             let txn = db.begin_write().map_err(db_err)?;
             {
+                reject_taken_name(&txn, &key, &display)?;
                 let mut views = txn.open_table(VIEWS).map_err(db_err)?;
-                if views.get(key.as_str()).map_err(db_err)?.is_some() {
-                    return Err(Error::new(
-                        ErrorKind::TableAlreadyExists,
-                        display.to_string(),
-                    ));
-                }
                 views
                     .insert(key.as_str(), value.as_slice())
                     .map_err(db_err)?;
@@ -1240,13 +1402,8 @@ impl CatalogStore for RedbCatalog {
         self.blocking(move |db| {
             let txn = db.begin_write().map_err(db_err)?;
             {
+                reject_taken_name(&txn, &key, &display)?;
                 let mut views = txn.open_table(VIEWS).map_err(db_err)?;
-                if views.get(key.as_str()).map_err(db_err)?.is_some() {
-                    return Err(Error::new(
-                        ErrorKind::TableAlreadyExists,
-                        display.to_string(),
-                    ));
-                }
                 views
                     .insert(key.as_str(), value.as_slice())
                     .map_err(db_err)?;
@@ -1261,6 +1418,7 @@ impl CatalogStore for RedbCatalog {
     async fn update_view(
         &self,
         view: &TableIdent,
+        expected_metadata_location: &str,
         metadata: ViewMetadata,
     ) -> Result<(String, ViewMetadata)> {
         let current = self.get_view_record(view).await?.ok_or_else(|| {
@@ -1269,6 +1427,17 @@ impl CatalogStore for RedbCatalog {
                 format!("{}.{}", view.namespace.join("."), view.name),
             )
         })?;
+
+        // Checked here as well as in the swap below, so a commit that lost the
+        // race is refused before a metadata file is written for it. The swap is
+        // what makes it safe; this only keeps the warehouse from collecting a
+        // document nothing will ever point at.
+        if current.metadata_location != expected_metadata_location {
+            return Err(Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                "View was modified concurrently",
+            ));
+        }
 
         // Derived from the current location so the version advances, and named
         // with a fresh UUID so an abandoned write leaves an unreferenced file
@@ -1294,7 +1463,11 @@ impl CatalogStore for RedbCatalog {
         let value = serde_json::to_vec(&record).map_err(json_err)?;
         let key = Self::table_key(view);
         let expected = current.version;
-        let expected_location = current.metadata_location.clone();
+        // The caller's witness, not this backend's own read. See
+        // `CatalogStore::update_view`: the updates were applied to the document
+        // at *that* location, so comparing against a later read would confirm a
+        // concurrent commit rather than detect it.
+        let expected_location = expected_metadata_location.to_string();
 
         self.blocking(move |db| {
             let txn = db.begin_write().map_err(db_err)?;
@@ -1370,7 +1543,7 @@ impl CatalogStore for RedbCatalog {
         self.blocking(move |db| {
             let txn = db.begin_write().map_err(db_err)?;
             {
-                let mut views = txn.open_table(VIEWS).map_err(db_err)?;
+                let views = txn.open_table(VIEWS).map_err(db_err)?;
 
                 let mut record: ViewRecord = match views.get(src_key.as_str()).map_err(db_err)? {
                     Some(v) => serde_json::from_slice(v.value()).map_err(json_err)?,
@@ -1382,12 +1555,13 @@ impl CatalogStore for RedbCatalog {
                     }
                 };
 
-                if views.get(dest_key.as_str()).map_err(db_err)?.is_some() {
-                    return Err(Error::new(
-                        ErrorKind::TableAlreadyExists,
-                        format!("Destination view already exists: {dest_display}"),
-                    ));
-                }
+                drop(views);
+                reject_taken_name(
+                    &txn,
+                    &dest_key,
+                    &format!("Destination view already exists: {dest_display}"),
+                )?;
+                let mut views = txn.open_table(VIEWS).map_err(db_err)?;
 
                 record.namespace = dest_ns;
                 record.name = dest_name;
@@ -1479,6 +1653,21 @@ impl RedbCatalog {
             // schema and spec it was given — but the builder reuses an identical
             // schema, spec or sort order rather than duplicating it, so
             // re-applying them is a no-op and only the new snapshot lands.
+            // A stale v3 row-id assignment is a lost race, not a malformed
+            // request. Reported before the builder sees it, so it leaves as a
+            // `409` the client will retry rather than a `400` it will not — see
+            // `store::reject_stale_row_lineage`.
+            super::store::reject_stale_row_lineage(ident, &base, updates)?;
+
+            // The four locations a commit carries, checked here because this is
+            // where the table's *current* location is already in hand. A handler
+            // would have to load the table a second time to learn it, on the
+            // hottest write path — and the bound needs it: rename never moves
+            // files, so a renamed table's files are not under the prefix its new
+            // name implies. See `location::LocationBound::ensure_commit`.
+            self.declared_bound(ident.namespace.as_ref(), &ident.name)
+                .ensure_commit(base.location(), updates)?;
+
             let mut builder = base.clone().into_builder(Some(base_location.clone()));
             for update in updates {
                 builder = update.clone().apply(builder)?;
@@ -1524,6 +1713,11 @@ impl RedbCatalog {
                     let mut tables = txn.open_table(TABLES).map_err(db_err)?;
                     let mut staged = txn.open_table(STAGED).map_err(db_err)?;
                     let namespaces = txn.open_table(NAMESPACES).map_err(db_err)?;
+                    // Opened here rather than through `reject_taken_name`, which
+                    // opens `TABLES` itself and cannot while this transaction
+                    // holds it mutably. Same question, asked with the handles
+                    // this loop already has.
+                    let views = txn.open_table(VIEWS).map_err(db_err)?;
 
                     for (key, expected, next, display) in &swaps {
                         // Checked inside the swap transaction, not before it: a
@@ -1582,7 +1776,21 @@ impl RedbCatalog {
                             // clients may stage the same name concurrently, so this
                             // is a real race and the loser must be told, not
                             // silently overwrite the winner.
+                            //
+                            // "Nothing" spans both kinds. Staging claims no name —
+                            // a client that never committed has no hold on one —
+                            // so a *view* may have taken it in between, and one
+                            // namespace holds one thing per name.
                             None => {
+                                if views.get(key.as_str()).map_err(db_err)?.is_some() {
+                                    return Err(Error::new(
+                                        ErrorKind::TableAlreadyExists,
+                                        format!(
+                                            "{display} was created as a view while this staged \
+                                             commit was in flight"
+                                        ),
+                                    ));
+                                }
                                 if current.is_some() {
                                     return Err(Error::new(
                                         ErrorKind::CatalogCommitConflicts,

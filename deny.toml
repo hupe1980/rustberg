@@ -82,9 +82,32 @@ multiple-versions = "warn"
 wildcards = "allow"  # Cargo doesn't support workspace inheritance with wildcards well
 highlight = "all"
 
-# Deny specific problematic crates
+# Crates that must never appear, under any feature combination.
+#
+# "No OpenSSL anywhere" is a design commitment, not a preference: it is what
+# makes a static musl build a `cargo zigbuild` away rather than a packaging
+# project, and it is claimed in the README and in CONCEPT.md §2. A claim nothing
+# checks is one feature flag away from becoming false, and the way it becomes
+# false is silent — some transitive dependency's default features switch
+# `native-tls` on and the binary suddenly needs a system library.
+#
+# This is the right place for the check rather than a grep in CI: `cargo deny`
+# resolves the graph from `cargo metadata`, which carries every *optional*
+# dependency too, so one run covers the whole feature matrix instead of the
+# combination that happened to be built.
+#
+# Three crates are deliberately absent from this list, and it is the same
+# distinction each time: reading the operating system's *trust store* is not
+# doing TLS with the operating system's TLS stack. `openssl-probe` locates the
+# CA bundle by reading well-known paths and links against nothing;
+# `security-framework` and `schannel` are how `rustls-native-certs` asks macOS
+# and Windows for the same list, on the way into rustls. Banning those would ban
+# the AWS SDK's use of the platform trust store, which is what anyone running
+# behind a corporate CA depends on.
 deny = [
-    # Example: { name = "openssl" }  # Prefer rustls
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
 ]
 
 # Allow specific duplicates (with justification)

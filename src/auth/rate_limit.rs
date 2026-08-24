@@ -1,15 +1,31 @@
-//! Rate limiting for authentication and API requests.
+//! Bounding what one client can spend.
 //!
-//! This module provides rate limiting to protect against brute-force attacks,
-//! denial-of-service attacks, and resource exhaustion.
+//! Two things are limited, for two different reasons.
 //!
-//! # Features
+//! **Authentication failures** are limited because a `401` is cheap to provoke
+//! and expensive to serve: verifying a JWT signature is public-key
+//! cryptography, and an unauthenticated caller can ask for it as fast as it can
+//! open sockets. Past a threshold the client is banned for a fixed interval.
 //!
-//! - **Per-IP rate limiting**: Limits requests from individual IP addresses
-//! - **Per-tenant rate limiting**: Limits requests per authenticated tenant
-//! - **Per-key rate limiting**: Limits requests per API key (for failed attempts)
-//! - **Sliding window**: Uses sliding window rate limiting for smooth throttling
-//! - **Response headers**: Returns standard rate limit headers
+//! **Requests** are limited because a catalog is a small number of shared
+//! replicas in front of an object store, and one client looping on
+//! `listNamespaces` starves the rest. Two token buckets apply: one per client
+//! address, one per authenticated tenant. The tenant bucket is the one that
+//! matters for a distributed client — a Spark cluster is fifty addresses and
+//! one identity.
+//!
+//! # The bucket is not the address
+//!
+//! Both per-address maps are keyed by [`ClientBucket`], which collapses IPv6 to
+//! its `/64`. Keying by the full address is the difference between a limit and
+//! the appearance of one; see that type.
+//!
+//! # Which address
+//!
+//! From [`crate::remote_ip`], resolved once per request and shared with
+//! `context.source_ip` and the audit record. Rate limiting does not resolve its
+//! own: a client that could pick its bucket by writing a header would have no
+//! limit at all.
 //!
 //! # Configuration
 //!
@@ -64,15 +80,6 @@ pub struct RateLimitConfig {
 
     /// Duration to ban an IP after exceeding auth fail limit.
     pub auth_fail_ban_duration: Duration,
-
-    /// Whether to trust proxy headers (X-Forwarded-For, X-Real-IP) for client IP.
-    ///
-    /// **SECURITY WARNING**: Only enable this when running behind a trusted reverse proxy
-    /// that sets these headers correctly. If enabled without a trusted proxy, attackers
-    /// can spoof their IP address to bypass rate limiting.
-    ///
-    /// Default: `false` (use connection IP only)
-    pub trust_proxy_headers: bool,
 }
 
 impl Default for RateLimitConfig {
@@ -85,7 +92,6 @@ impl Default for RateLimitConfig {
             per_tenant_burst: 1000,     // Allow burst of 1000
             auth_fail_limit: 10,        // 10 failed auths before ban
             auth_fail_ban_duration: Duration::from_secs(300), // 5 minute ban
-            trust_proxy_headers: false, // SECURE DEFAULT: don't trust proxy headers
         }
     }
 }
@@ -114,7 +120,6 @@ impl RateLimitConfig {
             per_tenant_burst: 100,
             auth_fail_limit: 5,
             auth_fail_ban_duration: Duration::from_secs(600), // 10 minutes
-            trust_proxy_headers: false, // SECURE DEFAULT: don't trust proxy headers
         }
     }
 
@@ -126,15 +131,22 @@ impl RateLimitConfig {
             return Some(Self::disabled());
         }
 
+        // Saturating throughout: the file says requests *per second* and the
+        // limiter counts per minute, so a generous configured value multiplies
+        // by 600 on its way to the tenant limit. `u32::MAX / 600` is 7.1
+        // million requests a second — a number an operator can plausibly write
+        // to mean "effectively unlimited", and one that would wrap to a limit of
+        // nearly zero. Saturating turns "absurdly large" into "as large as this
+        // can express", which is what was meant.
         Some(Self {
             enabled: true,
-            per_ip_requests: file_config.requests_per_second * 60, // Convert from per-second to per-minute
+            per_ip_requests: file_config.requests_per_second.saturating_mul(60),
             per_ip_burst: file_config.burst_size,
-            per_tenant_requests: file_config.requests_per_second * 60 * 10, // 10x IP limit for tenant
-            per_tenant_burst: file_config.burst_size * 10,
+            // Ten times the per-IP allowance: a tenant is many clients.
+            per_tenant_requests: file_config.requests_per_second.saturating_mul(600),
+            per_tenant_burst: file_config.burst_size.saturating_mul(10),
             auth_fail_limit: file_config.max_auth_failures,
             auth_fail_ban_duration: Duration::from_secs(file_config.lockout_duration_seconds),
-            trust_proxy_headers: file_config.trust_proxy_headers,
         })
     }
 }
@@ -185,14 +197,6 @@ impl RateLimitConfigBuilder {
     /// Sets the duration to ban after exceeding auth fail limit.
     pub fn auth_fail_ban_duration(mut self, duration: Duration) -> Self {
         self.config.auth_fail_ban_duration = duration;
-        self
-    }
-
-    /// Sets whether to trust proxy headers for client IP detection.
-    ///
-    /// **SECURITY WARNING**: Only enable this when running behind a trusted reverse proxy.
-    pub fn trust_proxy_headers(mut self, trust: bool) -> Self {
-        self.config.trust_proxy_headers = trust;
         self
     }
 
@@ -328,6 +332,57 @@ impl AuthFailureEntry {
 /// sees. Past it, the least-recently-used entry is dropped.
 const MAX_TRACKED_CLIENTS: u64 = 100_000;
 
+/// Prefix length one IPv6 client is assumed to control.
+///
+/// A `/64` is the smallest allocation any residential or cloud IPv6 assignment
+/// comes in, so it is the smallest unit that corresponds to *one* customer.
+const IPV6_CLIENT_PREFIX_BITS: u32 = 64;
+
+/// The unit a rate limit and an auth-failure ban apply to.
+///
+/// # Why this is not just the address
+///
+/// Every map here is keyed by something the client controls, and for IPv6 that
+/// is far more than one address. A single `/64` — the smallest allocation anyone
+/// receives — holds 2^64 of them, so keying by address gives an attacker a fresh
+/// token bucket and a fresh auth-failure counter per request. Per-IP limiting
+/// then limits nothing, and the LRU eviction that bounds the map becomes the
+/// attack: 100k requests from one prefix evict every real client's bucket.
+///
+/// So IPv6 is bucketed by `/64` and IPv4 by address. Two hosts behind one prefix
+/// share an allowance, which is the trade NAT already imposes on IPv4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClientBucket(IpAddr);
+
+impl ClientBucket {
+    /// The bucket `address` belongs to.
+    pub fn of(address: IpAddr) -> Self {
+        match address {
+            // A dual-stack listener reports an IPv4 peer as `::ffff:a.b.c.d`.
+            // Bucketing that by `/64` would put the entire IPv4 internet in one
+            // bucket, so it is unwrapped first.
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => Self(IpAddr::V4(v4)),
+                None => {
+                    let mut octets = v6.octets();
+                    octets[(IPV6_CLIENT_PREFIX_BITS / 8) as usize..].fill(0);
+                    Self(IpAddr::V6(std::net::Ipv6Addr::from(octets)))
+                }
+            },
+            v4 => Self(v4),
+        }
+    }
+}
+
+impl std::fmt::Display for ClientBucket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            IpAddr::V4(v4) => write!(f, "{v4}"),
+            IpAddr::V6(v6) => write!(f, "{v6}/{IPV6_CLIENT_PREFIX_BITS}"),
+        }
+    }
+}
+
 /// How long an idle entry is kept.
 ///
 /// A bucket refills continuously, so one untouched for this long is
@@ -352,12 +407,12 @@ const ENTRY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// inside the idle timeout.
 pub struct RateLimiter {
     config: RateLimitConfig,
-    /// Per-IP token buckets.
-    ip_limiters: Cache<IpAddr, Arc<Mutex<TokenBucket>>>,
+    /// Per-client token buckets. Keyed by [`ClientBucket`], not by address.
+    ip_limiters: Cache<ClientBucket, Arc<Mutex<TokenBucket>>>,
     /// Per-tenant token buckets.
     tenant_limiters: Cache<String, Arc<Mutex<TokenBucket>>>,
-    /// Auth failure tracker per IP.
-    auth_failures: Cache<IpAddr, Arc<Mutex<AuthFailureEntry>>>,
+    /// Auth failure tracker, keyed the same way.
+    auth_failures: Cache<ClientBucket, Arc<Mutex<AuthFailureEntry>>>,
 }
 
 impl RateLimiter {
@@ -398,15 +453,10 @@ impl RateLimiter {
         self.config.enabled
     }
 
-    /// Returns whether proxy headers should be trusted for IP detection.
-    pub fn trust_proxy_headers(&self) -> bool {
-        self.config.trust_proxy_headers
-    }
-
     /// Checks if an IP is currently banned due to auth failures.
     pub fn is_ip_banned(&self, ip: &IpAddr) -> bool {
         self.auth_failures
-            .get(ip)
+            .get(&ClientBucket::of(*ip))
             .map(|entry| entry.lock().is_banned())
             .unwrap_or(false)
     }
@@ -414,7 +464,7 @@ impl RateLimiter {
     /// Returns the ban remaining seconds for an IP.
     pub fn ip_ban_remaining(&self, ip: &IpAddr) -> Option<u64> {
         self.auth_failures
-            .get(ip)
+            .get(&ClientBucket::of(*ip))
             .and_then(|entry| entry.lock().ban_remaining_secs())
     }
 
@@ -424,9 +474,10 @@ impl RateLimiter {
             return;
         }
 
+        let bucket = ClientBucket::of(*ip);
         let entry = self
             .auth_failures
-            .get_with(*ip, || Arc::new(Mutex::new(AuthFailureEntry::new())));
+            .get_with(bucket, || Arc::new(Mutex::new(AuthFailureEntry::new())));
 
         let mut entry = entry.lock();
 
@@ -442,7 +493,7 @@ impl RateLimiter {
         if entry.failures >= self.config.auth_fail_limit {
             entry.ban_until = Some(std::time::Instant::now() + self.config.auth_fail_ban_duration);
             tracing::warn!(
-                ip = %ip,
+                client = %bucket,
                 failures = entry.failures,
                 ban_duration_secs = self.config.auth_fail_ban_duration.as_secs(),
                 "IP banned due to excessive auth failures"
@@ -457,7 +508,7 @@ impl RateLimiter {
         }
 
         // Remove failure tracking on successful auth
-        self.auth_failures.invalidate(ip);
+        self.auth_failures.invalidate(&ClientBucket::of(*ip));
     }
 
     /// Checks the per-IP rate limit. Returns Ok if allowed, Err with retry info if limited.
@@ -477,7 +528,7 @@ impl RateLimiter {
             });
         }
 
-        let entry = self.ip_limiters.get_with(*ip, || {
+        let entry = self.ip_limiters.get_with(ClientBucket::of(*ip), || {
             Arc::new(Mutex::new(TokenBucket::new(
                 self.config.per_ip_burst,
                 self.config.per_ip_requests,
@@ -566,7 +617,7 @@ impl RateLimiter {
             return Some(RateLimitInfo::unlimited());
         }
 
-        self.ip_limiters.get(ip).map(|entry| {
+        self.ip_limiters.get(&ClientBucket::of(*ip)).map(|entry| {
             let bucket = entry.lock();
             RateLimitInfo {
                 limit: self.config.per_ip_requests,
@@ -579,10 +630,10 @@ impl RateLimiter {
 
     /// Number of clients currently tracked, for tests and diagnostics.
     ///
-    /// There is deliberately no `cleanup()`. One existed, was tested, and was
-    /// never called from anywhere in the server — so the maps it was meant to
-    /// bound grew for the life of the process. Eviction is now a property of the
-    /// data structure instead of an obligation on the caller.
+    /// There is deliberately no `cleanup()`. Eviction is a property of the data
+    /// structure rather than an obligation on the caller: a method nothing calls
+    /// leaves the maps it was meant to bound growing for the life of the
+    /// process.
     pub fn tracked_clients(&self) -> u64 {
         self.ip_limiters.run_pending_tasks();
         self.ip_limiters.entry_count()
@@ -733,7 +784,10 @@ impl IntoResponse for RateLimitExceeded {
             error: RateLimitErrorBody {
                 code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
                 message,
-                error_type: "RateLimitExceededException".to_string(),
+                // Named once, in `crate::error`. This layer having its own copy
+                // is how the API reference came to document a type nothing
+                // emitted.
+                error_type: crate::error::RATE_LIMITED_TYPE.to_string(),
                 retry_after: self.retry_after,
             },
         };
@@ -757,6 +811,74 @@ impl IntoResponse for RateLimitExceeded {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    /// The attack the module's own bound was written about and did not stop:
+    /// one `/64` is 2^64 addresses, so a limiter keyed by address hands the
+    /// attacker a fresh bucket per request and evicts every real client's.
+    #[test]
+    fn one_ipv6_prefix_is_one_client() {
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff:ffff:ffff:ffff".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+
+        assert_eq!(ClientBucket::of(a), ClientBucket::of(b));
+        assert_ne!(ClientBucket::of(a), ClientBucket::of(other));
+    }
+
+    #[test]
+    fn ipv4_clients_are_still_bucketed_individually() {
+        let a: IpAddr = "203.0.113.1".parse().unwrap();
+        let b: IpAddr = "203.0.113.2".parse().unwrap();
+        assert_ne!(ClientBucket::of(a), ClientBucket::of(b));
+    }
+
+    /// A dual-stack listener reports an IPv4 peer as `::ffff:a.b.c.d`. Masking
+    /// that to a `/64` would put the whole IPv4 internet in one bucket.
+    #[test]
+    fn a_mapped_ipv4_address_is_bucketed_as_ipv4() {
+        let mapped: IpAddr = "::ffff:203.0.113.1".parse().unwrap();
+        let plain: IpAddr = "203.0.113.1".parse().unwrap();
+        let neighbour: IpAddr = "::ffff:203.0.113.2".parse().unwrap();
+
+        assert_eq!(ClientBucket::of(mapped), ClientBucket::of(plain));
+        assert_ne!(ClientBucket::of(mapped), ClientBucket::of(neighbour));
+    }
+
+    #[test]
+    fn an_ipv6_flood_exhausts_one_bucket_rather_than_minting_one_each() {
+        let limiter = RateLimiter::new(
+            RateLimitConfig::builder()
+                .per_ip_burst(5)
+                .per_ip_requests(60)
+                .build(),
+        );
+
+        // Every request from a different address inside one /64.
+        let mut refused = 0;
+        for i in 0..50u16 {
+            let ip: IpAddr = format!("2001:db8::{i:x}").parse().unwrap();
+            if limiter.check_ip_limit(&ip).is_err() {
+                refused += 1;
+            }
+        }
+
+        assert!(
+            refused > 0,
+            "rotating addresses inside one /64 must not buy a fresh allowance"
+        );
+    }
+
+    #[test]
+    fn an_absurd_configured_rate_saturates_rather_than_wrapping() {
+        let file = crate::config::RateLimitConfigFile {
+            enabled: true,
+            requests_per_second: u32::MAX,
+            ..Default::default()
+        };
+        let config = RateLimitConfig::from_file_config(&file).unwrap();
+        assert_eq!(config.per_ip_requests, u32::MAX);
+        assert_eq!(config.per_tenant_requests, u32::MAX);
+    }
 
     fn test_ip() -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))

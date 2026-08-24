@@ -110,6 +110,20 @@ GET /v1/config
 `<VERB> <path>` form. Clients feature-detect from it, so paths carry the
 `{prefix}` segment exactly as the OpenAPI spec writes them.
 
+Two entries depend on how **storage access** was configured rather than on a
+backend, and appear only when they can succeed:
+
+| Entry | Present when |
+|---|---|
+| `POST …/tables/{table}/sign` | remote signing is configured ([`[credentials.signing]`](@/docs/configuration.md)) |
+| `GET …/tables/{table}/credentials` | a credential provider covers **every** warehouse this catalog serves |
+
+A deployment with no credential provider can only ever answer `501` on
+`loadCredentials`, and an advertised endpoint that always fails is worse than an
+absent one — a client feature-detects once at startup and then assumes. The
+endpoints stay routed either way, so a mixed deployment keeps working where it
+can; what it stops doing is promising.
+
 > **Schemas.** Rustberg does not ship its own copy of the Iceberg REST OpenAPI
 > document. The authoritative one is
 > [`rest-catalog-open-api.yaml`](https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml)
@@ -217,7 +231,9 @@ POST /v1/namespaces/{namespace}/properties
 DELETE /v1/namespaces/{namespace}
 ```
 
-**Response:** `204 No Content`
+**Response:** `204 No Content`, or `409 Conflict` if the namespace still holds
+tables or views, or carries `rustberg.protected = "true"` — see
+[protection](#drop-table).
 
 ---
 
@@ -381,12 +397,41 @@ trip, and skipping it is the point. A request that sends no `If-None-Match`
 pays nothing for this: the tag is computed from the load that was happening
 anyway.
 
-The tag changes whenever the metadata does, and also when `snapshots` changes —
-a tag obtained with `snapshots=refs` will not satisfy a request for
-`snapshots=all`, because that is different content.
+The tag changes whenever the metadata does, and also whenever anything else
+about the document does: `snapshots=refs` and `snapshots=all` are different
+content and never share a tag, and neither do a caller whose policy restricts the
+table and one whose policy does not — a restricted caller is refused delegation,
+so its response is missing the signer block. Different content, different tag,
+in all three directions.
 
 `If-None-Match` is evaluated **after** authorization. A caller that may not see
 a table gets `404`, never `304`.
+
+A response carrying a tag also carries `Cache-Control: private, no-cache`.
+`no-cache` does not mean *do not cache* — it means the stored copy may not be
+reused without revalidating here first, which is what a validator is for, and why
+a grant revoked since the last load is caught on the next one. `private` keeps
+the response, which is scoped to one principal, out of shared caches. Responses
+without a tag keep the catalog-wide default of `no-store`.
+
+##### Delegation and caching
+
+`loadTable` is not one representation, and `X-Iceberg-Access-Delegation` decides
+which one you get.
+
+| Asked for | `ETag`? | Why |
+|---|---|---|
+| Nothing | yes | Metadata only, and it changes only when the table does |
+| `remote-signing` | yes, a **different** one | The signer block is derived from the table's identity and holds no secret, so it caches — but it is a different document, and must not share a tag with the plain one |
+| `remote-signing`, on a table policy restricts | yes, a **third** one | A restricted table is refused delegation, so the signer block is absent. Two principals asking the same question of the same table get two documents, and they must not share a tag either |
+| `vended-credentials` | **no** | The response carries a freshly minted, expiring credential |
+
+A credentialed load is never answered `304` and never carries a tag. A `304` has
+no body, so a client that echoed a tag *and* asked for a credential would be told
+"unchanged" and handed nothing to read the table with — with nothing in the
+exchange saying so. The response has no stable identity, so it is given no
+validator, and it keeps `Cache-Control: no-store`: nothing carrying a credential
+should be written to a cache at all.
 
 #### Snapshot scope
 
@@ -542,10 +587,78 @@ DELETE /v1/namespaces/{namespace}/tables/{table}
 
 **Purge Behavior:**
 
-When `purgeRequested=true`:
-1. Table metadata is loaded to determine the storage location
-2. Table is removed from the catalog registry
-3. All files in the table's location are recursively deleted (data files, manifest files, metadata files)
+When `purgeRequested=true`, the catalog walks the table's manifests and deletes
+exactly the files they reference — data files, delete files, manifests, manifest
+lists, Puffin statistics and metadata files — **that live under the table's own
+`location`**.
+
+Anything else the metadata names is skipped and logged by path. A manifest is
+written by the engine and lists data files by path, so "delete everything this
+metadata names" is an instruction a caller can partly write — and the catalog
+deletes with the *server's* storage role, which reaches the whole warehouse.
+Without the bound, an engine could list another tenant's data files in its own
+manifest and delete them by dropping its own table. Skipping leaves an orphan,
+which costs storage and can be found; deleting leaves nothing to find.
+
+It does **not** recursively delete the table's location either. Two tables can
+share a prefix, and a recursive delete of `s3://wh/db/events` would take
+`s3://wh/db/events-archive` with it. Anything under the location that no manifest
+references — an orphan from an abandoned write — is left in place; removing those
+is [orphan-file cleanup](#known-limitations), which is a maintenance job rather
+than a catalog operation.
+
+A manifest the purge cannot **read** gets the same answer as one it may not
+delete: the files it names are left as orphans, a warning counts them, and the
+drop succeeds. The table is dropped before its files are walked — the metadata
+naming them is reached through the entry being removed — so failing instead would
+answer `500` for a drop that already happened, and `404` on the retry. The usual
+cause is a snapshot expired outside this catalog.
+
+`write.data.path` and `write.metadata.path` are deliberately **not** honoured as
+extra roots. A table may point them anywhere, so a table naming another tenant's
+prefix would reopen the same hole one field along; confining them to the
+warehouse does not help, because the warehouse is where the other tenants are,
+and confining them to the table's location makes them redundant. A table that
+declares one outside its location keeps those files after a purge, and says so in
+a warning at purge time.
+
+Data files are additionally gated by the table's own `gc.enabled` property, which
+is Iceberg's way of saying "these files are not shared with another table". A
+table that sets it to `false` keeps its data on a purge.
+
+**Protection**
+
+A table, view or namespace carrying `rustberg.protected = "true"` refuses to be
+dropped or purged:
+
+```bash
+curl -X DELETE http://localhost:8000/v1/namespaces/analytics/tables/events \
+  -H "X-API-Key: $API_KEY"
+# 409 Conflict
+# Table 'analytics.events' is protected from deletion. Clear the
+# 'rustberg.protected' property first, then retry.
+```
+
+`409`, not `403`: you *are* permitted, and the resource is in a state that
+forbids the operation. Set it at creation, or later:
+
+```bash
+curl -X POST http://localhost:8000/v1/namespaces/analytics/tables/events \
+  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"requirements": [],
+       "updates": [{"action": "set-properties",
+                    "updates": {"rustberg.protected": "true"}}]}'
+```
+
+Only the exact value `true` protects, case-insensitively. `"yes"`, `"1"` and
+`""` do not — a value that looks like it might mean protected and does not is
+worse than no value at all.
+
+> **This stops an accident, not an adversary.** It is an ordinary property, so
+> anyone who can set it can clear it. It is there for the `DROP TABLE` typed
+> against the wrong catalog and the migration script pointed at prod. For a hard
+> stop, write a Cedar `forbid` on `Delete` — that is a rule the holder of the
+> property cannot edit.
 
 **Example:**
 
@@ -635,15 +748,18 @@ Adopts view metadata that already exists in storage — the mirror of `register`
 for tables. The metadata file is **read, never rewritten**, so the view's
 version history survives being moved between catalogs.
 
-The location is confined to the warehouse, and the `location` the metadata file
-itself declares is re-checked after reading. See
-[security](@/docs/security.md#credential-vending).
+The location is confined to the prefix this view's name puts it in, and the
+`location` the metadata file itself declares is re-checked after reading. See
+[security](@/docs/security.md#the-storage-boundary-is-the-policy-boundary).
 
 ### Drop View
 
 ```http
 DELETE /v1/namespaces/{namespace}/views/{view}
 ```
+
+**Response:** `204 No Content`, or `409 Conflict` if the view carries
+`rustberg.protected = "true"` — see [protection](#drop-table).
 
 ### View Exists
 
@@ -656,6 +772,22 @@ HEAD /v1/namespaces/{namespace}/views/{view}
 ```http
 POST /v1/namespaces/{namespace}/views/{view}
 ```
+
+Takes `requirements` and `updates` like a table commit. The one requirement the
+spec defines for views is `assert-view-uuid`.
+
+Concurrency is optimistic and answers `409 CommitFailedException`, exactly as a
+table commit does — but it is worth saying explicitly, because a view commit is
+the shape that most often is not: the server loads the current metadata, applies
+your updates to it, and swaps the pointer **only if it still points at what was
+loaded**. Two clients editing one view from the same read is a race, the first
+one through wins, and the second is told rather than silently overwriting it.
+Reload and re-apply, which is the same thing you do for a table.
+
+`assert-view-uuid` does not substitute for that. It pins the view's *identity* —
+that this is still the same view and not a recreated one under the same name —
+and every version of a view shares one UUID, so it cannot tell you the version
+moved.
 
 ### Rename View
 
@@ -845,7 +977,27 @@ GET /health
 GET /ready
 ```
 
-**Response:** `200 OK` when ready to serve traffic
+**Response:** `200 OK` when this replica can serve, `503` when it cannot.
+
+```json
+{
+  "status": "ready",
+  "version": "0.1.0",
+  "timestamp": 1704067200,
+  "components": {
+    "catalog": { "status": "ready" },
+    "storage": { "status": "ready", "message": "s3:12ms" }
+  }
+}
+```
+
+Two components, because two things can actually be unreachable. Everything else
+a replica needs is a value that exists or the process did not start.
+
+The probe is cached for two seconds. `/ready` carries no credential and is
+therefore outside rate limiting, so an uncached probe would let any caller turn
+one HTTP request into a database query and an object-store round trip at
+whatever rate it chose.
 
 ### Prometheus Metrics
 
@@ -877,6 +1029,35 @@ rustberg_requests_total{method="GET",status="200"} 1234
 }
 ```
 
+**Every** error uses this envelope, including the ones a web framework normally
+answers on its own: a malformed JSON body, a path parameter that fails
+validation, an unparseable namespace. Those arrive as plain text from most
+servers, and a client that reads `error.message` out of JSON gets a parse failure
+instead of the sentence — so "your namespace contains `..`" becomes an unhandled
+client-side error. The two exceptions are outside the catalog API entirely:
+`/health` and `/ready` answer with their own shapes, and `/metrics` with
+Prometheus text.
+
+`message` is a sentence and `type` is the machine-readable name, and neither
+repeats the other. An error whose message is a full sentence carries no prefix —
+`"The namespace contains U+200B, which is…"` rather than `"Bad request: the
+namespace contains…"` beside a `type` that already says `BadRequestException`.
+Where the payload is a bare identifier the prefix is the verb and stays:
+`"Table does not exist: analytics.events"`.
+
+### Every 401 is the same 401
+
+Missing, malformed, unknown, revoked, expired, bad signature — all the identical
+response. Two of those are reachable only *after* the server's constant-time hash
+comparison succeeds, so naming them would confirm that the key sent is a real
+one. The reason is in the server's audit record, joined to your request by
+`X-Request-Id`; ask an operator rather than the API.
+
+Every `401` carries `WWW-Authenticate: Bearer realm="rustberg"`, as RFC 9110
+requires. `Bearer` covers both mechanisms — an API key is accepted as
+`Authorization: Bearer <key>` as well as in `X-API-Key`, which is what makes
+PyIceberg's `token` property work against a catalog that issues no JWTs.
+
 ### Error Codes
 
 These are the exact `type` values the server emits.
@@ -884,14 +1065,21 @@ These are the exact `type` values the server emits.
 | Code | Type | Description |
 |------|------|-------------|
 | 400 | BadRequestException | Invalid request, identifier, schema, page token, or JSON body |
-| 401 | NotAuthorizedException | Missing or invalid credentials |
+| 401 | NotAuthorizedException | Missing or invalid credentials — one answer for every way of failing, see [below](#every-401-is-the-same-401) |
 | 403 | ForbiddenException | Authenticated, but not permitted |
 | 404 | NoSuchNamespaceException | Namespace not found |
 | 404 | NoSuchTableException | Table not found |
 | 404 | NoSuchViewException | View not found |
-| 409 | AlreadyExistsException | Namespace, table, or view already exists |
+| 404 | NoSuchSnapshotException | Snapshot id not in this table |
+| 404 | NoSuchReferenceException | Branch or tag not in this table |
+| 404 | NoSuchPlanIdException | Every plan completes inline; see [Scan planning](#scan-planning) |
+| 404 | NoSuchPlanTaskException | The same, for `fetchScanTasks` |
+| 404 | NotFoundException | The path is not part of this catalog's API |
+| 405 | MethodNotAllowedException | The path exists but does not take that method |
+| 409 | AlreadyExistsException | Namespace already exists, or the identifier is already a table **or** a view — see [one name, one thing](#one-name-one-thing) |
 | 409 | CommitFailedException | Optimistic concurrency conflict — retry |
 | 409 | NamespaceNotEmptyException | Namespace still has tables or children |
+| 409 | ProtectedException | `rustberg.protected = "true"` refuses the drop or purge |
 | 422 | UnprocessableEntityException | Well-formed but semantically invalid |
 | 429 | TooManyRequestsException | Rate limited |
 | 500 | InternalServerError | Internal error |
@@ -899,7 +1087,13 @@ These are the exact `type` values the server emits.
 | 503 | ServiceUnavailableException | Temporarily unavailable |
 
 A `409 CommitFailedException` is the normal outcome of two writers racing on one
-table; clients retry with exponential backoff. A `501` means the operation exists
+table; clients retry with exponential backoff. On a **format version 3** table it
+also covers a second kind of race: every row has an id, a writer stamps its
+snapshot with `first-row-id` taken from the metadata it read, and two writers that
+read the same metadata stamp the same value — so the second is stale and must
+refresh and re-derive it. That is a lost race like any other and is reported as
+one, rather than as the "invalid row id" `400` the underlying metadata library
+raises, which no client would retry. A `501` means the operation exists
 in the spec but this deployment does not offer it — credential vending with no
 provider configured, for example.
 
@@ -965,12 +1159,26 @@ curl -X POST http://localhost:8000/v1/namespaces/analytics/tables/events/plan \
 }
 ```
 
-Every plan completes in this response. Rustberg never answers `submitted`, emits
-no `plan-tasks`, and therefore never uses `fetchScanTasks`: issuing work to poll
-for means per-plan server-side state, which a replica set cannot share without a
-session store. The `plan-id` names a plan that has already finished — `GET`ting
-it reports that nothing is in progress, and `DELETE`ing it succeeds because there
-is nothing to cancel.
+Every plan completes in this response. Rustberg never answers `submitted` and
+emits no `plan-tasks`: issuing work to poll for means per-plan server-side state,
+which a replica set cannot share without a session store.
+
+The follow-up endpoints are routed anyway, and answer the spec's own errors:
+
+| | |
+|---|---|
+| `GET …/plan/{plan-id}` | `404 NoSuchPlanIdException` — the plan already finished, in the response above |
+| `DELETE …/plan/{plan-id}` | `204` — cancelling a finished plan is a no-op, so a client can clean up unconditionally |
+| `POST …/tasks` (`fetchScanTasks`) | `404 NoSuchPlanTaskException` — no `plan-task` was ever issued to exchange |
+
+Routed rather than left to the router's own `404`, because the two are different
+things to a client: an Iceberg error body naming `NoSuchPlanIdException` says
+"there is no such plan", and a bare `404` with no body reads as "this server does
+not implement the REST protocol".
+
+All three are advertised in `endpoints` alongside `POST …/plan`, and all three
+disappear together on a mount that cannot plan. Listing two of the three would
+say this server implements part of an interface it implements all of.
 
 ### The filter
 
@@ -991,18 +1199,42 @@ both halves.
 
 Literals are typed by the column they are compared against, in the spec's
 single-value form — a date is `"2023-01-01"`, a decimal and a UUID are strings,
-binary and fixed are hex.
+binary and fixed are hex. Every timestamp type takes that string spelling,
+including `timestamp_ns` and `timestamptz_ns`; the integer count each is stored
+as is accepted beside it, because engines send it.
 
-**Anything outside this is refused with `400`, never silently dropped.** That
-covers transform terms, `apply`, references by field id, a column the table does
-not have, and a literal that does not fit its column. A planner that ignored a
-filter it could not read would prune against a predicate you did not write and
-return *fewer* files than the scan needs — a wrong answer rather than a slow one.
-If your filter is outside the grammar, send none and prune client-side.
+**Two different failures, two different answers.**
 
-The `residual-filter` on each task is the filter you sent, unchanged. That is
-always correct because the client applies it, and it never claims a narrowing
-that did not happen.
+*Unsupported* — a transform term, `apply`, a reference by field id, an operator
+from a newer spec — is **widened**, not refused. It stops contributing to
+pruning, so you get a *superset* of the files your filter selects, and the
+`residual-filter` still carries the whole predicate for you to apply. Widening is
+polarity-aware, so a term under a `not` widens to "everything" rather than
+collapsing to "nothing". A planner that *dropped* such a term instead would prune
+against a predicate you did not write and return **fewer** files than the scan
+needs — a wrong answer rather than a slow one.
+
+*Malformed* — a column the table does not have, a literal that does not fit its
+column, a missing operand, an `is-nan` on a column that is not a float or a
+double — is a `400`. Widening a typo into a silent full scan would hide it. Every
+operator binds its column against the schema, including the unary ones that carry
+no literal to type-check.
+
+> **A Cedar `@row_filter` is the other way round.** Widening a *restriction*
+> removes it — `@row_filter("region = 'EU'")` silently becoming everything — so a
+> policy filter that cannot be bound to the table being planned is a `403` naming
+> the term. Same grammar, opposite safe direction: one is a request, the other a
+> limit.
+>
+> An operator or a term outside the table below cannot bind against *any* table,
+> so it is refused when the **policy set loads** rather than at plan time — a
+> misspelled `"type": "equals"` is a startup failure, not a `403` on whichever
+> query happens to hit it first.
+
+The `residual-filter` on each task is the filter you sent, plus whatever a
+matching permit's `@row_filter` added. Both halves are needed: pruning is
+conservative, so a file that survives may still hold rows the policy filter
+excludes, and an engine that applied only the half it sent would read them.
 
 ### Column statistics
 
@@ -1018,14 +1250,25 @@ Only the named fields appear in `column-sizes`, `value-counts`,
 `null-value-counts`, `nan-value-counts`, `lower-bounds` and `upper-bounds`.
 Naming a column the table does not have is a `400`.
 
+Names resolve with the request's own `case-sensitive` flag, like every other
+column reference in a plan. The **mask** check that follows is deliberately
+looser — it compares the resolved schema name without regard to case either way —
+so the flag cannot be used to ask for a masked column's bounds under a different
+spelling.
+
+It compares the column's **full dotted path**, which is what a `@column_mask`
+names: a mask on `user.ssn` withholds the statistics of `user.ssn` and of an
+unrelated top-level `ssn` neither.
+
 ### What is declined
 
 | | Status | |
 |---|---|---|
 | Incremental scans (`start-snapshot-id`, `end-snapshot-id`) | `501` | Answering them as a full scan would return far more than was asked for |
 | `stats-fields` naming a masked column | `403` | Statistics name the column's minimum and maximum values, which is what the mask hides |
+| A `@column_mask` over a column the table is **partitioned** on | `403` | Every file carries its partition tuple, and Iceberg writes partition values into the object key, so a plan cannot be served without publishing the column |
 | A policy row filter that cannot be applied to this table | `403` | Refused rather than returning files the filter was meant to withhold |
-| A federated `rest` mount | `501` | Its manifests are in storage this server does not manage. The endpoint is absent from `/v1/config` when any mount cannot plan |
+| A table in a federated `rest` mount | `501` | Its manifests are in storage this server does not manage. The refusal is **per namespace**: native tables beside it still plan, even though `/v1/config` stops advertising the endpoint once any mount cannot plan |
 | More than 25 000 files in one plan | `400` | One plan is one response; a silently short plan reads less than the query asked for |
 
 ---
@@ -1076,8 +1319,10 @@ The request and response are the spec's `RemoteSignRequest` and
 ```
 
 Only the headers signing *adds* come back — merge them into the request you
-already built. `Cache-Control: private` on a read says the signature may be
-reused for that exact request; a write is `no-cache`.
+already built. **Use the `uri` that comes back**, not the one you sent: it is the
+same URI in resolved form, and it is the one the signature covers. `Cache-Control:
+private` on a read says the signature may be reused for that exact request; a
+write is `no-cache`.
 
 ### What is signed, and what is refused
 
@@ -1086,24 +1331,95 @@ A signature is minted only when all of these hold:
 1. The caller may `Read` the table, and `Update` it for anything mutating.
 2. The table carries no row filter or column mask.
 3. The table's storage is a warehouse this server manages — never a mount's.
-4. Every location the request touches is inside the table's own location.
+4. The request is one of the S3 operations this endpoint knows how to authorize.
+5. Every location the request touches is inside the table's own location.
 
-The fourth is where the work is, because the location is not always in the path.
+The last two are where the work is, because neither the operation nor the
+locations are reliably in the path.
+
+#### The operation is not the method
+
+S3 dispatches on a **sub-resource** in the query string, so one `PUT` to one key
+is `PutObject`, `PutObjectAcl`, `PutObjectTagging` or `RestoreObject` depending
+on a parameter a location check never looks at. Only the first writes data —
+`PUT …/events/data/00000.parquet?acl` with `x-amz-acl: public-read` is inside the
+table location, passes every containment check, and publishes the file to the
+internet.
+
+So the endpoint signs an **allowlist** of operations:
+
+| Signed | Not signed |
+|---|---|
+| `GetObject`, `HeadObject`, `PutObject`, `DeleteObject` | `?acl`, `?policy`, `?ownershipControls` — who may read it |
+| `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload` (`?uploads`, `?uploadId`) | `?retention`, `?legal-hold`, `?object-lock`, `?lifecycle` — how long it survives |
+| `DeleteObjects` (`?delete`) | `?requestPayment`, `?restore`, `?intelligent-tiering` — what it costs |
+| `ListObjectsV2` (`?list-type=2`) | `?replication`, `?notification`, `?logging`, `?inventory` — what leaves the bucket |
+| `UploadPartCopy`/`CopyObject`, when the source is inside the same table | `?tagging`, `?versioning`, `?website`, `?cors`, `?encryption`, `?select`, `?torrent` |
+
+`x-amz-acl` and `x-amz-grant-*` are refused with them: a signature authorizes
+*this* request, never an unbounded set of future ones by somebody who never
+reached this catalog.
+
+Only the S3 sub-resource set is filtered, so ordinary parameters an SDK adds —
+`x-id`, `versionId`, response-header overrides, list continuation tokens — pass
+through untouched.
+
+#### A location can be in the body, the query string, or a header
+
 `DeleteObjects` addresses the bucket and names its keys in an XML body;
 `ListObjectsV2` addresses the bucket and names its prefix in the query string.
 Both are resolved and confined, and a list prefix must sit *strictly* inside the
 table location, because S3 matches prefixes as raw strings and `…/events` also
 returns the keys of `…/events-secret`.
 
-**Anything that cannot be resolved to a location is refused with `400`.** That
-covers bucket-level sub-resources (`?versions`, `?uploads`, `?location`), methods
-other than GET/HEAD/PUT/POST/DELETE/PATCH, and a `DeleteObjects` body this
-endpoint cannot read exactly.
+`x-amz-copy-source` is the sharpest case. A `PUT` to
+`…/events/data/00000.parquet` with
+
+```
+x-amz-copy-source: /other-bucket/secrets/private.parquet
+```
+
+has a destination squarely inside your own table, and asks S3 to fill it with an
+object you were never permitted to read — using **the catalog's** storage role,
+which reaches it. Signing only the destination would turn this endpoint into a
+read of everything that role can reach, from nothing but `Update` on one table
+you legitimately own. So the copy source is confined exactly like the
+destination.
+
+#### The URI that comes back is the URI that was checked
+
+Locations are resolved out of the URI with a URL parser, and a URL parser
+*resolves* a path: `.` and `..` segments are removed, and under `http`/`https` a
+backslash is a separator. So all three of
+
+```
+https://wh.s3.amazonaws.com/other/../analytics/events/data/00000.parquet
+https://wh.s3.amazonaws.com/other\..\..\analytics\events\data\00000.parquet
+https://wh.s3.amazonaws.com/analytics/events/data/x/%2E%2E/00000.parquet
+```
+
+read here as `…/analytics/events/data/00000.parquet` — inside the table — while
+S3 takes the key literally and would act on one that is not.
+
+Rather than refuse spellings — which would turn an ordinary key carrying an
+unusual byte into a `400` for no safety gained — the endpoint signs the
+**resolved** URI and returns it. The string checked, the string signed and the
+string in the response are one string, so anything else sent to S3 is refused by
+S3 itself.
+
+Clients that use the returned `uri` need do nothing; PyIceberg and the Java
+`S3V4RestSignerClient` both do.
+
+**Anything that cannot be resolved to a location, or to an operation on this
+list, is refused.** That covers bucket-level operations other than
+`DeleteObjects` and `ListObjectsV2`, methods outside
+GET/HEAD/PUT/POST/DELETE/PATCH, and a `DeleteObjects` body or
+`x-amz-copy-source` this endpoint cannot read exactly.
 
 | Status | Means |
 |---|---|
 | `200` | Signed; merge `headers` into the request |
-| `400` | The request cannot be resolved to a location inside a table |
+| `400` | The request cannot be resolved to a location, or is an operation this endpoint does not sign |
 | `403` | Outside the table, or the table is under row or column policy |
 | `404` | The caller cannot see the table |
 | `501` | This deployment does not offer remote signing |
@@ -1357,19 +1673,81 @@ partial success.
 |---|---|---|
 | Asynchronous scan planning (`plan-tasks`, `fetchScanTasks`) | — | Every plan is answered inline; there is nothing to poll for. See [Scan planning](#scan-planning). |
 | Incremental scan planning | `501` | Declined rather than answered as a full scan. |
-| `POST /v1/oauth/tokens` | `404` | Deprecated in the spec. Rustberg validates tokens, it does not issue them — `oauth2-server-uri` in the config response points at your IdP. |
+| `POST /v1/oauth/tokens` | `501` | Deprecated for removal in the spec. Rustberg validates tokens, it does not issue them — `oauth2-server-uri` in the config response points at your IdP. The path is *routed* and answers without a credential, because a client configured with `credential=` calls it before anything else and a bare `401` there reads as a bad key. |
 | SQL UDFs (`…/namespaces/{ns}/functions`) | `404` | Function metadata is a third metadata document alongside tables and views, and `iceberg-rust` models none of it. |
 | Row filters enforced against a hostile engine | — | Applied in the scan plan and withheld from credentials, but nothing makes an unplanned file unfetchable. See [authorization](@/docs/authorization.md). |
 | Column masks as anything but advisory | — | Needs Parquet modular encryption; the masked bytes are in the file the engine downloads. |
+| Compaction and file-level maintenance | — | Data rewriting is not a catalog operation. See [Table maintenance](#table-maintenance). |
 
-### Storage locations are confined to the warehouse
+### Table maintenance
+
+Rustberg does not compact, rewrite manifests or hunt orphan files, and this is a
+boundary rather than a gap. All three are *data rewriting*: they need a Parquet
+reader and writer, which would put the catalog in the data path that the whole
+[row- and column-security story](@/docs/authorization.md) depends on it staying
+out of. They are also a different availability shape — a compaction run holds
+work for minutes to hours and needs durable job state, retries and workers,
+against a server built around microsecond decisions and stateless replicas.
+
+Apache Polaris reached the same conclusion and delegates to a pluggable table
+maintenance system; Lakekeeper emits events for an external one to react to.
+
+**The metadata half is served, through the ordinary REST surface.** A maintenance
+job pointed at Rustberg gets compare-and-swap commits, an authorization decision
+per operation, and an audit record naming the principal that performed it:
+
+| Operation | How it arrives |
+|---|---|
+| Expire snapshots | `RemoveSnapshots` in `POST …/tables/{table}` |
+| Drop a branch or tag | `RemoveSnapshotRef` in the same call |
+| Discard statistics | `RemoveStatistics`, `RemovePartitionStatistics` |
+| Delete a dropped table's files | `DELETE …/tables/{table}?purgeRequested=true` |
+
+So Spark's `expire_snapshots`, or any maintenance system that speaks Iceberg
+REST, works against Rustberg today. What it must bring is the engine that rewrites
+the data.
+
+### One name, one thing
+
+A namespace holds one thing per name, whichever kind it is. `createTable`,
+`createView`, `renameTable` and `renameView` all answer `409` when the
+identifier is already taken — by a table *or* by a view, which is what the spec
+asks for on each of the four.
+
+It is not only an interoperability rule. Both kinds live at
+`<warehouse>/<namespace>/<name>`, so a collision would put two metadata
+documents in one directory and let `dropTable?purgeRequested=true` delete the
+view's files along with the table's — and no engine can resolve
+`SELECT * FROM db.events` when `db.events` is both.
+
+Staging does not claim a name: a `stage-create` that is never committed leaves
+the name free, and the claim happens at the commit.
+
+### A storage location is confined to the resource that names it
 
 `createTable`, `createView` and `registerTable` accept a client-supplied
-location. Any location outside `storage.warehouse_location` is refused with
-`400`. A registered table's metadata is read and its declared `location` checked
+location, and `set-location` on a commit changes one. All of them are confined
+to `<warehouse>/<namespace>/<name>` — the prefix the resource's own name puts it
+in, and the layout this catalog assigns anyway. Anything outside is `400`.
+
+`add-snapshot`, `set-statistics` and `set-partition-statistics` name files
+rather than move the table, so they are confined to the table's **own location**
+instead — which is where a renamed table's files still are, since a rename never
+moves them.
+
+The bound is the resource's prefix rather than the warehouse because it is a
+security boundary, not a layout rule; see
+[security](@/docs/security.md#the-storage-boundary-is-the-policy-boundary).
+Laying a table out freely *under* its own prefix is unaffected.
+
+A registered resource's metadata is read and its declared `location` checked
 *before* the catalog records anything — a file at a legitimate path can still
-declare a `location` elsewhere. See
-[security](@/docs/security.md#credential-vending).
+declare a `location` elsewhere.
+
+`storage.location_scope = "warehouse"` widens the bound back for adopting a lake
+that predates this catalog. See
+[security](@/docs/security.md#the-storage-boundary-is-the-policy-boundary) and
+[configuration](@/docs/configuration.md#where-a-client-may-put-a-table-s-files).
 
 ---
 

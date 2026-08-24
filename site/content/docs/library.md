@@ -56,6 +56,38 @@ let table = session.load_table(&events).await?;
 let tables = session.list_tables(events.namespace(), page(100)).await?;
 ```
 
+### Views, including writing them
+
+Create, load, commit and drop:
+
+```rust
+let summary = TableIdent::new(
+    NamespaceIdent::from_vec(vec!["analytics".into()])?,
+    "summary".into(),
+);
+
+let (location, metadata) = session.load_view(&summary).await?;
+
+// Edit the metadata directly — in-process there is no wire format of updates to
+// apply, so the host holds a `ViewMetadata` and changes it.
+let edited = metadata
+    .into_builder()
+    .set_properties(std::collections::HashMap::from([
+        ("comment".to_string(), "nightly rollup".to_string()),
+    ]))?
+    .build()?
+    .metadata;
+
+session.commit_view(&summary, &location, edited).await?;
+```
+
+`commit_view` takes the `location` that `load_view` returned, and that is the
+compare-and-swap witness rather than bookkeeping. The caller loads, edits and
+hands back a finished document, so the store cannot re-derive what the edit was
+based on — comparing against a read of its own would confirm a commit that landed
+in between rather than detect it. A stale location answers `409`; reload and
+re-apply.
+
 ### Authentication is yours
 
 Rustberg does not authenticate an in-process caller. Your host has already
@@ -103,8 +135,10 @@ Everything the endpoint of the same name enforces:
   catalog.
 - **Listing filters** — `list_namespaces`, `list_tables` and `list_views` return
   the subset you may read, filtered before the page is cut.
-- **Location confinement** — a `location` you supply to `create_table` is
-  confined to the warehouse of the namespace it goes in.
+- **Location confinement** — a `location` you supply to `create_table`, or a
+  `set-location` you commit, is confined to the prefix the table's own name puts
+  it in. Your host is the *server* here, not a trusted caller, so the check runs
+  on this side of the boundary too.
 - **The cross-tenant rename refusal** — a rename is not a way to move data
   between tenants.
 - **Audit** — every decision is recorded, permit and deny alike, and a mutation

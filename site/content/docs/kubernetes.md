@@ -108,7 +108,7 @@ rustberg:
     jwt:
       enabled: true
       issuer: https://auth.example.com
-      audience: rustberg
+      audiences: ["rustberg"]
 
 resources:
   requests:
@@ -131,7 +131,30 @@ podDisruptionBudget:
 serviceMonitor:
   enabled: true
   interval: 30s
+
+shutdown:
+  drainDelaySeconds: 5
+  terminationGracePeriodSeconds: 60
 ```
+
+### Rolling updates without dropped requests
+
+Kubernetes removes a pod from its Service's endpoints and sends it `SIGTERM` **at
+the same time**, and the removal still has to reach every kube-proxy and ingress
+controller. A pod that stops accepting the instant it is signalled refuses
+whatever arrives in that window — connection errors on every rolling update.
+
+A `preStop` hook that sleeps cannot fix it here: the image is distroless, so
+there is no shell. Rustberg waits itself. After `SIGTERM` it keeps serving for
+`shutdown.drainDelaySeconds` (passed as `--shutdown-delay`), then drains
+in-flight requests, which get 30 seconds.
+
+`terminationGracePeriodSeconds` must cover the delay *plus* the drain, or the
+kubelet `SIGKILL`s the process partway through. The chart sets both.
+
+A readiness probe does not replace this — it fails once the pod stops answering,
+which is after the ingress has already routed to it. A `podDisruptionBudget`
+bounds how many pods drain at once.
 
 ### Helm Commands
 
@@ -253,6 +276,9 @@ data:
     [server]
     host = "0.0.0.0"
     port = 8000
+    # The pod CIDR the ingress controller runs in. Without this every request is
+    # attributed to the ingress pod, and X-Forwarded-For is ignored entirely.
+    trusted_proxies = ["10.0.0.0/8"]
 
     [storage]
     # Postgres for a multi-replica deployment; supplied via RUSTBERG_CATALOG_URL
@@ -271,8 +297,6 @@ data:
     [rate_limit]
     enabled = true
     requests_per_second = 1000
-    # Behind an ingress that overwrites X-Forwarded-For.
-    trust_proxy_headers = true
 
     [audit]
     sink = "stdout"
@@ -700,9 +724,23 @@ spec:
     interval: 30s
 ```
 
-### Grafana Dashboard
+### Grafana
 
-Import the Rustberg dashboard from `docs/grafana-dashboard.json`.
+There is no dashboard to import — a JSON blob in the repository goes stale
+against every Grafana release and against its own metric names. Build one from
+what `/metrics` actually exports:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `rustberg_info` | gauge | `version` |
+| `rustberg_build_timestamp_seconds` | gauge | — |
+| `rustberg_requests_total` | counter | `method` |
+| `rustberg_catalog_operations_total` | counter | `operation`, `result` |
+| `rustberg_auth_attempts_total` | counter | `method`, `result` |
+| `rustberg_rate_limit_exceeded_total` | counter | — |
+
+`curl http://<pod>:8000/metrics` is the authoritative list; it is what the
+`ServiceMonitor` above scrapes.
 
 ---
 
@@ -720,19 +758,39 @@ kubectl logs -l app=rustberg -n rustberg --tail=100
 
 ### S3 Permission Issues
 
+The image is **distroless** — no shell, no `aws`, no `curl` — so nothing can be
+`exec`d into it except the `rustberg` binary itself. To test the pod's
+credentials, run a throwaway pod with the *same* service account, which is what
+actually decides the identity:
+
 ```bash
-# Test from pod
-kubectl exec -it deployment/rustberg -n rustberg -- \
-  aws s3 ls s3://my-bucket/rustberg-catalog/
+kubectl run s3-probe -n rustberg --rm -it --restart=Never \
+  --image=amazon/aws-cli \
+  --overrides='{"spec":{"serviceAccountName":"rustberg"}}' \
+  -- s3 ls s3://my-bucket/rustberg-catalog/
 ```
+
+A `403` here and a `403` from Rustberg are the same problem; a success here and a
+failure there is a Rustberg configuration problem, not an IAM one.
 
 ### Health Check Failures
 
+The readiness probe is an `httpGet` made by the kubelet, so it needs nothing
+inside the container. To ask the same question by hand:
+
 ```bash
-# Manual health check
-kubectl exec -it deployment/rustberg -n rustberg -- \
-  curl -s localhost:8000/health
+# From outside — the probe's own view
+kubectl port-forward -n rustberg deployment/rustberg 8000:8000 &
+curl -s localhost:8000/ready | jq
+
+# From inside — the binary probes itself, which is also what the container
+# image's own HEALTHCHECK runs
+kubectl exec deployment/rustberg -n rustberg -- rustberg healthcheck
 ```
+
+`/ready` names the component that is not ready — the catalog store or the
+warehouse — which is the part worth reading. `/health` only reports that the
+process is up.
 
 ---
 

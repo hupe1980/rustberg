@@ -38,6 +38,59 @@ pub const RESERVED_PROPERTY_PREFIX: &str = "rustberg.internal.";
 /// Reserved property key holding the owning tenant's ID.
 pub const TENANT_ID_PROPERTY: &str = "rustberg.internal.tenant-id";
 
+/// Property marking a table, view or namespace as protected from deletion.
+///
+/// Set it to `true` and `dropTable`, `dropView`, `dropNamespace` and a purge are
+/// refused with `409` until it is cleared.
+///
+/// # Deliberately *not* reserved, and deliberately not a security control
+///
+/// A caller who may set this may also clear it, because it is an ordinary
+/// property written through `updateProperties` and `commitTable`. So it stops an
+/// accident, not an adversary: the `DROP TABLE` typed against the wrong catalog,
+/// the migration script pointed at prod, the cleanup job whose filter matched
+/// one row too many. Every one of those is a *second* deliberate step away from
+/// being possible, and none of them takes it.
+///
+/// Making it reserved — server-managed, unwritable by clients — would mean
+/// protection could only ever be turned on, since the same handler that refuses
+/// client writes to `rustberg.internal.*` would refuse the write that lifts it.
+/// Gating it behind a separate action would be the real control, and would also
+/// be a second authorization vocabulary for one boolean; `Delete` on the
+/// resource is already the permission that decides whether it may be dropped at
+/// all. Anyone who wants a hard stop writes a Cedar `forbid`, which is what that
+/// is for and which the holder of the property cannot edit.
+pub const PROTECTED_PROPERTY: &str = "rustberg.protected";
+
+/// Whether `properties` marks the resource as protected from deletion.
+///
+/// Only the exact string `true`, case-insensitively and ignoring surrounding
+/// whitespace. Anything else — `"yes"`, `"1"`, `""` — is not protection: a
+/// value that looks like it might mean protected and does not is worse than an
+/// absent one, because the operator believes the resource is safe.
+pub fn is_protected(properties: &HashMap<String, String>) -> bool {
+    properties
+        .get(PROTECTED_PROPERTY)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+}
+
+/// Refuses a deletion when `properties` marks the resource protected.
+///
+/// # Errors
+///
+/// [`AppError::Protected`] naming the property to clear. `409` rather than `403`:
+/// the caller *is* permitted — the resource is in a state that forbids the
+/// operation, and the fix is one property write rather than a policy change.
+pub fn reject_if_protected(properties: &HashMap<String, String>, what: &str) -> Result<()> {
+    if !is_protected(properties) {
+        return Ok(());
+    }
+    Err(AppError::Protected(format!(
+        "{what} is protected from deletion. Clear the '{PROTECTED_PROPERTY}' property \
+         first, then retry."
+    )))
+}
+
 /// Returns true if `key` is server-managed and must never be set by a client.
 pub fn is_reserved(key: &str) -> bool {
     key.starts_with(RESERVED_PROPERTY_PREFIX)
@@ -158,5 +211,52 @@ mod tests {
     #[test]
     fn owner_of_reports_unowned() {
         assert_eq!(owner_of(&props(&[("owner", "alice")])), None);
+    }
+    // ── Protection ──────────────────────────────────────────────────────
+
+    #[test]
+    fn only_the_word_true_protects() {
+        assert!(is_protected(&props(&[(PROTECTED_PROPERTY, "true")])));
+        assert!(is_protected(&props(&[(PROTECTED_PROPERTY, "TRUE")])));
+        assert!(is_protected(&props(&[(PROTECTED_PROPERTY, " true ")])));
+
+        // A value that looks like it might mean protected and does not is worse
+        // than an absent one: the operator believes the table is safe.
+        for value in ["yes", "1", "on", "", "false", "True!"] {
+            assert!(
+                !is_protected(&props(&[(PROTECTED_PROPERTY, value)])),
+                "{value:?} must not read as protection"
+            );
+        }
+        assert!(!is_protected(&props(&[("other", "true")])));
+    }
+
+    #[test]
+    fn a_protected_resource_is_refused_with_a_conflict() {
+        let err = reject_if_protected(&props(&[(PROTECTED_PROPERTY, "true")]), "Table 'db.t'")
+            .unwrap_err();
+
+        assert_eq!(err.status_code(), axum::http::StatusCode::CONFLICT);
+        assert!(
+            err.to_string().contains("db.t"),
+            "names the resource: {err}"
+        );
+        assert!(
+            err.to_string().contains(PROTECTED_PROPERTY),
+            "names the property to clear: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unprotected_resource_is_not_refused() {
+        assert!(reject_if_protected(&props(&[("owner", "alice")]), "Table 'db.t'").is_ok());
+    }
+
+    /// Protection is an ordinary property, so it survives a property update the
+    /// way any other does — and can be cleared the same way. It is not reserved.
+    #[test]
+    fn protection_is_a_client_property_not_a_reserved_one() {
+        assert!(!is_reserved(PROTECTED_PROPERTY));
+        assert!(reject_reserved([PROTECTED_PROPERTY.to_string()].iter()).is_ok());
     }
 }

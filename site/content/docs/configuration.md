@@ -48,7 +48,54 @@ host = "0.0.0.0"
 
 # Listen port
 port = 8000
+
+# Address ranges that are forwarding infrastructure rather than callers.
+# Empty (the default) means X-Forwarded-For is not read at all and the caller's
+# address is the TCP peer.
+trusted_proxies = ["10.0.0.0/8"]
+
+# Seconds to keep serving after SIGTERM, before draining. Zero (the default)
+# drains immediately; set a few seconds behind a load balancer.
+shutdown_delay_seconds = 0
 ```
+
+#### `trusted_proxies`
+
+One setting, three consumers: the rate-limit bucket, `context.source_ip` in a
+Cedar policy, and the address on an audit record. They must agree, and an address
+a caller can choose is an authorization bypass in the second of them — so it is
+not a rate-limiting option.
+
+With ranges configured, the forwarding chain is `X-Forwarded-For` left to right
+with the TCP peer appended, and it is walked **from the right**, skipping hops
+inside a trusted range. The first address that is not infrastructure is the
+client. `X-Real-IP` is honoured only when the peer is itself trusted and no chain
+was sent.
+
+Reading the leftmost entry — all a "trust proxy headers" boolean can mean — is a
+spoof: `X-Forwarded-For` is appended to at each hop, so a client that sends one
+of its own arrives as `<chosen>, <real client>`.
+
+A range that does not parse is a **startup failure**, not a silently dropped
+entry. The alternative attributes every request to the load balancer's own
+address while looking like working software.
+
+#### `shutdown_delay_seconds`
+
+How long to keep accepting requests after `SIGTERM`, before draining what is in
+flight. Zero is right wherever nothing routes to this process but whoever started
+it — a laptop, Docker Compose, a systemd unit.
+
+Behind a load balancer it is not. Removing an instance from rotation and
+signalling it happen at the same time, and the removal takes time to reach
+whatever is still routing; requests arriving in that window are refused. In
+Kubernetes that is connection errors on every rolling update.
+
+A `preStop` hook that sleeps **cannot work here** — the image is distroless, so
+there is no shell. The wait is in-process instead, applies to `SIGTERM` only
+(never `Ctrl+C`), and is also settable as `--shutdown-delay` or
+`RUSTBERG_SHUTDOWN_DELAY`, which is how the Helm chart sets it. Once it is over,
+in-flight requests get 30 seconds on either transport.
 
 Request timeout (30 s), maximum body size (10 MB) and gzip compression are fixed
 rather than configurable. They are limits that protect the server from its
@@ -69,7 +116,34 @@ catalog_url = "file:///var/lib/rustberg/data"
 # Where tables live. Any scheme whose feature is compiled in:
 # file://, s3://, gs://, abfss://
 warehouse_location = "s3://my-bucket/warehouse"
+
+# How far inside the warehouse a client-supplied location may point.
+# "table" (default) or "warehouse" — see below. This is a security boundary.
+location_scope = "table"
 ```
+
+#### Where a client may put a table's files
+
+`location_scope` decides how far inside the warehouse a client-supplied location
+may point — the `location` on `createTable` and `createView`, the file
+`registerTable` names, and `set-location` on a commit.
+
+| | Bound | For |
+|---|---|---|
+| `"table"` | `<warehouse>/<namespace>/<name>` | The default. The layout this catalog assigns anyway |
+| `"warehouse"` | the whole warehouse | Adopting a lake whose files are not where a name would put them |
+
+The default is a **security boundary**: a grant is written over the namespace
+tree and storage access is scoped to a path, and those are one hierarchy only
+while a resource's files stay where its name puts them. Under `"warehouse"`, a
+caller permitted to write one table can point it at any prefix in the warehouse
+and be handed a correctly-scoped credential for it. Choose it only where
+something outside Rustberg enforces the isolation, or where every principal that
+can write is trusted with the whole warehouse. See
+[security](@/docs/security.md#the-storage-boundary-is-the-policy-boundary).
+
+Either way a resource lays itself out freely *under* its own prefix, so
+`s3://bucket/warehouse/db/events/data/2024/` is fine for table `db.events`.
 
 #### Reaching the warehouse
 
@@ -161,9 +235,12 @@ config change plus a restart; if you need revocation without a restart, use JWT.
 
 ```toml
 [server.auth.jwt]
-issuer   = "https://auth.example.com"
-audience = "rustberg"
-jwks_url = "https://auth.example.com/.well-known/jwks.json"
+issuer    = "https://auth.example.com"
+audiences = ["rustberg"]
+
+# Omitted: the signing keys are found by reading the issuer's
+# `/.well-known/openid-configuration`, whose own `issuer` is checked against the
+# one above. Set `jwks_url` to skip discovery.
 
 # Claim carrying the tenant; used for isolation. A dotted path addresses a
 # nested object, and the longest literal key wins — so a namespaced claim whose
@@ -218,6 +295,21 @@ max_auth_failures = 5
 lockout_duration_seconds = 300
 ```
 
+Which address counts as "the client IP" is set by
+[`[server] trusted_proxies`](#trusted-proxies), not here.
+
+A **failure** is a credential that was presented and rejected — a wrong API key,
+a JWT with a bad signature, an expired or malformed one. Verifying a signature is
+the most expensive thing an unauthenticated caller can ask this server to do,
+which is what the lockout bounds.
+
+Two things deliberately do not count. A request carrying **no** credential is an
+unconfigured client, and counting it would let a stray health checker lock out
+everyone behind its address. And a failure that is *this server's* — an
+unreachable identity provider above all — is not the caller's to pay for;
+turning an outage into a lockout answers it by refusing every client that
+noticed.
+
 ### TLS
 
 ```toml
@@ -233,7 +325,7 @@ insecure_http = false
 Omitting both paths with `enabled = true` generates a self-signed certificate —
 useful for development only. Supplying one path without the other is a startup
 error rather than a silent fallback. Rustberg is rustls-only; there is no
-OpenSSL in the dependency tree.
+OpenSSL in the dependency tree, and `cargo deny` keeps it that way.
 
 ### Audit
 
@@ -412,7 +504,7 @@ catalog, so adding a mount does not disturb what was already there.
 | `catalog_url` | **yes** | Backend location — see below |
 | `warehouse_location` | for `native` | Where this mount's tables live |
 | `owner` | **yes** | Tenant that owns everything in the mount |
-| `read_only` | no (`false`) | Refuse every mutation (`native` only) |
+| `read_only` | no (`false`) | Refuse every mutation (`native` only). Reads are untouched, [scan planning](@/docs/api.md#scan-planning) included — its manifests are in a warehouse this server declared, which is what a `rest` mount does not have |
 | `token_env` | no | Variable holding a bearer token (`rest` only) |
 
 #### Backends
@@ -503,7 +595,7 @@ table dropped from one catalog and never created in the other.
 ### Logging
 
 Application logs go to **stderr**. That is what keeps stdout a clean stream of
-audit records, so `rustberg serve | jq` works and a log shipper reading the audit
+audit records, so `rustberg | jq` works and a log shipper reading the audit
 trail never has to filter human-readable lines out of it.
 
 ```toml
@@ -572,11 +664,8 @@ COMMANDS:
     generate-key     Generate a new API key
     generate-cert    Generate a self-signed TLS certificate for development
     generate-config  Generate a sample configuration file
-    backup           Create a backup of the catalog database
-    restore          Restore a catalog database from backup
-    validate-backup  Validate a backup file without restoring
-    status           Show catalog statistics and health
-    benchmark        Run startup/performance benchmarks
+    healthcheck      Probe a running server's /ready and set the exit status
+    bench            Measure the numbers this project claims, the way CI does
     help             Print help for a subcommand
 
 OPTIONS:
@@ -584,7 +673,9 @@ OPTIONS:
         --host <HOST>        Bind address [default: 0.0.0.0]
     -p, --port <PORT>        Listen port [default: 8000]
     -w, --warehouse <URL>    Warehouse location for table storage (see below)
+        --catalog-url <URL>  Catalog database: file:///…, postgres://…, memory://
     -t, --tenant-id <ID>     Default tenant ID [default: default]
+        --dev                Development mode (ephemeral catalog, relaxed checks)
         --no-auth            Disable authentication (NOT RECOMMENDED)
         --log-level <LEVEL>  Log level [default: info]
         --tls-cert <FILE>    TLS certificate path (PEM format)
@@ -593,6 +684,26 @@ OPTIONS:
     -V, --version            Print version
     -h, --help               Print help
 ```
+
+There is no `backup`, `restore` or `status` subcommand. Backup belongs to the
+backend — a stopped-server file copy for redb, `pg_dump` for Postgres — and
+[catalog and warehouse](@/docs/storage.md#backup-and-restore) says how. Status is
+`/health` and `/ready`, which report on a server that is actually running rather
+than guessing from what is on disk.
+
+`healthcheck` exists for one reason: the container image is distroless, so it has
+no shell and no `curl`, and a `HEALTHCHECK` has to be the binary that is already
+there. It reads `/ready` on `127.0.0.1` at this server's own port and exits
+non-zero when the answer is not `200`:
+
+```bash
+rustberg healthcheck                                  # http://127.0.0.1:8000/ready
+rustberg --port 9000 healthcheck                      # a different port
+rustberg healthcheck --url https://catalog/ready      # anywhere else
+```
+
+Kubernetes does not need it — an `httpGet` probe is made by the kubelet, from
+outside the container — and the Helm chart uses `httpGet` accordingly.
 
 ### Warehouse Location
 
@@ -702,9 +813,8 @@ jwt_enabled = true
 policy_file = "/etc/rustberg/policies/catalog.cedar"
 
 [server.auth.jwt]
-issuer     = "https://auth.company.com"
-audience   = "rustberg"
-jwks_url   = "https://auth.company.com/.well-known/jwks.json"
+issuer       = "https://auth.company.com"
+audiences    = ["rustberg"]
 tenant_claim = "tenant"
 roles_claim  = "groups"
 

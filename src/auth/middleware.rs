@@ -13,12 +13,14 @@ use axum::{
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use super::audit::{log_auth_failure, log_auth_success, log_rate_limit};
+use super::audit::AuditEvent;
+use super::audit_sink::Auditor;
 use super::authn::Authenticator;
 use super::authz::RequestContext;
 use super::error::AuthError;
 use super::principal::Principal;
 use super::rate_limit::{RateLimitConfig, RateLimitInfo, RateLimiter};
+use crate::remote_ip::{RemoteIp, X_FORWARDED_FOR, X_REAL_IP};
 
 // ============================================================================
 // AuthState for Middleware
@@ -29,6 +31,20 @@ use super::rate_limit::{RateLimitConfig, RateLimitInfo, RateLimiter};
 pub struct AuthState {
     pub authenticator: Arc<dyn Authenticator>,
     pub rate_limiter: Arc<RateLimiter>,
+    /// How the caller's address is worked out.
+    ///
+    /// Deliberately *not* part of the rate-limiter's configuration. The address
+    /// decides three separate things — the rate-limit bucket,
+    /// `context.source_ip` in a Cedar policy, and the address on an audit record
+    /// — so hanging it off one of the three would let switching rate limiting
+    /// off silently change what every address-conditioned policy sees.
+    pub remote_ip: RemoteIp,
+    /// Where authentication and rate-limit records go.
+    ///
+    /// The same auditor the catalog guard writes decisions through: there is one
+    /// trail, so "was this request authenticated" and "what was it then allowed
+    /// to do" are answered by one file.
+    pub auditor: Arc<Auditor>,
 }
 
 impl AuthState {
@@ -37,6 +53,8 @@ impl AuthState {
         Self {
             authenticator,
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::disabled())),
+            remote_ip: RemoteIp::direct(),
+            auditor: Arc::new(Auditor::disabled()),
         }
     }
 
@@ -48,7 +66,23 @@ impl AuthState {
         Self {
             authenticator,
             rate_limiter,
+            remote_ip: RemoteIp::direct(),
+            auditor: Arc::new(Auditor::disabled()),
         }
+    }
+
+    /// The same state, resolving caller addresses behind trusted proxies.
+    pub fn with_remote_ip(mut self, remote_ip: RemoteIp) -> Self {
+        self.remote_ip = remote_ip;
+        self
+    }
+
+    /// The same state, recording through `auditor`.
+    ///
+    /// Must be the process's one auditor; see the field.
+    pub fn with_auditor(mut self, auditor: Arc<Auditor>) -> Self {
+        self.auditor = auditor;
+        self
     }
 }
 
@@ -81,17 +115,29 @@ pub async fn auth_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    // Extract client IP for rate limiting
-    // Only trust proxy headers if explicitly configured (prevents IP spoofing attacks)
-    let trust_proxy = auth_state.rate_limiter.trust_proxy_headers();
-    let client_ip = extract_client_ip(&request, trust_proxy);
+    // One resolution, read by the rate limiter, by `context.source_ip`, and by
+    // the audit record. See `remote_ip` for why a forwarding chain is walked
+    // from the right.
+    let client_ip = extract_client_ip(&request, &auth_state.remote_ip);
+
+    // Read before anything can be refused, so a `401` or a `429` joins to the
+    // client's own log line as well as a served request does. Those refusals are
+    // the records somebody is watching this stream for.
+    let request_id = request
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(sanitize_request_id);
 
     // Check rate limit before authentication
     if let Some(ip) = client_ip
         && let Err(exceeded) = auth_state.rate_limiter.check_ip_limit(&ip)
     {
-        // Audit log: rate limit triggered
-        log_rate_limit(&ip.to_string(), None, "ip");
+        auth_state.auditor.record_lossy(
+            &AuditEvent::rate_limit("ip")
+                .with_client_ip(ip)
+                .with_optional_request_id(request_id.as_deref()),
+        );
         return exceeded.into_response();
     }
 
@@ -110,14 +156,6 @@ pub async fn auth_middleware(
             // trail that records it as a success describes something that did
             // not happen — which is the one thing a governance product's audit
             // stream cannot do.
-            if principal.is_expired() {
-                if let Some(ip) = client_ip {
-                    log_auth_failure(Some(&ip.to_string()), "credential expired");
-                }
-                return AuthError::TokenExpired.into_response();
-            }
-
-            // Audit log: authentication success
             let auth_method = match principal.auth_method() {
                 super::principal::AuthMethod::ApiKey => "api_key",
                 super::principal::AuthMethod::Bearer => "jwt",
@@ -125,11 +163,25 @@ pub async fn auth_middleware(
                 super::principal::AuthMethod::External => "host",
                 _ => "other",
             };
-            log_auth_success(
-                principal.id(),
-                principal.tenant_id(),
-                client_ip.as_ref().map(|ip| ip.to_string()).as_deref(),
-                auth_method,
+
+            if principal.is_expired() {
+                // Recorded whether or not the address resolved: a failure this
+                // server cannot attribute is more worth keeping, not less.
+                auth_state.auditor.record_lossy(
+                    &AuditEvent::authentication(auth_method, false)
+                        .with_optional_client_ip(client_ip)
+                        .with_optional_request_id(request_id.as_deref())
+                        .with_detail("reason", "credential expired"),
+                );
+                return AuthError::TokenExpired.into_response();
+            }
+
+            auth_state.auditor.record_lossy(
+                &AuditEvent::authentication(auth_method, true)
+                    .with_principal_id(principal.id())
+                    .with_tenant_id(principal.tenant_id())
+                    .with_optional_client_ip(client_ip)
+                    .with_optional_request_id(request_id.as_deref()),
             );
 
             // Check per-tenant rate limit for authenticated requests
@@ -137,13 +189,12 @@ pub async fn auth_middleware(
                 .rate_limiter
                 .check_tenant_limit(principal.tenant_id())
             {
-                // Audit log: tenant rate limit triggered
-                log_rate_limit(
-                    &client_ip
-                        .map(|ip| ip.to_string())
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    Some(principal.tenant_id()),
-                    "tenant",
+                auth_state.auditor.record_lossy(
+                    &AuditEvent::rate_limit("tenant")
+                        .with_principal_id(principal.id())
+                        .with_tenant_id(principal.tenant_id())
+                        .with_optional_client_ip(client_ip)
+                        .with_optional_request_id(request_id.as_deref()),
                 );
                 return add_rate_limit_headers(exceeded.into_response(), None);
             }
@@ -158,12 +209,7 @@ pub async fn auth_middleware(
                 Some(ip) => RequestContext::from_ip(ip),
                 None => RequestContext::default(),
             };
-            if let Some(id) = request
-                .headers()
-                .get("x-request-id")
-                .and_then(|v| v.to_str().ok())
-                .and_then(sanitize_request_id)
-            {
+            if let Some(id) = request_id {
                 facts = facts.with_request_id(id);
             }
             request.extensions_mut().insert(facts);
@@ -183,20 +229,31 @@ pub async fn auth_middleware(
             response
         }
         Err(e) => {
-            // Record auth failure
-            if let Some(ip) = client_ip {
-                // Only record failures for invalid credentials, not missing credentials
-                if matches!(
-                    e,
-                    AuthError::InvalidCredentials(_)
-                        | AuthError::ApiKeyNotFound
-                        | AuthError::ApiKeyDisabled
-                ) {
+            // A *presented* credential that did not verify is the event worth
+            // both counting and recording. A request that carried none is not:
+            // it is an unauthenticated caller reaching an authenticated server,
+            // which is the ordinary shape of a client that has not been
+            // configured yet, and counting it would let a stray health checker
+            // exhaust the failure budget of everyone sharing its address.
+            //
+            // The classification lives on `AuthError` rather than here: listed
+            // inline, it reads as three variants and leaves out every way a
+            // *token* fails — a forged JWT signature is `InvalidToken`, the most
+            // expensive rejection this server serves and the cheapest to
+            // provoke. See `AuthError::credential_was_rejected`.
+            if e.credential_was_rejected() {
+                if let Some(ip) = client_ip {
                     auth_state.rate_limiter.record_auth_failure(&ip);
-
-                    // Audit log: authentication failure
-                    log_auth_failure(Some(&ip.to_string()), &e.to_string());
                 }
+                // Outside the address check, so a deployment whose forwarding
+                // chain cannot be read — the case `remote_ip` resolves to
+                // *unknown* — still audits its failed authentications.
+                auth_state.auditor.record_lossy(
+                    &AuditEvent::authentication("unknown", false)
+                        .with_optional_client_ip(client_ip)
+                        .with_optional_request_id(request_id.as_deref())
+                        .with_detail("reason", e.to_string()),
+                );
             }
             e.into_response()
         }
@@ -207,55 +264,45 @@ pub async fn auth_middleware(
 // Helper Functions
 // ============================================================================
 
-/// Extracts the client IP address from the request.
+/// The caller's address, per this deployment's trusted-proxy configuration.
 ///
-/// If `trust_proxy_headers` is true, checks the following in order:
-/// 1. `X-Forwarded-For` header (first IP)
-/// 2. `X-Real-IP` header
-/// 3. Connected socket address
-///
-/// If `trust_proxy_headers` is false (default), only uses the connected socket address.
-///
-/// **SECURITY NOTE**: Only trust proxy headers when running behind a known, trusted
-/// reverse proxy. Untrusted proxy headers allow attackers to spoof their IP address
-/// and bypass rate limiting.
-fn extract_client_ip(request: &Request<Body>, trust_proxy_headers: bool) -> Option<IpAddr> {
-    // Only check proxy headers if explicitly trusted
-    if trust_proxy_headers {
-        // Try X-Forwarded-For first (common for proxied requests)
-        if let Some(xff) = request.headers().get("x-forwarded-for")
-            && let Ok(xff_str) = xff.to_str()
-        {
-            // X-Forwarded-For can contain multiple IPs; take the first
-            if let Some(first_ip) = xff_str.split(',').next()
-                && let Ok(ip) = first_ip.trim().parse::<IpAddr>()
-            {
-                return Some(ip);
-            }
-        }
-
-        // Try X-Real-IP
-        if let Some(real_ip) = request.headers().get("x-real-ip")
-            && let Ok(ip_str) = real_ip.to_str()
-            && let Ok(ip) = ip_str.trim().parse::<IpAddr>()
-        {
-            return Some(ip);
-        }
-    }
-
-    // Fall back to connected address (from ConnectInfo extension)
-    // This is always safe to use as it's the actual TCP connection source
-    request
+/// The rule and the reasoning live in [`crate::remote_ip`]; this only pulls the
+/// headers and the peer address out of the request and hands them over.
+fn extract_client_ip(request: &Request<Body>, resolver: &RemoteIp) -> Option<IpAddr> {
+    let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0.ip())
+        .map(|ci| ci.0.ip());
+
+    // Skipped entirely when no proxy is trusted: the headers cannot change the
+    // answer, and cloning them per request to prove that would be waste.
+    if !resolver.trusts_any_proxy() {
+        return resolver.resolve(peer, &[], None);
+    }
+
+    let forwarded: Vec<&str> = request
+        .headers()
+        .get_all(X_FORWARDED_FOR)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    let real_ip = request
+        .headers()
+        .get(X_REAL_IP)
+        .and_then(|value| value.to_str().ok());
+
+    resolver.resolve(peer, &forwarded, real_ip)
 }
 
 /// Longest client-supplied request id that reaches an audit record.
 ///
 /// A UUID is 36 characters and every tracing convention in use is shorter than
 /// this. The bound is what matters, not the exact number.
-const MAX_REQUEST_ID_LEN: usize = 128;
+/// Longest inbound `x-request-id` this server will carry.
+///
+/// Every audit record names one, so an unbounded id is an unbounded row and a
+/// caller could inflate the trail by a large multiple of the requests it sent.
+pub const MAX_REQUEST_ID_LEN: usize = 128;
 
 /// Accepts a correlation id only if it is safe to carry into an audit record.
 ///
@@ -277,14 +324,59 @@ const MAX_REQUEST_ID_LEN: usize = 128;
 /// something unusual loses correlation on that request and nothing else. The
 /// server-generated UUID still identifies it, because `SetRequestIdLayer` only
 /// declines to *overwrite* — it always ensures one exists.
-fn sanitize_request_id(id: &str) -> Option<String> {
-    let id = id.trim();
-    if id.is_empty() || id.len() > MAX_REQUEST_ID_LEN {
-        return None;
+/// The header a request id travels in, named once.
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Removes an inbound `x-request-id` this server will not carry, so the layer
+/// that mints one replaces it.
+///
+/// An inbound id is preserved so a trace survives the hop, and bounded so a
+/// caller cannot inflate the audit trail with it. The bound has to *replace*
+/// rather than ignore: `PropagateRequestIdLayer` echoes whatever it found, so an
+/// id dropped only from the record leaves the response naming one thing and the
+/// trail naming nothing — which lets a caller unjoin its own requests from the
+/// trail by sending a two-kilobyte id.
+///
+/// Sits outside `SetRequestIdLayer`, which leaves an existing header alone and
+/// mints only when there is none.
+pub async fn strip_unusable_request_id(mut request: Request<Body>, next: Next) -> Response {
+    let unusable = request
+        .headers()
+        .get_all(REQUEST_ID_HEADER)
+        .iter()
+        // A repeat is unusable for the same reason a bad character is: which one
+        // the trail would name is then a coin toss.
+        .try_fold(0usize, |count, value| match (count, value.to_str()) {
+            (0, Ok(id)) if is_usable_request_id(id) => Ok(1),
+            _ => Err(()),
+        })
+        .is_err();
+
+    if unusable {
+        request.headers_mut().remove(REQUEST_ID_HEADER);
     }
-    id.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
-        .then(|| id.to_string())
+
+    next.run(request).await
+}
+
+/// Whether an inbound `x-request-id` is one this server will carry.
+///
+/// Read in two places, which is why it is a function rather than a check at each
+/// of them: [`strip_unusable_request_id`], which runs *outside* the layer that
+/// mints one, and this middleware, which reads whatever survived. If those two
+/// disagreed the record and the echoed header would name different things —
+/// which is the one thing a request id exists not to do.
+pub fn is_usable_request_id(id: &str) -> bool {
+    let id = id.trim();
+    !id.is_empty()
+        && id.len() <= MAX_REQUEST_ID_LEN
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+}
+
+fn sanitize_request_id(id: &str) -> Option<String> {
+    is_usable_request_id(id).then(|| id.trim().to_string())
 }
 
 /// Adds rate limit headers to a response.
@@ -479,6 +571,31 @@ mod tests {
             None
         );
         assert!(sanitize_request_id(&"a".repeat(MAX_REQUEST_ID_LEN)).is_some());
+    }
+
+    /// The two readers of the rule have to agree, or the id echoed to the client
+    /// and the id in the audit record name different things.
+    #[test]
+    fn the_layer_and_the_record_agree_on_what_is_usable() {
+        for id in [
+            "9af89211-3ef2-4e97-b516-ffc00ae2274b",
+            "trace:abc.123_x",
+            &"a".repeat(MAX_REQUEST_ID_LEN),
+        ] {
+            assert!(is_usable_request_id(id), "{id} should be carried");
+            assert_eq!(sanitize_request_id(id).as_deref(), Some(id.trim()));
+        }
+
+        for id in [
+            "",
+            "   ",
+            &"a".repeat(MAX_REQUEST_ID_LEN + 1),
+            "has space",
+            "nul\u{0}",
+        ] {
+            assert!(!is_usable_request_id(id), "{id:?} should be replaced");
+            assert_eq!(sanitize_request_id(id), None);
+        }
     }
 
     /// Dropped rather than escaped or truncated: a correlation id is opaque, so
