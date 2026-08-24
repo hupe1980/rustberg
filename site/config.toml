@@ -1,6 +1,6 @@
 base_url = "https://hupe1980.github.io/rustberg"
 title = "Rustberg"
-description = "The policy layer for Apache Iceberg. One authenticated, policy-controlled Iceberg REST endpoint in front of every catalog you own — a single Rust binary, and an embeddable crate."
+description = "A policy-first Apache Iceberg REST catalog. Cedar authorization on every request, embedded redb or Postgres, storage access scoped to what policy allows, and a real audit trail — a single Rust binary, and an embeddable crate."
 default_language = "en"
 author = "hupe1980"
 
@@ -49,7 +49,7 @@ license = "Apache-2.0"
 og_image = "/og.png"
 
 # The one-line claim the whole site is arranged around.
-tagline = "The policy layer for Apache Iceberg"
+tagline = "A policy-first Apache Iceberg REST catalog"
 
 # Order of the documentation sidebar. Pages carry `weight`, and the groups here
 # name which weights belong together — a flat sixteen-item list is a list

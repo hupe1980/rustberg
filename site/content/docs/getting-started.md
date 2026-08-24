@@ -53,7 +53,7 @@ See [Kubernetes documentation](@/docs/kubernetes.md) for full configuration opti
 
 ### From source
 
-Requires Rust 1.94 or newer.
+Requires Rust 1.94.1 or newer.
 
 ```bash
 git clone https://github.com/hupe1980/rustberg.git

@@ -3,8 +3,8 @@ title = "Federation"
 description = "Mount several Iceberg catalogs under one endpoint and one identity, routed by top-level namespace."
 weight = 8
 +++
-One authenticated endpoint in front of every catalog an organisation owns, so an
-engine configures one catalog and sees one namespace tree.
+Mount catalogs somebody else runs behind Rustberg's own, so an engine configures
+one catalog and sees one namespace tree.
 
 ## What it is for
 

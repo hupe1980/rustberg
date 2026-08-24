@@ -222,6 +222,11 @@ impl StorageCredentialRequest {
 
 /// How long to wait for a cloud provider's token endpoint to accept a
 /// connection.
+///
+/// Gated with [`exchange_client`] on the two providers that perform an HTTPS
+/// exchange of their own. AWS goes through its own SDK, which brings its own
+/// timeouts, so a build with only `aws-credentials` has no caller for these.
+#[cfg(any(feature = "gcp-credentials", feature = "azure-credentials"))]
 const EXCHANGE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long to wait for it to answer.
@@ -234,6 +239,7 @@ const EXCHANGE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// open until the outer layer gave up on it.
 ///
 /// [`catalog::rest`]: crate::catalog
+#[cfg(any(feature = "gcp-credentials", feature = "azure-credentials"))]
 const EXCHANGE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The HTTP client every credential exchange uses.
@@ -241,6 +247,7 @@ const EXCHANGE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// One constructor rather than a `Client::new()` per provider, because the two
 /// that need it are on the `loadTable` path and a client with no timeout there
 /// is not a detail either of them would have thought to configure.
+#[cfg(any(feature = "gcp-credentials", feature = "azure-credentials"))]
 #[must_use]
 pub fn exchange_client() -> reqwest::Client {
     reqwest::Client::builder()

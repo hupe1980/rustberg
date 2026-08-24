@@ -2,17 +2,19 @@
 
 # Rustberg
 
-**The policy layer for Apache Iceberg.**
+**A policy-first Apache Iceberg REST catalog.**
 
-One authenticated, policy-controlled Iceberg REST endpoint in front of every
-catalog your organisation owns — a single Rust binary, and an embeddable crate.
+Two first-party registries — one embedded file, or Postgres for HA — with Cedar
+policy on every request, storage access scoped to what that policy allows, and
+an audit trail that names the rule. A single Rust binary, and an embeddable
+crate.
 
 [Documentation](https://hupe1980.github.io/rustberg) ·
 [Getting started](https://hupe1980.github.io/rustberg/docs/getting-started/) ·
 [API reference](https://hupe1980.github.io/rustberg/docs/api/) ·
 [Security](https://hupe1980.github.io/rustberg/docs/security/)
 
-<img src="https://img.shields.io/badge/tests-1073%20%2B%2070%20client-brightgreen" alt="1073 Rust tests, 70 client conformance tests">
+<img src="https://img.shields.io/badge/tests-1089%20%2B%2071%20client-brightgreen" alt="1089 Rust tests, 71 client conformance tests">
 <img src="https://img.shields.io/badge/unsafe-forbidden-brightgreen" alt="unsafe forbidden">
 <img src="https://img.shields.io/badge/binary-~24%20MB-blue" alt="~24 MB binary">
 <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="Apache 2.0">
@@ -23,10 +25,15 @@ catalog your organisation owns — a single Rust binary, and an embeddable crate
 
 ## 🧊 What it is
 
-Engines connect to one endpoint with one identity. Rustberg authenticates the
-caller, authorizes every operation against [Cedar](https://www.cedarpolicy.com/)
-policy, routes the request to the catalog that actually holds the table, hands
-out storage access scoped to what policy allows, and records the decision.
+A complete Iceberg REST catalog, not a proxy in front of one: `redb` for the
+embedded case and Postgres for the clustered one, both doing the compare-and-swap
+commit themselves and both held to a single conformance suite.
+
+What it is *first* is the policy. Engines connect to one endpoint with one
+identity; Rustberg authenticates the caller, authorizes every operation against
+[Cedar](https://www.cedarpolicy.com/) policy, hands out storage access scoped to
+what that policy allows, and records the decision. Catalogs somebody else runs
+can be mounted behind the same endpoint and the same policy — read-only.
 
 ```
    Spark · Trino · DuckDB · PyIceberg · Flink
@@ -42,14 +49,15 @@ out storage access scoped to what policy allows, and records the decision.
            │         │          │
      ┌─────┘         │          └──────────┐
      ▼               ▼                     ▼
-  native          remote REST          AWS Glue
-  redb ·        (Polaris · Lakekeeper   Hive · S3 Tables
-  Postgres       · Unity · Nessie)       (not built)
+  its own        mounted, read-only    AWS Glue
+  registry       (Polaris · Lakekeeper  Hive · S3 Tables
+  redb ·          · Unity · Nessie)       (not built)
+  Postgres
 ```
 
-Storing table pointers is solved. Governing who may read, who may write, and who
-gets handed storage access — across catalogs an organisation did not choose to
-have in the same place — is not. That is the product.
+Storing table pointers is solved. Governing who may read, who may write and who
+gets handed storage access is not, and every other subsystem here exists to make
+that decision correct, fast and auditable.
 
 ## 🚀 Quick start
 
@@ -102,7 +110,7 @@ helm install rustberg charts/rustberg \
   --set rustberg.storage.type=s3 \
   --set rustberg.storage.s3.bucket=my-catalog-bucket
 
-# From source — Rust 1.94+
+# From source — Rust 1.94.1 or newer
 cargo build --release --all-features
 ```
 

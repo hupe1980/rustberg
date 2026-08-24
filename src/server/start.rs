@@ -127,12 +127,43 @@ async fn start_server_http(
     // per-IP rate limiting, auth-failure banning, `context.source_ip` in a
     // policy, and the client address in an audit record. Without it they do not
     // error — they silently do nothing.
-    axum::serve(
+    // `axum::serve`'s graceful shutdown waits for in-flight connections with no
+    // deadline of its own, so the drain is bounded here: the shutdown future
+    // signals when it fires, and the timer starts from that point rather than
+    // from process start.
+    //
+    // The same bound the TLS path gets from `Handle::graceful_shutdown`. Where
+    // TLS is terminated should not change how a deployment drains, and the
+    // plaintext path is the one behind a proxy.
+    let (draining, drained) = tokio::sync::oneshot::channel();
+    let delay = config.shutdown_delay;
+
+    let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(wait_for_shutdown(config.shutdown_delay))
-    .await?;
+    .with_graceful_shutdown(async move {
+        wait_for_shutdown(delay).await;
+        // The receiver is dropped once serving ends, so a send that fails means
+        // there is nothing left to time out.
+        let _ = draining.send(());
+    });
+
+    tokio::select! {
+        result = serve => result?,
+        () = async move {
+            if drained.await.is_ok() {
+                tokio::time::sleep(DRAIN_TIMEOUT).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            warn!(
+                seconds = DRAIN_TIMEOUT.as_secs(),
+                "Connections were still open when the drain ran out; closing them"
+            );
+        }
+    }
 
     info!("🛑 Server has shut down gracefully");
 

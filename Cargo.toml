@@ -3,17 +3,18 @@ name = "rustberg"
 version = "0.1.0"
 edition = "2024"
 authors = ["hupe1980"]
-description = "A production-grade, cross-platform, single-binary Apache Iceberg REST Catalog"
+description = "A policy-first Apache Iceberg REST catalog: Cedar authorization on every request, scoped storage access, and an audit trail — in a single binary or as a library"
 readme = "README.md"
 keywords = ["rustberg", "iceberg", "catalog", "lakehouse", "data"]
 categories = ["database", "web-programming"]
 license = "Apache-2.0"
 repository = "https://github.com/hupe1980/rustberg"
 homepage = "https://hupe1980.github.io/rustberg/"
-# The floor the dependency tree imposes, not an aspiration: `iceberg` 0.10.1 and
-# the AWS SDK both declare 1.94. `just msrv` checks this against a real
-# toolchain — it was "1.89" while nothing in the tree could build on it.
-rust-version = "1.94"
+# The floor the dependency tree imposes, not an aspiration: the AWS SDK crates
+# declare 1.94.1 and `iceberg` 0.10.1 declares 1.94, so the higher of the two
+# governs. `just msrv` checks it against a real toolchain, because a version
+# floor nothing verifies drifts to whatever the newest dependency demands.
+rust-version = "1.94.1"
 
 [features]
 # Optional dependencies are referenced as `dep:name`. Without the prefix Cargo

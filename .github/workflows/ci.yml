@@ -376,11 +376,49 @@ jobs:
           version: 'v3.14.0'
       - name: Lint Helm chart
         run: helm lint charts/rustberg
-      - name: Template Helm chart
-        run: helm template rustberg charts/rustberg > /dev/null
-      - name: Validate Helm chart
+      # Rendered per backend, with values that make a *valid* deployment of each.
+      # The chart refuses to render one that would not work — postgres with no
+      # database, redb with more than one replica or without a volume — so
+      # templating the bare defaults asserts nothing except that the guard fires.
+      - name: Template and validate each backend
         run: |
-          helm template rustberg charts/rustberg | kubectl apply --dry-run=client -f - 2>/dev/null || true
+          set -euo pipefail
+          render() {
+            name=$1; shift
+            echo "── $name ──"
+            helm template rustberg charts/rustberg "$@" \
+              | kubectl apply --dry-run=client -f - > /dev/null
+          }
+          render postgres \
+            --set rustberg.catalog.backend=postgres \
+            --set rustberg.catalog.postgres.dsn=postgres://u:p@db:5432/rustberg
+          render redb \
+            --set rustberg.catalog.backend=redb \
+            --set replicaCount=1 \
+            --set persistence.enabled=true
+      # The guard rails are load-bearing, so each one is asserted rather than
+      # assumed: a chart that silently rendered these would produce a deployment
+      # that cannot start.
+      - name: Refuse configurations that cannot work
+        run: |
+          set -uo pipefail
+          refuses() {
+            name=$1; shift
+            if helm template rustberg charts/rustberg "$@" > /dev/null 2>&1; then
+              echo "::error::the chart rendered $name, which cannot start"
+              exit 1
+            fi
+            echo "refused: $name"
+          }
+          refuses "postgres without a database" \
+            --set rustberg.catalog.backend=postgres
+          refuses "redb with two replicas" \
+            --set rustberg.catalog.backend=redb \
+            --set persistence.enabled=true \
+            --set replicaCount=2
+          refuses "redb without persistence" \
+            --set rustberg.catalog.backend=redb \
+            --set replicaCount=1
 
   benchmarks:
     name: Benchmarks

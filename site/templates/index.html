@@ -8,13 +8,13 @@
 <section class="hero">
   <div class="hero__inner">
     <p class="hero__eyebrow">Apache Iceberg REST Catalog · Rust · Apache-2.0</p>
-    <h1 class="hero__title">The policy layer for<br><span class="grad">Apache Iceberg</span></h1>
+    <h1 class="hero__title">A policy-first<br><span class="grad">Iceberg REST catalog</span></h1>
     <p class="hero__lede">
-      One authenticated, policy-controlled Iceberg REST endpoint in front of every
-      catalog your organisation owns. Engines connect once, with one identity.
-      Rustberg authenticates the caller, authorizes every operation against Cedar
-      policy, routes to the catalog that holds the table, vends short-lived
-      storage credentials, and records the decision.
+      A whole catalog, not a proxy in front of one: an embedded file, or Postgres
+      for HA. Engines connect once, with one identity. Rustberg authenticates the
+      caller, authorizes every operation against Cedar policy, vends short-lived
+      storage credentials scoped to what that policy allows, and records the
+      decision.
     </p>
 
     <div class="hero__actions">

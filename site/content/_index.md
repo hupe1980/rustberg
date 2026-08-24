@@ -1,5 +1,5 @@
 +++
-title = "Rustberg — the policy layer for Apache Iceberg"
-description = "One authenticated, policy-controlled Apache Iceberg REST endpoint in front of every catalog you own. Cedar authorization, catalog federation, scoped credential vending and a real audit trail — in a single Rust binary, or as an embeddable crate."
+title = "Rustberg — a policy-first Apache Iceberg REST catalog"
+description = "An Apache Iceberg REST catalog with Cedar policy on every request. Embedded redb or Postgres, storage access scoped to what policy allows, a real audit trail, and read-only mounts over the catalogs you already run — in a single Rust binary, or as an embeddable crate."
 template = "index.html"
 +++
