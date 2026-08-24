@@ -99,7 +99,7 @@ number on a page:
 - Concurrent-commit tests asserting zero lost updates, on both catalog backends,
   including two replicas committing to one table over a real Postgres
 - The latency table above, against regression ceilings
-- Linux (gnu + musl, x86-64 and aarch64), macOS and Windows builds and test runs
+- Linux (gnu + musl, x86-64 and aarch64) and macOS builds and test runs
 - Every optional Cargo feature compiled on its own, not only all together
 - The declared MSRV, against that toolchain
 - `cargo deny` over advisories, licences, bans and sources

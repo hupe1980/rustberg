@@ -54,7 +54,7 @@ use std::collections::HashSet;
 
 use futures::{StreamExt, stream};
 use iceberg::table::Table;
-use iceberg::{Error, ErrorKind, Result};
+use iceberg::{Error, Result};
 
 /// Table properties that may name a prefix outside the table's own location.
 ///
@@ -70,6 +70,13 @@ const WRITE_PATH_PROPERTIES: [&str; 2] = ["write.data.path", "write.metadata.pat
 /// large table is the slowest part of a drop. The deletes themselves are handed
 /// to `FileIO::delete_stream`, which does its own batching.
 const MANIFEST_READ_CONCURRENCY: usize = 10;
+
+/// How many files are deleted at once.
+///
+/// Matches the manifest read concurrency, for the same reason: an object store
+/// answers these in parallel and a serial loop over a large table is the slowest
+/// part of a drop.
+const DELETE_CONCURRENCY: usize = 10;
 
 /// Deletes the files `table` references, confined to the table's own location.
 ///
@@ -263,14 +270,55 @@ async fn delete_confined(
         );
     }
 
-    if !owned.is_empty() {
-        table
-            .file_io()
-            .delete_stream(stream::iter(owned))
-            .await
-            .map_err(|e| {
-                Error::new(ErrorKind::Unexpected, "Failed to delete a table's files").with_source(e)
-            })?;
+    // Deleted one at a time rather than through `delete_stream`, and the reason
+    // is that the two resolve a path differently.
+    //
+    // A location reaches the storage layer as `file:///C:/wh/…`, and the layer
+    // strips `file:/` — one slash — leaving `//C:/wh/…`. `Operator::write`
+    // normalises that against the operator's root, so the file lands where it
+    // should. The batched deleter hands the path straight to the backend with no
+    // normalisation, so it addresses something else — and deleting a path that
+    // does not exist is documented as *not* an error, so the purge reports
+    // success and the files survive.
+    //
+    // On Linux `//wh/x` and `/wh/x` are the same file, which is why only Windows
+    // shows it. The rule is that the call which removes a file resolves its path
+    // exactly as the call that wrote it, on every platform.
+    //
+    // The cost is a request per file where an object store could take a
+    // thousand keys at once. Bounded concurrency covers most of it, and a purge
+    // is a rare operation; the batched form is worth revisiting when it
+    // normalises paths.
+    //
+    // Per-file also makes the failure reportable. One error no longer abandons
+    // the rest of the purge — which matters because the table is already
+    // dropped by this point, so aborting leaves files nothing will ever revisit.
+    let failed = stream::iter(owned)
+        .map(|path| async move {
+            match table.file_io().delete(&path).await {
+                Ok(()) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        table = %table.identifier(),
+                        %path,
+                        error = %e,
+                        "Could not delete a file this table owns; it is left as an orphan"
+                    );
+                    Some(())
+                }
+            }
+        })
+        .buffer_unordered(DELETE_CONCURRENCY)
+        .filter_map(|outcome| async move { outcome })
+        .count()
+        .await;
+
+    if failed > 0 {
+        tracing::warn!(
+            table = %table.identifier(),
+            failed,
+            "Some of this table's own files could not be deleted"
+        );
     }
 
     Ok(skipped.len())

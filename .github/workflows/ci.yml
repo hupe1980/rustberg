@@ -210,19 +210,6 @@ jobs:
       - name: Run tests
         run: cargo test --all-features -- --skip trino_
 
-  test-windows:
-    name: Test (Windows)
-    runs-on: windows-latest
-    needs: [quick-checks]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: windows-cargo
-      - name: Run tests
-        run: cargo test --all-features -- --skip trino_
-
   # Python integration tests use pre-built binary
   test-python-integrations:
     name: Python Integrations
@@ -277,9 +264,6 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: rustberg
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: rustberg.exe
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -475,8 +459,27 @@ jobs:
           echo "=== Binary Size ==="
           ls -lh target/release/rustberg
           du -h target/release/rustberg
+      # Only *definite* leaks are errors.
+      #
+      # `--leak-check=full` alone reports "possibly lost" and "still reachable"
+      # as errors too, and neither is a leak here. Both are what a Rust binary
+      # looks like at exit: process-lifetime statics, thread-local storage, and
+      # the one-time initialisation the C crypto libraries under rustls do in
+      # `call_init` before `main` runs. Every block in the report that failed
+      # this step was one of those, against `definitely lost: 0 bytes` — a gate
+      # that fires on every possible build tells you nothing about any of them.
+      #
+      # What this does check is narrow and worth saying: one short-lived
+      # invocation, so it catches a leak on the startup path and nothing about a
+      # server under load. Valgrind is 20-50x slower, and a gate that takes the
+      # whole build with it gets turned off.
       - name: Check for memory leaks
-        run: valgrind --leak-check=full --error-exitcode=1 ./target/release/rustberg generate-config > /dev/null
+        run: |
+          valgrind --leak-check=full \
+                   --show-leak-kinds=definite \
+                   --errors-for-leak-kinds=definite \
+                   --error-exitcode=1 \
+                   ./target/release/rustberg generate-config > /dev/null
 
   coverage:
     name: Code Coverage

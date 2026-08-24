@@ -23,11 +23,14 @@ curl -L "https://github.com/hupe1980/rustberg/releases/latest/download/rustberg-
 mv "rustberg-$TARGET" rustberg
 ```
 
-On Windows, download `rustberg-windows-x86_64.zip` and unpack it. Every release
-also publishes `checksums.txt`.
+Every release also publishes `checksums.txt`.
 
 The Linux builds are statically linked against musl, so there is nothing to
 install underneath — no JVM, no database, no runtime.
+
+Releases cover **Linux and macOS**. Anywhere else, including Windows, run the
+container: it carries the same statically linked binary, and it is what CI
+starts and probes on every change.
 
 ### Docker
 

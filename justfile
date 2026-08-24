@@ -243,8 +243,6 @@ release-all:
     cross build --release --all-features --target x86_64-apple-darwin
     @echo "Building for macOS ARM64..."
     cross build --release --all-features --target aarch64-apple-darwin
-    @echo "Building for Windows..."
-    cross build --release --all-features --target x86_64-pc-windows-msvc
 
 # Build Docker image
 docker-build tag="latest":

@@ -221,6 +221,11 @@ pub fn is_prefix_within(root: &str, candidate: &str) -> bool {
 /// of this would be one edit away from disagreeing about where a deployment
 /// keeps its data.
 ///
+/// Windows is not a released or CI-tested platform — the container is the answer
+/// there — so the drive-letter half is kept correct rather than claimed: the
+/// rule takes the platform as an argument and both behaviours are unit-tested
+/// from any host, so a local Windows build is not quietly broken.
+///
 /// Nothing is percent-decoded. These URLs are written by an operator or by this
 /// crate's own default-warehouse helper, neither of which encodes, and decoding
 /// would change the meaning of a path that legitimately contains `%`.
@@ -888,6 +893,40 @@ mod tests {
         assert!(!is_within("file:///srv/warehouse", "srv/warehouse/db/t"));
         assert!(!is_within("srv/warehouse", "/srv/warehouse/db/t"));
         assert!(!is_prefix_within("/srv/wh/t", "srv/wh/t/data/"));
+    }
+
+    /// Containment holds over a drive-letter URL, where the first path segment
+    /// is `C:` rather than a bucket or a directory.
+    ///
+    /// The conversion rules above are tested on their own, but containment is
+    /// the security-critical half — a purge deletes what it says is inside the
+    /// table — and it reads these URLs through the same segment comparison as
+    /// every other location. The sibling cases are the ones that matter: a
+    /// neighbouring table must not be inside, and neither must one whose name
+    /// merely starts with this one's.
+    #[test]
+    fn containment_holds_over_a_drive_letter_url() {
+        let warehouse = "file:///C:/wh";
+        let table = format!("{warehouse}/db/events");
+
+        assert!(is_within(&table, &format!("{table}/metadata/00000-a.json")));
+        assert!(is_within(&table, &table));
+
+        assert!(
+            !is_within(
+                &table,
+                &format!("{warehouse}/db/other/metadata/00000-b.json")
+            ),
+            "a neighbouring table is not inside this one"
+        );
+        assert!(
+            !is_within(&table, &format!("{warehouse}/db/events2/data/f.parquet")),
+            "segment-wise, so a name this one is a prefix of is still outside"
+        );
+        assert!(
+            !is_within(&table, "file:///D:/wh/db/events/metadata/00000-c.json"),
+            "another drive is another root"
+        );
     }
 
     /// A traversal segment would let a location climb out of the root it
