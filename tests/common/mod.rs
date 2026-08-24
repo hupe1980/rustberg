@@ -1157,14 +1157,10 @@ pub async fn a_lost_commit_leaves_no_metadata_file(catalog: &dyn CatalogStore, w
     let ns = given_namespace(catalog, &["litter"]).await;
     let table = given_table(catalog, &ns, "events").await;
 
-    let metadata_dir = std::path::Path::new(
-        warehouse
-            .strip_prefix("file://")
-            .expect("this case needs a local warehouse"),
-    )
-    .join("litter")
-    .join("events")
-    .join("metadata");
+    let metadata_dir = std::path::Path::new(rustberg::location::path_from_url(warehouse))
+        .join("litter")
+        .join("events")
+        .join("metadata");
 
     let count = || {
         std::fs::read_dir(&metadata_dir)

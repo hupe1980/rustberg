@@ -697,10 +697,10 @@ async fn test_metadata_file_written_to_warehouse() {
         .metadata_location()
         .expect("Table should have metadata location");
 
-    // Strip file:// prefix and verify file exists
-    let file_path = metadata_location
-        .strip_prefix("file://")
-        .unwrap_or(metadata_location);
+    // The `file://` URL back to a local path. `path_from_url` rather than a
+    // strip, because on Windows the URL is `file:///C:/…` and stripping the
+    // scheme leaves `/C:/…`, which is not a path.
+    let file_path = rustberg::location::path_from_url(metadata_location);
     assert!(
         std::path::Path::new(file_path).exists(),
         "Metadata file should exist at: {}",
@@ -1624,21 +1624,18 @@ async fn purge_deletes_the_tables_own_files_and_not_a_neighbours() {
         .metadata_location()
         .expect("a created table has a metadata pointer")
         .to_string();
-    let victim_path = victim_metadata
-        .strip_prefix("file://")
-        .expect("local warehouse")
-        .to_string();
+    let victim_path = rustberg::location::path_from_url(&victim_metadata).to_string();
     assert!(
         std::path::Path::new(&victim_path).exists(),
         "the neighbour's metadata should exist before the purge"
     );
 
-    let doomed_path = doomed
-        .metadata_location()
-        .expect("a created table has a metadata pointer")
-        .strip_prefix("file://")
-        .expect("local warehouse")
-        .to_string();
+    let doomed_path = rustberg::location::path_from_url(
+        doomed
+            .metadata_location()
+            .expect("a created table has a metadata pointer"),
+    )
+    .to_string();
 
     // Point the doomed table's *previous metadata* at the neighbour's file. A
     // purge deletes every entry in `metadata-log`, so an unconfined one would
@@ -1712,12 +1709,12 @@ async fn a_purge_survives_a_manifest_list_that_is_no_longer_there() {
         .await
         .expect("create table");
 
-    let metadata_path = table
-        .metadata_location()
-        .expect("a created table has a metadata pointer")
-        .strip_prefix("file://")
-        .expect("local warehouse")
-        .to_string();
+    let metadata_path = rustberg::location::path_from_url(
+        table
+            .metadata_location()
+            .expect("a created table has a metadata pointer"),
+    )
+    .to_string();
 
     // A snapshot pointing at a manifest list that was never written. Written
     // straight to storage, because the commit path confines these locations and

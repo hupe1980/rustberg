@@ -699,6 +699,77 @@ mod tests {
         assert_eq!(without_url_prefix("C:/data", true), "C:/data");
     }
 
+    /// Nothing outside this module spells the `file://` rule by hand.
+    ///
+    /// Both directions look like one line of string handling and are not, and
+    /// the way that surfaces is a platform-specific failure a long way from the
+    /// code that wrote it — a warehouse URL with a drive letter in the authority
+    /// position, or a path with a leading slash before one. Every such spelling
+    /// found so far was somebody reaching for the obvious `strip_prefix` or
+    /// `format!`, in a place where the rule was not visible.
+    ///
+    /// So it is a gate rather than a convention. Literals are untouched: a fixed
+    /// `"file:///tmp/x"` in a fixture names no real path and cannot be wrong.
+    /// What is banned is *deriving* one from a path or a URL.
+    #[test]
+    fn the_file_url_rule_has_one_spelling() {
+        const BANNED: &[(&str, &str)] = &[
+            ("strip_prefix(\"file://\")", "location::path_from_url"),
+            ("trim_start_matches(\"file://\")", "location::path_from_url"),
+            ("format!(\"file://{}\"", "location::url_from_path"),
+            ("format!(\"file:///{}\"", "location::url_from_path"),
+        ];
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offences = Vec::new();
+
+        let mut pending = vec![root.join("src"), root.join("tests")];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                // This module is where the rule lives.
+                if path == root.join("src").join("location.rs") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (number, line) in text.lines().enumerate() {
+                    let code = line.trim_start();
+                    if code.starts_with("//") {
+                        continue;
+                    }
+                    for (banned, instead) in BANNED {
+                        if code.contains(banned) {
+                            offences.push(format!(
+                                "{}:{}: `{banned}` — use `{instead}`",
+                                path.strip_prefix(root).unwrap_or(&path).display(),
+                                number + 1
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offences.is_empty(),
+            "a `file://` URL and a local path are not the same string on every \
+             platform, and these spell the conversion by hand:\n  {}",
+            offences.join("\n  ")
+        );
+    }
+
     /// A path becomes a URL and comes back unchanged, on either platform.
     ///
     /// The round trip is the property that matters: a warehouse is written as a
