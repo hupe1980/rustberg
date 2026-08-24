@@ -34,7 +34,7 @@ async fn catalog(label: &str) -> (Arc<dyn CatalogStore>, TempDir, String) {
     let dir = TempDir::new().expect("temp dir");
     let warehouse = dir.path().join("warehouse");
     std::fs::create_dir_all(&warehouse).expect("warehouse dir");
-    let warehouse_url = format!("file://{}", warehouse.to_string_lossy());
+    let warehouse_url = rustberg::location::url_from_path(&warehouse);
 
     let store = RedbCatalog::open(dir.path().join(format!("{label}.redb")), &warehouse_url)
         .await
@@ -58,7 +58,7 @@ async fn catalog_with_policy_store(
     let dir = TempDir::new().expect("temp dir");
     let warehouse = dir.path().join("warehouse");
     std::fs::create_dir_all(&warehouse).expect("warehouse dir");
-    let warehouse_url = format!("file://{}", warehouse.to_string_lossy());
+    let warehouse_url = rustberg::location::url_from_path(&warehouse);
 
     let store = Arc::new(
         RedbCatalog::open(dir.path().join(format!("{label}.redb")), &warehouse_url)

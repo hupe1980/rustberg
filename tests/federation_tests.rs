@@ -36,7 +36,7 @@ async fn catalog_with_warehouse(label: &str) -> (Arc<dyn CatalogStore>, TempDir,
     let dir = TempDir::new().expect("temp dir");
     let warehouse = dir.path().join("warehouse");
     std::fs::create_dir_all(&warehouse).expect("warehouse dir");
-    let warehouse_url = format!("file://{}", warehouse.to_string_lossy());
+    let warehouse_url = rustberg::location::url_from_path(&warehouse);
 
     let store = RedbCatalog::open(dir.path().join(format!("{label}.redb")), &warehouse_url)
         .await
@@ -1078,8 +1078,8 @@ async fn a_native_backend_is_buildable_from_configuration() {
     let warehouse = dir.path().join("warehouse");
     std::fs::create_dir_all(&warehouse).expect("warehouse dir");
 
-    let mut config = mount_config("native", &format!("file://{}", dir.path().display()));
-    config.warehouse_location = format!("file://{}", warehouse.display());
+    let mut config = mount_config("native", &rustberg::location::url_from_path(dir.path()));
+    config.warehouse_location = rustberg::location::url_from_path(warehouse);
 
     let mount = rustberg::AppBuilder::build_mount(
         "local",
@@ -1098,8 +1098,8 @@ async fn a_read_only_native_backend_keeps_its_views_readable() {
     let warehouse = dir.path().join("warehouse");
     std::fs::create_dir_all(&warehouse).expect("warehouse dir");
 
-    let mut config = mount_config("native", &format!("file://{}", dir.path().display()));
-    config.warehouse_location = format!("file://{}", warehouse.display());
+    let mut config = mount_config("native", &rustberg::location::url_from_path(dir.path()));
+    config.warehouse_location = rustberg::location::url_from_path(warehouse);
     config.read_only = true;
 
     let mount = rustberg::AppBuilder::build_mount(
@@ -1428,7 +1428,7 @@ async fn a_table_may_be_created_in_its_own_mounts_warehouse() {
     let mount_dir = TempDir::new().expect("temp dir");
     let mount_warehouse = mount_dir.path().join("warehouse");
     std::fs::create_dir_all(&mount_warehouse).expect("warehouse dir");
-    let mount_warehouse_url = format!("file://{}", mount_warehouse.display());
+    let mount_warehouse_url = rustberg::location::url_from_path(&mount_warehouse);
 
     let prod = RedbCatalog::open(
         mount_dir.path().join("prod.redb"),
@@ -1446,7 +1446,7 @@ async fn a_table_may_be_created_in_its_own_mounts_warehouse() {
             store: Arc::new(prod),
             capabilities: Capabilities::full(),
             owner: TENANT.to_string(),
-            warehouse: Some(format!("file://{}", mount_warehouse.display())),
+            warehouse: Some(rustberg::location::url_from_path(mount_warehouse)),
         }])
         .build()
         .await
@@ -1494,7 +1494,7 @@ async fn a_mount_still_confines_locations_to_its_own_warehouse() {
 
     let prod = RedbCatalog::open(
         mount_dir.path().join("prod.redb"),
-        format!("file://{}", mount_warehouse.display()),
+        rustberg::location::url_from_path(&mount_warehouse),
     )
     .await
     .expect("open mount catalog");
@@ -1508,7 +1508,7 @@ async fn a_mount_still_confines_locations_to_its_own_warehouse() {
             store: Arc::new(prod),
             capabilities: Capabilities::full(),
             owner: TENANT.to_string(),
-            warehouse: Some(format!("file://{}", mount_warehouse.display())),
+            warehouse: Some(rustberg::location::url_from_path(mount_warehouse)),
         }])
         .build()
         .await

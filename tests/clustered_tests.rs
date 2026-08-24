@@ -91,7 +91,7 @@ impl Cluster {
     async fn replica(&self, keys: Vec<ApiKey>) -> App {
         App::builder()
             .with_catalog_url(&self.dsn)
-            .with_warehouse_location(format!("file://{}", self.warehouse.path().display()))
+            .with_warehouse_location(rustberg::location::url_from_path(self.warehouse.path()))
             .with_default_tenant_id("acme")
             .with_policies(POLICIES)
             .with_api_keys(keys)
@@ -689,13 +689,13 @@ async fn a_postgres_backed_mount_works_across_replicas() {
     let (admin_key, admin) = key("admin", "admin");
 
     let mount_warehouse = tempfile::tempdir().expect("mount warehouse");
-    let mount_warehouse_url = format!("file://{}", mount_warehouse.path().display());
+    let mount_warehouse_url = rustberg::location::url_from_path(mount_warehouse.path());
 
     // Each replica opens its own handle on the mounted catalog, exactly as it
     // does on its own.
     let replica = |keys: Vec<ApiKey>| {
         let dsn = cluster.dsn.clone();
-        let warehouse = format!("file://{}", cluster.warehouse.path().display());
+        let warehouse = rustberg::location::url_from_path(cluster.warehouse.path());
         let mount_warehouse_url = mount_warehouse_url.clone();
         async move {
             let mounted = PostgresCatalog::connect(&dsn, &mount_warehouse_url)

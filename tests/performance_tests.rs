@@ -193,7 +193,7 @@ async fn load_table_stays_under_budget() {
 async fn conditional_and_full_loads_are_reported() {
     let warehouse = tempfile::tempdir().expect("temp dir");
     let app = App::builder()
-        .with_warehouse_location(format!("file://{}", warehouse.path().display()))
+        .with_warehouse_location(rustberg::location::url_from_path(warehouse.path()))
         .with_default_tenant_id("default")
         .build()
         .await

@@ -229,6 +229,47 @@ pub fn path_from_url(location: &str) -> &str {
     without_url_prefix(location, cfg!(windows))
 }
 
+/// The `file://` URL naming a local path — the inverse of [`path_from_url`].
+///
+/// # Why this is not `format!("file://{path}")`
+///
+/// On Unix it is: `/var/lib/rustberg` interpolates to `file:///var/lib/rustberg`,
+/// three slashes and all. On Windows the same formatting yields
+/// `file://C:\data\warehouse`, which is not a URL anyone can resolve — the
+/// drive letter lands where the *authority* goes, and the separators are the
+/// wrong ones. What comes back out of an object-store layer given that is
+/// `/C:\data\warehouse`, a leading slash before a drive and mixed separators,
+/// and the operating system answers `ERROR_INVALID_NAME` at the first read or
+/// delete rather than where the URL was built.
+///
+/// So separators are normalised and a drive letter gets the third slash that
+/// makes it a path rather than a host. Every place that turns a path into a
+/// location goes through here — the warehouse a registry canonicalises, the
+/// default warehouse for a server started without one — because a URL built one
+/// way and read back another is a deployment that writes where nothing looks.
+#[must_use]
+pub fn url_from_path(path: impl AsRef<std::path::Path>) -> String {
+    to_url(&path.as_ref().display().to_string(), cfg!(windows))
+}
+
+/// The rule [`url_from_path`] applies, with the platform as an argument so both
+/// halves are testable from either.
+fn to_url(path: &str, windows: bool) -> String {
+    // Only on Windows: a backslash is an ordinary character in a Unix filename,
+    // and rewriting it there would rename the file being addressed.
+    let normalized = if windows {
+        path.replace('\\', "/")
+    } else {
+        path.to_string()
+    };
+
+    if windows && starts_with_drive_letter(&normalized) {
+        format!("file:///{normalized}")
+    } else {
+        format!("file://{normalized}")
+    }
+}
+
 /// The rule [`path_from_url`] applies, with the platform as an argument so both
 /// halves are testable from either.
 fn without_url_prefix(location: &str, windows: bool) -> &str {
@@ -656,6 +697,52 @@ mod tests {
             "/var/lib/rustberg"
         );
         assert_eq!(without_url_prefix("C:/data", true), "C:/data");
+    }
+
+    /// A path becomes a URL and comes back unchanged, on either platform.
+    ///
+    /// The round trip is the property that matters: a warehouse is written as a
+    /// URL, read back as a path, and joined with namespace segments in between.
+    /// If the two halves disagree the files land somewhere nothing looks for
+    /// them, and the first sign of it is a read or a delete failing far away.
+    #[test]
+    fn a_path_and_its_url_round_trip() {
+        // (path, platform, its URL, the path that comes back)
+        for (path, windows, url, back) in [
+            (
+                "/var/lib/rustberg",
+                false,
+                "file:///var/lib/rustberg",
+                "/var/lib/rustberg",
+            ),
+            (
+                "C:/data/warehouse",
+                true,
+                "file:///C:/data/warehouse",
+                "C:/data/warehouse",
+            ),
+            (
+                "C:\\data\\warehouse",
+                true,
+                "file:///C:/data/warehouse",
+                "C:/data/warehouse",
+            ),
+            ("/tmp/wh", true, "file:///tmp/wh", "/tmp/wh"),
+        ] {
+            assert_eq!(to_url(path, windows), url, "{path} -> url");
+            assert_eq!(
+                without_url_prefix(&to_url(path, windows), windows),
+                back,
+                "{path} -> url -> path"
+            );
+        }
+
+        // The shape that broke Windows: two slashes and native separators.
+        assert_ne!(
+            to_url("C:\\data\\warehouse", true),
+            "file://C:\\data\\warehouse",
+            "a drive letter must not land in the authority position"
+        );
     }
 
     /// The drive-letter rule applies on Windows only, so a Unix path that

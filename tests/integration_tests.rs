@@ -3747,7 +3747,7 @@ async fn assert_create_without_staging_is_rejected() {
 async fn a_conditional_load_never_reads_the_metadata_document() {
     let warehouse = tempfile::tempdir().expect("temp dir");
     let app = App::builder()
-        .with_warehouse_location(format!("file://{}", warehouse.path().display()))
+        .with_warehouse_location(rustberg::location::url_from_path(warehouse.path()))
         .with_default_tenant_id("default")
         .build()
         .await

@@ -9,13 +9,13 @@
 pub fn temp_path() -> String {
     let path = std::env::temp_dir().join(format!("rustberg-{}", uuid::Uuid::new_v4()));
 
-    // On Windows a bare `C:\...` path has its drive letter read as a URL scheme
-    // by the storage layer, so hand back a file:// URL there.
-    // `location::path_from_url` is the inverse, and knows that the leading slash
-    // this adds is not part of the path.
+    // A bare `C:\...` has its drive letter read as a URL scheme by the storage
+    // layer, so this is handed back as a URL on Windows. Built by the one rule
+    // that knows where the third slash goes; `location::path_from_url` is its
+    // inverse.
     #[cfg(windows)]
     {
-        format!("file:///{}", path.display().to_string().replace('\\', "/"))
+        crate::location::url_from_path(&path)
     }
 
     #[cfg(not(windows))]

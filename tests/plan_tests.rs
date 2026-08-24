@@ -46,8 +46,8 @@ async fn fixture() -> Fixture {
         .build();
 
     let (app, _keys) = App::builder()
-        .with_catalog_url(format!("file://{}", catalog.path().display()))
-        .with_warehouse_location(format!("file://{}", warehouse.path().display()))
+        .with_catalog_url(rustberg::location::url_from_path(catalog.path()))
+        .with_warehouse_location(rustberg::location::url_from_path(warehouse.path()))
         .with_default_tenant_id("acme")
         .with_policies(POLICY)
         .with_api_keys(vec![writer_key, restricted_key] as Vec<ApiKey>)
@@ -406,8 +406,8 @@ async fn partitioned_fixture() -> Fixture {
         .build();
 
     let (app, _keys) = App::builder()
-        .with_catalog_url(format!("file://{}", catalog.path().display()))
-        .with_warehouse_location(format!("file://{}", warehouse.path().display()))
+        .with_catalog_url(rustberg::location::url_from_path(catalog.path()))
+        .with_warehouse_location(rustberg::location::url_from_path(warehouse.path()))
         .with_default_tenant_id("acme")
         .with_policies(POLICY)
         .with_api_keys(vec![writer_key, restricted_key])

@@ -21,7 +21,7 @@ async fn create_test_catalog() -> (RedbCatalog, TempDir) {
 
     let catalog = RedbCatalog::open(
         temp_dir.path().join("catalog.redb"),
-        format!("file://{}", warehouse_path.to_string_lossy()),
+        rustberg::location::url_from_path(&warehouse_path),
     )
     .await
     .expect("Failed to create RedbCatalog");
@@ -289,10 +289,8 @@ async fn test_table_create_with_location() {
         .expect("Failed to create namespace");
 
     // Create table with custom location
-    let custom_location = format!(
-        "file://{}/custom_table",
-        temp.path().join("warehouse").to_string_lossy()
-    );
+    let custom_location =
+        rustberg::location::url_from_path(temp.path().join("warehouse").join("custom_table"));
     let creation = TableCreation::builder()
         .name("custom_table".to_string())
         .schema(test_schema())
@@ -620,7 +618,7 @@ async fn test_metadata_persists_to_filesystem() {
     std::fs::create_dir_all(&warehouse_path).expect("Failed to create warehouse dir");
     std::fs::create_dir_all(&catalog_path).expect("Failed to create catalog dir");
 
-    let warehouse_location = format!("file://{}", warehouse_path.to_string_lossy());
+    let warehouse_location = rustberg::location::url_from_path(&warehouse_path);
     let ns = NamespaceIdent::new("persist_db".to_string());
     let table_ident = TableIdent::new(ns.clone(), "persist_table".to_string());
 
@@ -1470,7 +1468,7 @@ async fn satisfies_the_shared_catalog_contract() {
         let warehouse = temp_dir.path().join("warehouse");
         std::fs::create_dir_all(&warehouse).expect("warehouse dir");
 
-        let warehouse_url = format!("file://{}", warehouse.to_string_lossy());
+        let warehouse_url = rustberg::location::url_from_path(&warehouse);
         let catalog = RedbCatalog::open(temp_dir.path().join("catalog.redb"), &warehouse_url)
             .await
             .expect("open redb catalog");
@@ -1773,7 +1771,7 @@ async fn a_purge_survives_a_manifest_list_that_is_no_longer_there() {
 async fn a_catalog_file_from_another_schema_version_is_refused() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let path = temp_dir.path().join("catalog.redb");
-    let warehouse = format!("file://{}/warehouse", temp_dir.path().display());
+    let warehouse = rustberg::location::url_from_path(temp_dir.path().join("warehouse"));
 
     // A first open stamps the file and creates a table in it.
     {
@@ -1846,7 +1844,7 @@ async fn purge_does_not_follow_a_write_path_outside_the_table() {
                 .schema(test_schema())
                 .properties(HashMap::from([(
                     "write.data.path".to_string(),
-                    format!("file://{}", elsewhere.to_string_lossy()),
+                    rustberg::location::url_from_path(&elsewhere),
                 )]))
                 .build(),
         )

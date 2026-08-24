@@ -76,7 +76,7 @@ impl TestDb {
     async fn catalog(&self) -> PostgresCatalog {
         PostgresCatalog::connect(
             &self.dsn,
-            &format!("file://{}", self.warehouse.path().display()),
+            &rustberg::location::url_from_path(self.warehouse.path()),
         )
         .await
         .expect("connect catalog")
@@ -186,7 +186,7 @@ async fn a_database_from_another_schema_version_is_refused() {
 
     let err = PostgresCatalog::connect(
         &db.dsn,
-        &format!("file://{}", db.warehouse.path().display()),
+        &rustberg::location::url_from_path(db.warehouse.path()),
     )
     .await
     .expect_err("a database this build does not describe must be refused");
@@ -780,7 +780,7 @@ async fn paging_namespaces_counts_only_direct_children() {
 async fn satisfies_the_shared_catalog_contract() {
     let db = TestDb::start().await;
 
-    let warehouse = format!("file://{}", db.warehouse.path().display());
+    let warehouse = rustberg::location::url_from_path(db.warehouse.path());
 
     common::run_all(|| async {
         (

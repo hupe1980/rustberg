@@ -447,7 +447,7 @@ mod tests {
         use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
-        let warehouse = format!("file://{}", dir.path().join("wh").display());
+        let warehouse = crate::location::url_from_path(dir.path().join("wh"));
         let catalog = RedbCatalog::open(dir.path().join("catalog.redb"), &warehouse)
             .await
             .unwrap();

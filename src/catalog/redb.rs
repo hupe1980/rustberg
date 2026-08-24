@@ -387,7 +387,7 @@ impl RedbCatalog {
         };
         std::fs::create_dir_all(&absolute).map_err(db_err)?;
 
-        Ok(format!("file://{}", absolute.display()))
+        Ok(crate::location::url_from_path(&absolute))
     }
 
     /// Runs a registry operation on the blocking pool.
