@@ -4167,6 +4167,87 @@ async fn commit_may_move_a_table_within_its_own_prefix() {
     );
 }
 
+/// The same commit check must accept the spelling a Hadoop client actually
+/// sends.
+///
+/// A URI's authority is optional: `file:///wh/ns/t` and `file:/wh/ns/t` are one
+/// location, and Hadoop's `Path` normalises to the second. So Spark writes a
+/// table this catalog recorded as `file:///wh/ns/t` and commits a manifest list
+/// at `file:/wh/ns/t/metadata/snap-….avro` — its own file, under its own
+/// location, spelled with one slash instead of three.
+///
+/// Read as a bare path that splits into segments `["file:", "wh", …]`, which is
+/// inside nothing, and the commit is refused for naming a file "outside the
+/// table's own storage" — the table that just wrote it. The first `INSERT` into
+/// a brand-new table fails, after `CREATE TABLE` succeeded, which is what makes
+/// it look like a storage bug rather than a spelling one.
+#[tokio::test]
+async fn a_commit_may_name_its_files_in_the_authority_less_spelling() {
+    let warehouse = tempfile::tempdir().expect("temp dir");
+    let app = App::builder()
+        .with_warehouse_location(rustberg::location::url_from_path(warehouse.path()))
+        .with_default_tenant_id("default")
+        .build()
+        .await
+        .expect("build app");
+
+    namespace_for_location_tests(&app, "hadoop_ns").await;
+    let (status, body) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/hadoop_ns/tables",
+        None,
+        Some(json!({ "name": "t", "schema": location_test_schema() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let location =
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["metadata"]["location"]
+            .as_str()
+            .expect("a created table names its location")
+            .to_string();
+
+    // What the catalog recorded, re-spelled the way the client will send it
+    // back. Dropping two slashes is the whole difference.
+    let hadoop = location.replacen("file:///", "file:/", 1);
+    assert_ne!(hadoop, location, "the warehouse should be a file:// URL");
+
+    // A snapshot may not predate the metadata the table was just created with.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after the epoch")
+        .as_millis() as i64
+        + 1;
+
+    let (status, body) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/hadoop_ns/tables/t",
+        None,
+        Some(json!({
+            "requirements": [],
+            "updates": [{
+                "action": "add-snapshot",
+                "snapshot": {
+                    "snapshot-id": 1,
+                    "sequence-number": 1,
+                    "timestamp-ms": now,
+                    "manifest-list": format!("{hadoop}/metadata/snap-1.avro"),
+                    "summary": { "operation": "append" },
+                    "schema-id": 0
+                }
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a table's own file, spelled without an authority, is still its own: {body}"
+    );
+}
+
 /// And the boundary that matters: a *sibling* location inside the same
 /// warehouse is refused.
 ///

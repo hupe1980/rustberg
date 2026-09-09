@@ -77,14 +77,56 @@ fn canonical_scheme(scheme: &str) -> &str {
 /// absolute `/srv/warehouse/x` and would be admitted into a warehouse it does
 /// not name. A relative table location has no meaning here anyway — it would be
 /// resolved against whatever directory the process happened to start in.
+///
+/// # Why `://` is not the only spelling
+///
+/// A URI has an authority only when it is written `scheme://authority/path`;
+/// `file:///srv/wh` is that form with an *empty* authority, and `file:/srv/wh`
+/// is the same location written without one. RFC 3986 says they resolve alike,
+/// and Hadoop's `Path` normalises to the second — so a Spark writer commits
+/// `file:/srv/wh/db/t/metadata/snap-….avro` for a table this catalog recorded as
+/// `file:///srv/wh/db/t`.
+///
+/// Reading only `://` makes that fall through to the bare-path arm, where the
+/// scheme becomes part of the *path*: the location splits into segments
+/// `["file:", "srv", …]` and is refused as outside the table's own storage —
+/// the table it was written by. So an authority-less scheme is recognised too,
+/// and both spellings name one location.
 fn split(location: &str) -> (String, &str) {
-    match location.split_once("://") {
-        Some((scheme, rest)) => (
+    if let Some((scheme, rest)) = location.split_once("://") {
+        return (
             canonical_scheme(&scheme.to_ascii_lowercase()).to_string(),
             rest,
-        ),
-        None => ("file".to_string(), location),
+        );
     }
+
+    // `scheme:/path` — the authority-less form. The remainder must be rooted:
+    // `file:relative` names nothing this catalog can confine, and refusing it
+    // here keeps it in the bare-path arm rather than inventing a root for it.
+    if let Some((scheme, rest)) = location.split_once(':')
+        && is_scheme(scheme)
+        && rest.starts_with('/')
+    {
+        return (
+            canonical_scheme(&scheme.to_ascii_lowercase()).to_string(),
+            rest,
+        );
+    }
+
+    ("file".to_string(), location)
+}
+
+/// Whether `candidate` is a URI scheme rather than the first part of a path.
+///
+/// RFC 3986 spells a scheme `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, and
+/// one letter is excluded on top of that: `C:/wh` is a Windows drive, not a
+/// scheme, and reading it as one would split a local path into a store called
+/// `c` that no backend serves.
+fn is_scheme(candidate: &str) -> bool {
+    let mut chars = candidate.chars();
+    candidate.len() > 1
+        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// Whether a local path is rooted.
@@ -278,7 +320,19 @@ fn to_url(path: &str, windows: bool) -> String {
 /// The rule [`path_from_url`] applies, with the platform as an argument so both
 /// halves are testable from either.
 fn without_url_prefix(location: &str, windows: bool) -> &str {
-    let rest = location.strip_prefix("file://").unwrap_or(location);
+    // Both spellings of a local URL, for the reason given on `split`: an
+    // authority is optional, so Hadoop writes `file:/srv/wh` for what an
+    // operator writes `file:///srv/wh`. Stripping only the first leaves the
+    // scheme glued to the path, which is then relative and gets resolved
+    // against whatever directory the process started in.
+    let rest = location
+        .strip_prefix("file://")
+        .or_else(|| {
+            location
+                .strip_prefix("file:")
+                .filter(|rest| rest.starts_with('/'))
+        })
+        .unwrap_or(location);
 
     if windows
         && let Some(after) = rest.strip_prefix('/')
@@ -696,6 +750,18 @@ mod tests {
         // Two slashes, no third: already a path.
         assert_eq!(without_url_prefix("file://C:/data", true), "C:/data");
 
+        // One slash: the authority-less spelling Hadoop writes. Without this
+        // the scheme stays glued on, the path is relative, and a warehouse
+        // configured that way is created under the process's own directory.
+        assert_eq!(
+            without_url_prefix("file:/var/lib/rustberg", false),
+            "/var/lib/rustberg"
+        );
+        assert_eq!(without_url_prefix("file:/C:/data", true), "C:/data");
+
+        // Not rooted, so not a path this catalog will invent a root for.
+        assert_eq!(without_url_prefix("file:relative", false), "file:relative");
+
         // No scheme at all passes through.
         assert_eq!(
             without_url_prefix("/var/lib/rustberg", false),
@@ -720,6 +786,7 @@ mod tests {
     fn the_file_url_rule_has_one_spelling() {
         const BANNED: &[(&str, &str)] = &[
             ("strip_prefix(\"file://\")", "location::path_from_url"),
+            ("strip_prefix(\"file:\")", "location::path_from_url"),
             ("trim_start_matches(\"file://\")", "location::path_from_url"),
             ("format!(\"file://{}\"", "location::url_from_path"),
             ("format!(\"file:///{}\"", "location::url_from_path"),
@@ -882,6 +949,59 @@ mod tests {
         assert!(is_within("/srv/warehouse", "file:///srv/warehouse/db/t"));
         assert!(is_within("file:///srv/warehouse", "/srv/warehouse/db/t"));
         assert!(!is_within("/srv/warehouse", "/srv/warehouse-other/db/t"));
+    }
+
+    /// The authority-less spelling of a URL names the same location as the
+    /// spelling with an empty authority.
+    ///
+    /// This is the shape a Spark commit arrives in: Hadoop's `Path` normalises
+    /// `file:///tmp/wh/ns/t` to `file:/tmp/wh/ns/t`, so the manifest list an
+    /// `AddSnapshot` carries is spelled with one slash while the table location
+    /// the catalog recorded has three. Read as a bare path the first splits
+    /// into segments `["file:", "tmp", …]` and the table is refused the files
+    /// it just wrote — the first `INSERT` into a new table fails at commit.
+    #[test]
+    fn an_authority_less_url_names_the_same_location() {
+        let table = "file:///tmp/rustberg-wh/ns/t";
+        assert!(is_within(
+            table,
+            "file:/tmp/rustberg-wh/ns/t/metadata/snap-1.avro"
+        ));
+        assert!(is_within(
+            "file:/tmp/rustberg-wh/ns/t",
+            &format!("{table}/d/f")
+        ));
+        assert!(is_within("/tmp/rustberg-wh", "file:/tmp/rustberg-wh/ns/t"));
+
+        // Object stores are written the same way by the same code paths.
+        assert!(is_within("s3://bucket/wh", "s3:/bucket/wh/db/t"));
+        assert!(is_within("s3a:/bucket/wh", "s3://bucket/wh/db/t"));
+        assert!(is_prefix_within(
+            "file:///tmp/wh/t",
+            "file:/tmp/wh/t/data/f"
+        ));
+
+        // Recognising the scheme must not widen anything: a sibling prefix, a
+        // different store and a traversal are refused in this spelling too.
+        assert!(!is_within("file:///tmp/wh", "file:/tmp/wh-evil/t"));
+        assert!(!is_within("s3://bucket/wh", "gs:/bucket/wh/t"));
+        assert!(!is_within("file:///tmp/wh", "file:/tmp/wh/../etc/passwd"));
+
+        // Still relative, so still outside an absolute warehouse.
+        assert!(!is_within("file:///tmp/wh", "file:tmp/wh/t"));
+    }
+
+    /// A drive letter is not a scheme, and a colon in a directory name is not
+    /// one either — both would otherwise be split off as a store of their own.
+    #[test]
+    fn a_colon_that_is_not_a_scheme_is_left_in_the_path() {
+        assert_eq!(split("C:/data/wh"), ("file".to_string(), "C:/data/wh"));
+        assert_eq!(
+            split("/srv/wh/a:b/t"),
+            ("file".to_string(), "/srv/wh/a:b/t")
+        );
+        assert!(is_within("C:/data/wh", "C:/data/wh/db/t"));
+        assert!(!is_within("C:/data/wh", "D:/data/wh/db/t"));
     }
 
     /// Segment comparison drops the leading slash, so without an explicit test
