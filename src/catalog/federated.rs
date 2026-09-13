@@ -313,7 +313,7 @@ impl FederatedCatalog {
     /// [`capabilities`](super::capabilities) for why the intersection.
     pub fn effective_capabilities(&self) -> Capabilities {
         // Seeded from the catalog underneath, not from `full()`: names no mount
-        // claims still reach it (§6.1), so it is one of the backends the
+        // claims still reach it, so it is one of the backends the
         // advertised set has to be honest about. Asked with the root namespace,
         // which is the one every backend can answer for.
         self.mounts

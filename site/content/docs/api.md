@@ -399,10 +399,11 @@ anyway.
 
 The tag changes whenever the metadata does, and also whenever anything else
 about the document does: `snapshots=refs` and `snapshots=all` are different
-content and never share a tag, and neither do a caller whose policy restricts the
-table and one whose policy does not — a restricted caller is refused delegation,
-so its response is missing the signer block. Different content, different tag,
-in all three directions.
+content and never share a tag, and neither do two callers whose policies restrict
+the table **differently** — the response carries the signer block only for an
+unrestricted caller, and carries `read-restrictions` naming the actual filter and
+masks for a restricted one. Different content, different tag, in all three
+directions.
 
 `If-None-Match` is evaluated **after** authorization. A caller that may not see
 a table gets `404`, never `304`.
@@ -423,7 +424,7 @@ which one you get.
 |---|---|---|
 | Nothing | yes | Metadata only, and it changes only when the table does |
 | `remote-signing` | yes, a **different** one | The signer block is derived from the table's identity and holds no secret, so it caches — but it is a different document, and must not share a tag with the plain one |
-| `remote-signing`, on a table policy restricts | yes, a **third** one | A restricted table is refused delegation, so the signer block is absent. Two principals asking the same question of the same table get two documents, and they must not share a tag either |
+| `remote-signing`, on a table policy restricts | yes, a **third** one | The signer block is absent and `read-restrictions` is present. The tag covers *which* restrictions apply, so two callers restricted differently do not share one either |
 | `vended-credentials` | **no** | The response carries a freshly minted, expiring credential |
 
 A credentialed load is never answered `304` and never carries a tag. A `304` has
@@ -953,6 +954,92 @@ and could not be given them because the exchange failed is a `503`, not a silent
 `200` — the response would otherwise carry metadata the caller cannot read and
 look exactly like the ordinary uncredentialed case.
 
+### `read-restrictions`
+
+A restricted `loadTable` also carries `read-restrictions`, the Iceberg REST
+extension that tells a conforming reader what to apply:
+
+```json
+{
+  "metadata-location": "s3://warehouse/db/people/metadata/00001-....json",
+  "metadata": { "...": "..." },
+  "read-restrictions": {
+    "required-row-filter": {
+      "type": "eq",
+      "left":  { "type": "reference", "id": 1 },
+      "right": { "type": "literal", "value": "EU" }
+    },
+    "required-column-projections": [
+      { "action": "replace-with-null", "field-id": 2 }
+    ]
+  }
+}
+```
+
+Columns are addressed by **field id**, which is what keeps the restriction valid
+across a column rename. A reader that supports the extension must apply both, and
+must **fail the query** rather than return raw, partial or empty results if it
+cannot.
+
+Three things are worth knowing:
+
+- **It does not relax anything.** The credential is still withheld and the signer
+  block is still absent. `read-restrictions` exists for the engine that reads with
+  its *own* storage credentials, which is the only one withholding does not reach.
+  It is cooperative: a hostile engine ignores it.
+- **A mask becomes `replace-with-null` on an optional column and
+  `mask-to-fixed-value` on a required one.** The specification forbids nulling a
+  required field and says a reader must fail the query on receiving such a
+  projection.
+- **A filter this table cannot carry becomes `false`.** A tenant-wide
+  `@row_filter` naming a column some tables do not have publishes
+  `"required-row-filter": false` for those tables — the caller reads the metadata
+  and none of the rows. It is not omitted, because omitting it would tell a
+  conforming reader the table is unrestricted.
+
+The field is absent entirely when no policy restricts the caller on that table.
+
+### Server-side planning and pre-signed URLs
+
+A restricted `loadTable` also sets `scan-planning-mode` in `config`:
+
+```json
+{ "config": { "scan-planning-mode": "server" } }
+```
+
+The specification defines `server` as *"Clients MUST use server-side scan planning
+via the `planTableScan` endpoint"*. A client that plans here never reads the
+manifests, so it never sees the files the policy filter excluded — and the files
+it *is* told about come back as **pre-signed URLs** rather than bare paths, one
+per file the filter selected.
+
+```json
+{
+  "file-scan-tasks": [
+    { "data-file": {
+        "content": "data",
+        "file-path": "https://wh.s3.eu-west-1.amazonaws.com/db/t/data/00000-0-....parquet?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=900&X-Amz-Signature=..."
+    }}
+  ]
+}
+```
+
+The caller still receives **no** `storage-credentials` and **no**
+`remote-signing-config`.
+
+Three limits:
+
+- **A pre-signed URL is a bearer token.** Anyone holding one can fetch that object
+  until it expires. `credentials.signing.presign_ttl_seconds` sets the window;
+  default `900`.
+- **S3 only.** A restricted table on GCS or ADLS is planned but not delegated.
+- **A client that ignores the MUST** and reads manifests itself sees the excluded
+  files' *metadata*. It cannot fetch them: no credential, no signature, and no URL
+  for an unplanned file.
+
+An unrestricted table sets no `scan-planning-mode`, and its plan returns ordinary
+paths.
+
 ---
 
 ## Health & Metrics
@@ -982,7 +1069,7 @@ GET /ready
 ```json
 {
   "status": "ready",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "timestamp": 1704067200,
   "components": {
     "catalog": { "status": "ready" },
@@ -1675,7 +1762,7 @@ partial success.
 | Incremental scan planning | `501` | Declined rather than answered as a full scan. |
 | `POST /v1/oauth/tokens` | `501` | Deprecated for removal in the spec. Rustberg validates tokens, it does not issue them — `oauth2-server-uri` in the config response points at your IdP. The path is *routed* and answers without a credential, because a client configured with `credential=` calls it before anything else and a bare `401` there reads as a bad key. |
 | SQL UDFs (`…/namespaces/{ns}/functions`) | `404` | Function metadata is a third metadata document alongside tables and views, and `iceberg-rust` models none of it. |
-| Row filters enforced against a hostile engine | — | Applied in the scan plan and withheld from credentials, but nothing makes an unplanned file unfetchable. See [authorization](@/docs/authorization.md). |
+| Row filters enforced against a hostile engine | — | Enforced at **file** granularity: an unplanned file gets no pre-signed URL and no credential. Rows inside a delivered file are the reader's to filter. See [authorization](@/docs/authorization.md). |
 | Column masks as anything but advisory | — | Needs Parquet modular encryption; the masked bytes are in the file the engine downloads. |
 | Compaction and file-level maintenance | — | Data rewriting is not a catalog operation. See [Table maintenance](#table-maintenance). |
 

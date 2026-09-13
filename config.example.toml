@@ -362,6 +362,14 @@ provider = "none"
 # url_style = "auto"
 # # Lets `auto` tell minio:9000/bucket/key from bucket.minio:9000/key.
 # endpoint_host = "minio:9000"
+# # How long a pre-signed URL in a scan plan stays valid, in seconds.
+# #
+# # A table under a row filter or column mask is refused a credential and a
+# # signature, so its scan plan pre-signs the files the policy selected — the one
+# # delegation whose scope is exactly the permitted set, because the set is the
+# # plan. Those URLs carry their authorisation in the string and are replayable
+# # by whoever holds one until it expires, so this is minutes, not hours.
+# presign_ttl_seconds = 900
 
 # =============================================================================
 # Federation

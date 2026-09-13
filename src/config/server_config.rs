@@ -42,6 +42,11 @@ fn default_true() -> bool {
     true
 }
 
+/// Fifteen minutes, matching SigV4's own ceiling for a pre-signed request.
+const fn default_presign_ttl_seconds() -> u64 {
+    900
+}
+
 use crate::auth::JwtConfig;
 
 /// Server configuration
@@ -593,6 +598,18 @@ pub struct SigningConfig {
     #[serde(default)]
     pub region: Option<String>,
 
+    /// How long a pre-signed URL in a scan plan stays valid, in seconds.
+    ///
+    /// A restricted table is refused a credential and a signature, so its scan
+    /// plan pre-signs the files the policy filter selected — the only delegation
+    /// whose scope is exactly the permitted set. Those URLs carry their
+    /// authorisation in the string and are replayable by whoever holds one until
+    /// it expires, which is why this is minutes and not hours.
+    ///
+    /// Fifteen minutes by default, matching SigV4's own ceiling for a session.
+    #[serde(default = "default_presign_ttl_seconds")]
+    pub presign_ttl_seconds: u64,
+
     /// How to read a bucket out of a request URI: `auto`, `path` or
     /// `virtual-host`.
     ///
@@ -624,6 +641,7 @@ impl Default for SigningConfig {
             region: None,
             url_style: default_url_style(),
             endpoint_host: None,
+            presign_ttl_seconds: default_presign_ttl_seconds(),
         }
     }
 }
@@ -1535,9 +1553,18 @@ key_env = "RUSTBERG_KEY_CI"
                 .filter(|p| p.extension().is_some_and(|e| e == "md"))
                 .collect();
         files.push(root.join("README.md"));
-        // The design document too: it shows a mount table, and a design
-        // document whose examples do not parse is one a reader copies from.
-        files.push(root.join("CONCEPT.md"));
+        // The design notes too: they show a mount table, and a design document
+        // whose examples do not parse is one a reader copies from. Discovered
+        // rather than listed for the same reason the docs tree above is — and
+        // `concepts/` is gitignored, so in a fresh clone it is simply absent,
+        // which leaves this contributing nothing rather than failing.
+        files.extend(
+            std::fs::read_dir(root.join("concepts"))
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|e| e == "md")),
+        );
         // And the Helm chart, whose `config:` block is this exact schema handed
         // to a cluster. It is the copy furthest from this file and so the one
         // most likely to drift.

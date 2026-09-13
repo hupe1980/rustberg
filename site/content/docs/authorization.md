@@ -284,6 +284,22 @@ The accepted grammar is [the same one the plan endpoint reads](@/docs/api.md#the
 `and`, `or`, `not`, `is-null`, `not-null`, `is-nan`, `not-nan`, the comparisons,
 and `in`/`not-in`.
 
+**Both spellings of an operand are accepted.** The Iceberg spec deprecated
+`term`/`value` in favour of `left`/`right` (comparisons) and `child` (unary and
+set predicates), where the operand is a reference carrying either a name or a
+**field id**:
+
+```json
+{ "type": "eq",
+  "left":  { "type": "reference", "id": 7 },
+  "right": { "type": "literal", "value": "EU" } }
+```
+
+Prefer the field-id form in policies. A name stops matching the moment somebody
+renames the column, and although Rustberg refuses rather than silently dropping
+the restriction, a refusal still breaks reads until the policy is edited. A field
+id survives the rename, so the policy keeps working.
+
 A filter that is not readable JSON, or not a predicate, is a **startup failure** —
 the same answer a policy that does not typecheck gets, and for the same reason: a
 restriction that silently does not apply is worse than one that refuses to
@@ -292,9 +308,11 @@ install.
 Startup checks everything that can be checked **without a table**: the JSON, the
 shape, and that every operator and every term is one this catalog can bind. An
 operator outside the grammar above — a misspelled `"type": "equals"` — and a term
-wrapped in a `transform` or naming a field by id are both refused there, because
-neither can ever bind against any table and a filter that cannot bind is a
-restriction that would not apply.
+wrapped in a `transform` or a function application are both refused there,
+because neither can ever bind against any table and a filter that cannot bind is
+a restriction that would not apply. A reference **by field id** is bindable and is
+accepted; whether that id exists is a question about a table, so it is answered
+below.
 
 What startup cannot check is the two questions that are about a *table*: whether
 a column exists, and whether a literal fits it. One policy covers tables that do
@@ -319,6 +337,49 @@ empty entry is dropped, so a trailing comma is not a column named `""`. A column
 name that itself contains a comma cannot be masked — Iceberg permits one, this
 annotation cannot express it, and the honest answer is to say so rather than to
 invent an escaping rule no Cedar tool would render.
+
+Two behaviours are worth knowing before you write one.
+
+**A mask on a struct covers everything inside it.** `@column_mask("user")`
+withholds `user.ssn` and every other field beneath `user`. You do not have to
+enumerate them, and a field added to the struct later is covered without a policy
+change. A sibling that merely starts with the same characters is *not* covered:
+`user` does not reach a separate top-level `username`, because the match is on a
+path segment boundary.
+
+**A mask naming a column the table never had is simply skipped.** A broad permit
+is the ordinary way to say *"mask `ssn` wherever it appears"*:
+
+```cedar
+@column_mask("ssn")
+permit(principal in Rustberg::Group::"analysts",
+       action == Rustberg::Action::"Read",
+       resource in Rustberg::Tenant::"acme");
+```
+
+Most tables in a tenant have no `ssn`. There is nothing to withhold there and
+nothing is disclosed, so those tables are unaffected.
+
+**But a mask naming a column the table *used to have* refuses the request.** If
+the column was renamed or dropped, a scan plan and a table load both answer:
+
+```
+403 Forbidden
+Policy withholds the column 'ssn', which this table had and no longer has — it
+was renamed or dropped. The mask now withholds nothing, so the request is refused
+rather than served with the restriction quietly missing. Update the policy to the
+current name.
+```
+
+The two cases look identical in the policy — a name that does not resolve — and
+the table's **schema history** is what separates them. The distinction matters: a
+renamed column is still there, still readable, and a mask that silently stops
+matching is a policy that reads as though it protects a column and does not.
+
+The operational consequence is worth planning for: **renaming a masked column
+breaks reads of that table until the policy is updated.** Change the annotation in
+the same commit as the rename, or address the column by field id, which does not
+move.
 
 ### How they compose
 
@@ -426,18 +487,20 @@ rather than mask one column.
 
 Two things, and they are worth separating.
 
-**It makes the table undelegatable.** Rustberg grants it no storage access at
-all. A storage credential is **prefix-shaped** — the narrowest one Rustberg can
-mint covers the table's location — so an engine holding it reads every row and
-every column under that prefix whatever the policy says. A signature is
-table-shaped for the same reason. Given the choice between granting one while
-calling the filter enforced, and declining, Rustberg declines:
+**It withholds every *broad* form of storage access.** A storage credential is
+**prefix-shaped** — the narrowest one Rustberg can mint covers the table's
+location — so an engine holding it reads every row and every column under that
+prefix whatever the policy says. A signature is table-shaped for the same reason.
+Given the choice between granting one while calling the filter enforced, and
+declining, Rustberg declines — and delegates through the plan instead, where the
+scope can be exact:
 
 | Request | Result |
 |---|---|
-| `loadTable` on an annotated table | `200`, metadata returned, **no** `storage-credentials` and no signer configuration |
+| `loadTable` on an annotated table | `200`, metadata returned, **no** `storage-credentials` and no signer configuration; `config` sets `scan-planning-mode: server` |
 | `GET .../credentials` on an annotated table | `403`, naming the restriction |
 | `POST .../sign` on an annotated table | `403`, naming the restriction |
+| `POST .../plan` on an annotated table | `200`, with a **pre-signed URL** per file the filter selected ([details](@/docs/api.md#server-side-planning-and-pre-signed-urls)) |
 | `POST .../plan`, `@column_mask` over a **partition** column | `403`, naming the column |
 | Any of these, on an unannotated table | Access granted normally |
 

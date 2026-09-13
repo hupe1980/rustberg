@@ -81,7 +81,7 @@
       "description": {{ config.description | json_encode }},
       "codeRepository": {{ config.extra.repo | json_encode }},
       "programmingLanguage": "Rust",
-      "license": "https://www.apache.org/licenses/LICENSE-2.0",
+      "license": "https://spdx.org/licenses/Apache-2.0.html",
       "url": {{ config.base_url | json_encode }}
     },
     {
@@ -149,7 +149,7 @@
       <a href="{{ get_url(path='@/docs/_index.md') }}">Documentation</a>
       <a href="{{ config.extra.repo }}" rel="noopener">Source</a>
       <a href="{{ config.extra.repo }}/issues" rel="noopener">Issues</a>
-      <a href="{{ config.extra.repo }}/blob/main/LICENSE" rel="noopener">License</a>
+      <a href="{{ config.extra.repo }}#license" rel="noopener">License</a>
     </nav>
   </div>
 </footer>

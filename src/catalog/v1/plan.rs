@@ -161,7 +161,7 @@ pub async fn plan_table_scan(
     // — which is the *intersection* `GET /v1/config` publishes. A refusal is
     // per-request, so one read-only `rest` mount must remove planning from what
     // this catalog advertises without removing it from the native tables beside
-    // it (§6.4).
+    // it.
     if !state
         .catalog
         .capabilities_for(Some(&namespace))
@@ -188,9 +188,113 @@ pub async fn plan_table_scan(
         .load_table(&iceberg::TableIdent::new(namespace, name))
         .await?;
 
-    let tasks = build_plan(&loaded, &payload, &authorized.obligations).await?;
+    let mut tasks = build_plan(&loaded, &payload, &authorized.obligations).await?;
+
+    // A restricted table is refused a credential and a signature, so its plan
+    // names files the caller has no way to fetch. Pre-signing them here is what
+    // closes that loop — and it is the only delegation whose scope is *exactly*
+    // the set policy permits, because the set was computed one line above.
+    presign_planned_files(&state, &authorized, &loaded, &mut tasks).await?;
 
     Ok((StatusCode::OK, axum::Json(tasks)).into_response())
+}
+
+/// Replaces each planned file's `file-path` with a pre-signed URL.
+///
+/// Only for a table carrying obligations, which is refused a credential and a
+/// signature and would otherwise be planned but unreadable. The scope is exact by
+/// construction: the permitted set is not checked against afterwards, it *is* the
+/// plan.
+///
+/// Two things this must keep. It does not relax the credential refusal — the
+/// caller still gets no `storage-credentials` and no signer block. And it signs
+/// **reads** only: a pre-signed write is a URL that overwrites an object for
+/// whoever holds it until it expires, which is why
+/// [`RequestSigner::presign_get`] has no write form.
+///
+/// A pre-signed URL carries its authorisation in the string, so it is replayable
+/// until it expires — hence a short, configurable TTL.
+async fn presign_planned_files(
+    state: &AppState,
+    authorized: &guard::Authorized,
+    table: &iceberg::table::Table,
+    plan: &mut CompletedPlan,
+) -> Result<()> {
+    if authorized.obligations.is_empty() || !state.signing.enabled {
+        return Ok(());
+    }
+
+    // The same bound vending answers, asked the same way: this server pre-signs
+    // only for storage it manages. A mount's files belong to somebody else, and
+    // a remote reporting a location inside *this* warehouse must not earn a URL
+    // for it.
+    let location = table.metadata().location().to_string();
+    if !crate::location::is_vendable(state.request_signer.allowed_prefixes(), &location) {
+        return Ok(());
+    }
+
+    let ttl = state.signing.presign_ttl;
+    let region = state
+        .signing
+        .fallback_region
+        .clone()
+        .unwrap_or_else(|| "us-east-1".to_string());
+
+    for file in plan
+        .file_scan_tasks
+        .iter_mut()
+        .filter_map(|task| task.get_mut("data-file"))
+        .chain(plan.delete_files.iter_mut())
+    {
+        let Some(path) = file.get("file-path").and_then(Value::as_str) else {
+            continue;
+        };
+
+        let uri = planned_file_uri(&location, path, &region, &state.signing)?;
+        let signed = state
+            .request_signer
+            .presign_get(&uri, &region, ttl)
+            .await
+            .map_err(|e| AppError::Internal(format!("could not pre-sign '{path}': {e}")))?;
+        file["file-path"] = json!(signed);
+    }
+
+    Ok(())
+}
+
+/// The URL one planned file will be pre-signed at, with the two checks that have
+/// to pass first.
+///
+/// Separated from the signing loop because these are the parts that can be wrong
+/// on a file the loop never reaches in a test: containment, and whether the
+/// location has a pre-signed form at all.
+///
+/// # Errors
+///
+/// [`AppError::Internal`] for a file outside the table's own storage, and
+/// [`AppError::NotSupported`] for a location with no pre-signed form here.
+fn planned_file_uri(
+    table_location: &str,
+    path: &str,
+    region: &str,
+    config: &super::sign::SigningEndpointConfig,
+) -> Result<String> {
+    // Every file in the plan must be inside the table whose plan it is. The
+    // planner reads the snapshot's own manifests, so this holds by construction —
+    // but a manifest is written by an engine, and a path in one is the same
+    // untrusted input a purge already refuses to follow outside the table's
+    // location. Issuing a URL for it would be that hole with a signature on it.
+    if !crate::location::is_within(table_location, path) {
+        return Err(AppError::Internal(format!(
+            "the plan named '{path}', which is outside this table's own storage. No URL              is issued for it."
+        )));
+    }
+
+    super::sign::object_url(path, region, config).ok_or_else(|| {
+        AppError::NotSupported(format!(
+            "This table's files are at '{path}', which this server cannot pre-sign — only              S3 locations have a pre-signed URL form here. A restricted table on other              storage is planned but not delegated."
+        ))
+    })
 }
 
 /// `GET …/plan/{plan-id}`
@@ -343,10 +447,14 @@ async fn build_plan(
         (None, None) => None,
     };
 
-    refuse_masked_partition_columns(metadata, obligations)?;
+    // Resolved once per plan, and before anything is served: a mask that names no
+    // column in this schema refuses the request here rather than withholding
+    // nothing further down.
+    let masked = masked_field_ids(metadata, obligations)?;
 
-    let stats_fields =
-        stats_field_ids(request.stats_fields.as_deref(), &schema, case, obligations)?;
+    refuse_masked_partition_columns(metadata, &masked)?;
+
+    let stats_fields = stats_field_ids(request.stats_fields.as_deref(), &schema, case, &masked)?;
 
     // The residual carries the policy filter too, or a cooperating engine
     // applies only half of what the plan was built from — and the half it drops
@@ -545,27 +653,94 @@ async fn read_manifest_files(
     Ok(found)
 }
 
+/// Every field id policy withholds on this table, a masked struct's descendants
+/// included.
+///
+/// A `@column_mask` names a column and a `commitTable` may rename one, so a name
+/// that does not resolve is **two different facts**, and the table's schema
+/// history is what separates them:
+///
+/// - resolves in an **older** schema — renamed or dropped out from under the
+///   policy, so the mask now withholds nothing: [`AppError::Forbidden`];
+/// - resolves in **no** schema this table ever had — a broad permit's mask that
+///   is about other tables, so there is nothing here to withhold: skipped.
+///
+/// Ids rather than names because an id survives a rename, which is why the spec
+/// addresses restrictions by field id too.
+///
+/// # Errors
+///
+/// [`AppError::Forbidden`] naming a mask whose column this table has dropped or
+/// renamed.
+pub(crate) fn masked_field_ids(
+    metadata: &iceberg::spec::TableMetadata,
+    obligations: &Obligations,
+) -> Result<HashSet<i32>> {
+    let mut ids = HashSet::new();
+    if obligations.column_masks.is_empty() {
+        return Ok(ids);
+    }
+
+    let schema = metadata.current_schema();
+    let mut masked_paths: Vec<String> = Vec::new();
+
+    for mask in &obligations.column_masks {
+        let Some(field) = schema
+            .field_by_name(mask)
+            .or_else(|| schema.field_by_name_case_insensitive(mask))
+        else {
+            // Not in the current schema. Was it ever?
+            let once_had = metadata.schemas_iter().any(|past| {
+                past.field_by_name(mask).is_some()
+                    || past.field_by_name_case_insensitive(mask).is_some()
+            });
+            if once_had {
+                return Err(AppError::Forbidden(format!(
+                    "Policy withholds the column '{mask}', which this table had and no \
+                     longer has — it was renamed or dropped. The mask now withholds \
+                     nothing, so the request is refused rather than served with the \
+                     restriction quietly missing. Update the policy to the current name."
+                )));
+            }
+            // This table never had it, so the mask is about other tables and
+            // there is nothing here to withhold.
+            continue;
+        };
+
+        ids.insert(field.id);
+        if let Some(canonical) = schema.name_by_field_id(field.id) {
+            masked_paths.push(canonical.to_lowercase());
+        }
+    }
+
+    // A mask on a struct covers everything under it. Iceberg addresses nested
+    // fields by dotted path, so a descendant is any field whose canonical path
+    // is prefixed by a masked one plus a separator.
+    for (id, name) in schema.field_id_to_name_map() {
+        let lowered = name.to_lowercase();
+        if masked_paths
+            .iter()
+            .any(|masked| lowered.starts_with(&format!("{masked}.")))
+        {
+            ids.insert(*id);
+        }
+    }
+
+    Ok(ids)
+}
+
 /// The field ids to send statistics for, or `None` when the client asked for
 /// none.
 ///
-/// # The mask is matched on the resolved *full* name, and always case-insensitively
+/// Statistics carry a column's minimum and maximum value, so sending them for a
+/// masked column publishes exactly what the mask hides. The check is on the
+/// **field id** resolved by [`masked_field_ids`], so a mask on a struct covers
+/// the fields beneath it and a renamed column has already been refused rather
+/// than silently matching nothing.
 ///
-/// The field resolves with the request's own `case-sensitive` flag, like every
-/// other column reference in a plan — see [`CaseSensitivity`].
-///
-/// It is then compared by its **full dotted path**, because that is what a
-/// `@column_mask` names and what
-/// [`all_partition_source_columns`](crate::auth::filter_alignment::all_partition_source_columns)
-/// produces. `NestedField::name` carries the leaf only, so comparing it would
-/// miss `user.ssn` entirely while matching an unrelated top-level `ssn`.
-///
-/// The mask is then compared against the *resolved* schema name rather than what
-/// the client typed, and case-insensitively even under case-sensitive binding. A
-/// mask is a restriction, so the two error directions are not equal: withholding
-/// statistics for a column policy did not mean to mask costs a client one field
-/// it can ask for by its exact name, while publishing the bounds of a column
-/// policy *did* mask is the disclosure this exists to prevent. Matching the
-/// client's spelling instead would make `case-sensitive: false` a way around it.
+/// The field the *client* named resolves with the request's own
+/// `case-sensitive` flag, like every other column reference in a plan — see
+/// [`CaseSensitivity`].
 ///
 /// # Errors
 ///
@@ -575,7 +750,7 @@ fn stats_field_ids(
     names: Option<&[String]>,
     schema: &Schema,
     case: CaseSensitivity,
-    obligations: &Obligations,
+    masked: &HashSet<i32>,
 ) -> Result<Option<HashSet<i32>>> {
     let Some(names) = names else { return Ok(None) };
 
@@ -591,19 +766,16 @@ fn stats_field_ids(
             ))
         })?;
 
-        // The **full** dotted path, not `NestedField::name`, which is the leaf
-        // only. A mask reads `user.ssn`, so comparing the leaf compares `ssn`
-        // and matches nothing — the statistics of a masked nested column would
-        // be published, which is the exact disclosure this check exists to stop.
-        // `column_masks` and `all_partition_source_columns` both speak full
-        // names, so this is the one spelling all three agree on.
-        let resolved = schema
-            .name_by_field_id(field.id)
-            .unwrap_or(field.name.as_str());
-
         // Statistics carry a column's minimum and maximum value, so sending
-        // them for a masked column publishes exactly what the mask hides.
-        if is_masked(resolved, obligations) {
+        // them for a masked column publishes exactly what the mask hides. The
+        // comparison is on the **field id**, resolved once by
+        // [`masked_field_ids`], so a policy naming a struct withholds the fields
+        // beneath it and a policy naming a renamed column has already been
+        // refused rather than silently matching nothing.
+        if masked.contains(&field.id) {
+            let resolved = schema
+                .name_by_field_id(field.id)
+                .unwrap_or(field.name.as_str());
             return Err(AppError::Forbidden(format!(
                 "Policy withholds the column '{resolved}', and its statistics would name \
                  its minimum and maximum values."
@@ -628,28 +800,40 @@ fn stats_field_ids(
 /// exists to hand over. Dropping the tuple leaves the path; dropping the path
 /// leaves no plan.
 ///
-/// So the plan is refused, for the reason §8 refuses a credential and a
+/// So the plan is refused, for the reason storage access is refused for a
 /// signature for a restricted table: an answer that cannot carry the restriction
 /// is withheld rather than served with the restriction quietly missing. A mask
 /// over any other column plans normally.
 ///
-/// Comparison is against the partition *source* column by full name, over every
-/// spec the table has, since a snapshot holds files written under specs it has
-/// evolved away from.
+/// Comparison is against the partition *source* **field id**, over every spec the
+/// table has, since a snapshot holds files written under specs it has evolved
+/// away from. Ids rather than names because a rename must not silently drop the
+/// check — see [`masked_field_ids`].
 ///
 /// # Errors
 ///
 /// [`AppError::Forbidden`] naming the column.
 fn refuse_masked_partition_columns(
     metadata: &iceberg::spec::TableMetadata,
-    obligations: &Obligations,
+    masked: &HashSet<i32>,
 ) -> Result<()> {
-    if obligations.column_masks.is_empty() {
+    if masked.is_empty() {
         return Ok(());
     }
 
-    for column in crate::auth::filter_alignment::all_partition_source_columns(metadata) {
-        if is_masked(&column, obligations) {
+    // Every spec the table has ever had, by **source id**. A snapshot holds files
+    // written under specs it has evolved away from, and each carries the tuple of
+    // its own — and an id is the one spelling that survives a rename, which is
+    // the whole reason [`masked_field_ids`] resolves rather than compares.
+    for field in metadata
+        .partition_specs_iter()
+        .flat_map(|spec| spec.fields())
+    {
+        if masked.contains(&field.source_id) {
+            let column = metadata
+                .current_schema()
+                .name_by_field_id(field.source_id)
+                .map_or_else(|| format!("#{}", field.source_id), str::to_string);
             return Err(AppError::Forbidden(format!(
                 "Policy withholds the column '{column}', and this table is partitioned on \
                  it. Every file in a scan plan carries its partition values, and Iceberg \
@@ -660,17 +844,6 @@ fn refuse_masked_partition_columns(
         }
     }
     Ok(())
-}
-
-/// Whether policy withholds a column, comparing without regard to case.
-///
-/// See [`stats_field_ids`] for why the comparison is deliberately looser than
-/// Iceberg's own name binding.
-fn is_masked(column: &str, obligations: &Obligations) -> bool {
-    obligations
-        .column_masks
-        .iter()
-        .any(|masked| masked.eq_ignore_ascii_case(column))
 }
 
 /// What policy permits this caller to see, as one predicate.
@@ -1048,6 +1221,42 @@ mod tests {
 
     /// A table partitioned on a date, a timestamp and a decimal — the three
     /// types whose JSON form is not the shape of the literal that carries them.
+    /// Metadata carrying exactly this schema and no partitioning, for the mask
+    /// tests — which are about names and ids, not about layout.
+    fn metadata_with(schema: Schema) -> TableMetadata {
+        iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            iceberg::spec::UnboundPartitionSpec::builder().build(),
+            iceberg::spec::SortOrder::unsorted_order(),
+            "memory://wh/db/t".to_string(),
+            iceberg::spec::FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("metadata builds")
+        .build()
+        .expect("metadata builds")
+        .metadata
+    }
+
+    /// Metadata whose *current* schema is `now` and whose history also holds
+    /// `before` — a table that has been through a schema change.
+    fn metadata_after_change(before: Schema, now: Schema) -> TableMetadata {
+        iceberg::spec::TableMetadataBuilder::new(
+            before,
+            iceberg::spec::UnboundPartitionSpec::builder().build(),
+            iceberg::spec::SortOrder::unsorted_order(),
+            "memory://wh/db/t".to_string(),
+            iceberg::spec::FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("metadata builds")
+        .add_current_schema(now)
+        .expect("schema evolves")
+        .build()
+        .expect("metadata builds")
+        .metadata
+    }
+
     fn metadata() -> TableMetadata {
         let schema = Schema::builder()
             .with_fields(vec![
@@ -1190,11 +1399,13 @@ mod tests {
             column_masks: HashSet::from(["user.ssn".to_string()]),
         };
 
+        let metadata = metadata_with(schema);
+        let masked = masked_field_ids(&metadata, &obligations).expect("the mask resolves");
         let refused = stats_field_ids(
             Some(&["user.ssn".to_string()]),
-            &schema,
+            metadata.current_schema(),
             CaseSensitivity::Sensitive,
-            &obligations,
+            &masked,
         );
         assert!(
             matches!(refused, Err(AppError::Forbidden(_))),
@@ -1212,13 +1423,213 @@ mod tests {
             column_masks: HashSet::from(["user.ssn".to_string()]),
         };
 
+        let metadata = metadata_with(schema);
+        let current = metadata.current_schema();
+        let masked = masked_field_ids(&metadata, &obligations).expect("the mask resolves");
         let allowed = stats_field_ids(
             Some(&["amount".to_string()]),
-            &schema,
+            current,
             CaseSensitivity::Sensitive,
-            &obligations,
+            &masked,
         )
         .expect("an unmasked column is served");
-        assert_eq!(allowed, Some(HashSet::from([3])));
+        let amount = current.field_id_by_name("amount").expect("amount exists");
+        assert_eq!(allowed, Some(HashSet::from([amount])));
+    }
+
+    /// The defect this resolver exists for. A `@column_mask` names a column; a
+    /// `commitTable` may rename one. Before masks were resolved to ids, the stale
+    /// name matched nothing and the statistics of the renamed column — its
+    /// minimum and maximum value — were served, while
+    /// [`Obligations::is_empty`] still reported the table restricted and so still
+    /// refused a credential. Fail-closed for delegation, fail-open for
+    /// disclosure, from one annotation.
+    #[test]
+    fn a_mask_naming_a_renamed_column_refuses_rather_than_withholding_nothing() {
+        // The schema the policy was written against.
+        let original = nested_schema();
+
+        // `user.ssn` has been renamed to `user.tax_id`; the policy still says `ssn`.
+        let renamed = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(
+                    1,
+                    "user",
+                    Type::Struct(iceberg::spec::StructType::new(vec![
+                        NestedField::optional(2, "tax_id", Type::Primitive(PrimitiveType::String))
+                            .into(),
+                    ])),
+                )
+                .into(),
+                NestedField::optional(3, "amount", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .expect("schema builds");
+
+        let obligations = Obligations {
+            row_filters: Vec::new(),
+            column_masks: HashSet::from(["user.ssn".to_string()]),
+        };
+
+        let resolved = masked_field_ids(&metadata_after_change(original, renamed), &obligations);
+        assert!(
+            matches!(resolved, Err(AppError::Forbidden(_))),
+            "a mask that resolves to no column must refuse, got {resolved:?}"
+        );
+    }
+
+    /// The other half of the same question, and the one that makes the schema
+    /// history necessary. A broad permit carrying `@column_mask("ssn")` reaches
+    /// every table in a tenant, and most have no `ssn` — there is nothing to
+    /// withhold and nothing is disclosed. Refusing here would break the ordinary
+    /// way to say "mask `ssn` wherever it appears".
+    #[test]
+    fn a_mask_for_a_column_this_table_never_had_is_skipped() {
+        let schema = nested_schema();
+        let obligations = Obligations {
+            row_filters: Vec::new(),
+            column_masks: HashSet::from(["ssn_of_some_other_table".to_string()]),
+        };
+
+        let masked = masked_field_ids(&metadata_with(schema), &obligations)
+            .expect("a mask this table never had is not an error");
+        assert!(
+            masked.is_empty(),
+            "nothing here to withhold, got {masked:?}"
+        );
+    }
+
+    /// A mask on a struct withholds what is under it. Comparing dotted names
+    /// never did this: `user` and `user.ssn` are different strings, so masking
+    /// the struct published the statistics of every field inside it.
+    #[test]
+    fn a_mask_on_a_struct_withholds_its_nested_fields() {
+        let schema = nested_schema();
+        let obligations = Obligations {
+            row_filters: Vec::new(),
+            column_masks: HashSet::from(["user".to_string()]),
+        };
+
+        let metadata = metadata_with(schema);
+        let current = metadata.current_schema();
+        let masked = masked_field_ids(&metadata, &obligations).expect("the mask resolves");
+
+        let struct_id = current.field_id_by_name("user").expect("user exists");
+        let nested_id = current
+            .field_id_by_name("user.ssn")
+            .expect("user.ssn exists");
+        assert!(masked.contains(&struct_id), "the struct itself is masked");
+        assert!(
+            masked.contains(&nested_id),
+            "the field beneath a masked struct is masked too, got {masked:?}"
+        );
+
+        let refused = stats_field_ids(
+            Some(&["user.ssn".to_string()]),
+            current,
+            CaseSensitivity::Sensitive,
+            &masked,
+        );
+        assert!(
+            matches!(refused, Err(AppError::Forbidden(_))),
+            "statistics under a masked struct must be refused, got {refused:?}"
+        );
+    }
+
+    /// An unrelated sibling is still served — the prefix match is on a path
+    /// segment boundary, so `user` must not swallow a top-level `username`.
+    #[test]
+    fn a_masked_struct_does_not_swallow_a_similarly_named_sibling() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(
+                    1,
+                    "user",
+                    Type::Struct(iceberg::spec::StructType::new(vec![
+                        NestedField::optional(2, "ssn", Type::Primitive(PrimitiveType::String))
+                            .into(),
+                    ])),
+                )
+                .into(),
+                NestedField::optional(3, "username", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .expect("schema builds");
+
+        let obligations = Obligations {
+            row_filters: Vec::new(),
+            column_masks: HashSet::from(["user".to_string()]),
+        };
+
+        let metadata = metadata_with(schema);
+        let current = metadata.current_schema();
+        let masked = masked_field_ids(&metadata, &obligations).expect("the mask resolves");
+        let sibling = current
+            .field_id_by_name("username")
+            .expect("username exists");
+        assert!(
+            !masked.contains(&sibling),
+            "`username` is not under `user`, got {masked:?}"
+        );
+    }
+    fn signing_config() -> super::super::sign::SigningEndpointConfig {
+        super::super::sign::SigningEndpointConfig {
+            enabled: true,
+            url_style: Some(super::super::sign::UrlStyle::Auto),
+            endpoint_host: None,
+            fallback_region: None,
+            presign_ttl: std::time::Duration::from_secs(900),
+        }
+    }
+
+    /// The ordinary case: a data file under the table gets a URL to be signed at.
+    #[test]
+    fn a_planned_file_inside_the_table_resolves_to_a_url() {
+        let uri = planned_file_uri(
+            "s3://wh/db/events",
+            "s3://wh/db/events/data/00000-0-abc.parquet",
+            "eu-west-1",
+            &signing_config(),
+        )
+        .expect("inside the table");
+        assert_eq!(
+            uri,
+            "https://wh.s3.eu-west-1.amazonaws.com/db/events/data/00000-0-abc.parquet"
+        );
+    }
+
+    /// A manifest is written by an engine, so a path inside one is untrusted input
+    /// — the same input a purge already refuses to follow outside the table. A
+    /// pre-signed URL for it would be that hole with a signature on it.
+    #[test]
+    fn a_planned_file_outside_the_table_is_refused() {
+        for path in [
+            "s3://wh/db/other/data/f.parquet",
+            "s3://wh/db/events-evil/data/f.parquet",
+            "s3://other-bucket/db/events/data/f.parquet",
+        ] {
+            let refused =
+                planned_file_uri("s3://wh/db/events", path, "eu-west-1", &signing_config());
+            assert!(
+                matches!(refused, Err(AppError::Internal(_))),
+                "{path} is outside the table and must be refused, got {refused:?}"
+            );
+        }
+    }
+
+    /// A restricted table on storage with no pre-signed form is planned and not
+    /// delegated, and says which it is rather than failing opaquely.
+    #[test]
+    fn a_file_with_no_presigned_form_is_not_supported() {
+        let refused = planned_file_uri(
+            "gs://wh/db/events",
+            "gs://wh/db/events/data/f.parquet",
+            "eu-west-1",
+            &signing_config(),
+        );
+        assert!(
+            matches!(refused, Err(AppError::NotSupported(_))),
+            "got {refused:?}"
+        );
     }
 }

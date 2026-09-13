@@ -24,9 +24,14 @@
 //!
 //! Rustberg *does* apply row filters — a scan plan is built from the client's
 //! filter conjoined with what policy permits, and the residual on every task
-//! carries both halves. But a plan is advice to a cooperating engine. What makes
-//! a filter architectural is that the files it excludes are never named, and
-//! that only happens when the boundary is partition-aligned.
+//! carries both halves. A restricted table is pinned to server-side planning and
+//! its planned files come back pre-signed, so an excluded **file** is unnamed and
+//! unfetchable.
+//!
+//! That still leaves the rows *inside* a delivered file, and the residual
+//! predicate over them is advice. What makes a filter architectural is that no
+//! delivered file contains a forbidden row, and that only happens when the
+//! boundary is partition-aligned.
 //!
 //! So the warning fires where the filter and the partition spec are both in
 //! hand, names the table and the columns, and says which of the two kinds of
@@ -57,8 +62,11 @@ use iceberg::spec::{TableMetadata, Transform};
 /// Delegates to [`crate::predicate::referenced_columns`]: one grammar, read one
 /// way, so the columns this warns about are exactly the columns the planner
 /// prunes on.
-pub fn referenced_columns(filter: &serde_json::Value) -> BTreeSet<String> {
-    crate::predicate::referenced_columns(filter)
+pub fn referenced_columns(
+    filter: &serde_json::Value,
+    metadata: &TableMetadata,
+) -> BTreeSet<String> {
+    crate::predicate::referenced_columns(filter, metadata.current_schema())
 }
 
 /// Columns a filter can be enforced on by withholding files.
@@ -93,47 +101,13 @@ pub fn partition_source_columns(metadata: &TableMetadata) -> BTreeSet<String> {
         .collect()
 }
 
-/// Every column any partition spec the table has ever had puts in a file's
-/// partition tuple, whatever the transform.
-///
-/// Three deliberate differences from [`partition_source_columns`], because the
-/// two answer opposite questions. That one asks *what can a filter be enforced
-/// on*, so it is narrow: only an identity transform separates rows by value, and
-/// only the spec new files are written under matters for a filter about the
-/// future.
-///
-/// This one asks *what does a plan disclose*, so it is wide:
-///
-/// - **Every transform counts.** `bucket(16, id)` is a lossy function of `id`,
-///   but a tuple carrying bucket 7 still narrows `id` to a sixteenth of its
-///   range, and `days(ts)` names the day. A mask over the source column is not
-///   honoured by publishing a function of it.
-/// - **Every spec counts, not just the default.** A snapshot holds files written
-///   under specs the table has since evolved away from, and each of those files
-///   carries the tuple of the spec it was written under.
-/// - **A source id with no name in the current schema still counts**, under the
-///   id, since a plan for those files discloses the value either way.
-pub fn all_partition_source_columns(metadata: &TableMetadata) -> BTreeSet<String> {
-    let schema = metadata.current_schema();
-
-    metadata
-        .partition_specs_iter()
-        .flat_map(|spec| spec.fields())
-        .map(|field| {
-            schema
-                .name_by_field_id(field.source_id)
-                .map_or_else(|| format!("#{}", field.source_id), str::to_string)
-        })
-        .collect()
-}
-
 /// Columns a filter references that the table does not partition on.
 ///
 /// Empty means the filter is partition-aligned, and withholding files would be
 /// real enforcement. Non-empty names the columns that make it cooperative.
 pub fn unaligned_columns(filter: &serde_json::Value, metadata: &TableMetadata) -> BTreeSet<String> {
     let partitions = partition_source_columns(metadata);
-    referenced_columns(filter)
+    referenced_columns(filter, metadata)
         .into_iter()
         .filter(|column| !partitions.contains(column))
         .collect()
@@ -141,11 +115,32 @@ pub fn unaligned_columns(filter: &serde_json::Value, metadata: &TableMetadata) -
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use serde_json::json;
+    use std::sync::Arc;
+
+    /// The columns these tests reference, so an `IdReference` has something to
+    /// resolve against.
+    fn schema() -> Arc<Schema> {
+        Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "region", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                    NestedField::optional(2, "a", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(3, "b", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(4, "c", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(5, "ts", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .expect("schema builds"),
+        )
+    }
 
     fn cols(filter: serde_json::Value) -> Vec<String> {
-        referenced_columns(&filter).into_iter().collect()
+        crate::predicate::referenced_columns(&filter, &schema())
+            .into_iter()
+            .collect()
     }
 
     #[test]
@@ -180,8 +175,26 @@ mod tests {
         );
     }
 
-    /// A term this catalog cannot bind contributes no column — and no pruning,
-    /// so reporting it as unaligned is the safe direction.
+    /// A reference by **field id** names its column. `IdReference` is the form
+    /// the spec prefers and the one `read-restrictions` mandates, so reading it
+    /// as nothing would silently suppress the alignment warning for every filter
+    /// written the modern way.
+    #[test]
+    fn a_reference_by_field_id_names_its_column() {
+        assert_eq!(
+            cols(json!({
+                "type": "eq",
+                "left": { "type": "reference", "id": 1 },
+                "right": { "type": "literal", "value": "EU" }
+            })),
+            vec!["region".to_string()]
+        );
+    }
+
+    /// A term this catalog cannot bind contributes no column. That suppresses
+    /// the alignment warning rather than provoking it — safe only because such a
+    /// *policy* filter is refused outright at plan time, so there is no
+    /// enforcement claim left to be wrong about.
     #[test]
     fn an_unbindable_term_names_nothing() {
         assert!(

@@ -324,7 +324,7 @@ impl AppState {
     /// Storage access — a vended credential, a signed request — is scoped to a
     /// table's `location`, and that location is whatever the catalog holding the
     /// table reported. For the native catalog that is this server's own record.
-    /// For a **mount** it is somebody else's catalog, which §7 treats as
+    /// For a **mount** it is somebody else's catalog, which is treated as
     /// untrusted input because it sits on the request path of every call into
     /// its subtree.
     ///
@@ -341,7 +341,7 @@ impl AppState {
     /// is right for building a default location and wrong here — the fallback is
     /// the whole hole. A `rest` mount stores nothing and declares no warehouse,
     /// so the honest answer for its tables is that this server manages none of
-    /// their storage, which is also what §8.2 already says about signing for a
+    /// their storage, which is also the rule the signing endpoint applies to a
     /// mount.
     pub async fn manages_storage_for(
         &self,
@@ -1463,6 +1463,7 @@ impl AppBuilder {
             )?),
             endpoint_host: signing_config.endpoint_host.clone(),
             fallback_region: signing_config.region.clone(),
+            presign_ttl: std::time::Duration::from_secs(signing_config.presign_ttl_seconds),
         };
 
         // Advertised only where it works everywhere — see `AppState::vending`.

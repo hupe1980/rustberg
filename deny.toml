@@ -94,9 +94,9 @@ highlight = "all"
 #
 # "No OpenSSL anywhere" is a design commitment, not a preference: it is what
 # makes a static musl build a `cargo zigbuild` away rather than a packaging
-# project, and it is claimed in the README and in CONCEPT.md §2. A claim nothing
-# checks is one feature flag away from becoming false, and the way it becomes
-# false is silent — some transitive dependency's default features switch
+# project, and it is claimed in the README. A claim nothing checks is one feature
+# flag away from becoming false, and the way it
+# becomes false is silent — some transitive dependency's default features switch
 # `native-tls` on and the binary suddenly needs a system library.
 #
 # This is the right place for the check rather than a grep in CI: `cargo deny`

@@ -19,6 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -95,6 +96,34 @@ pub trait RequestSigner: Send + Sync + Debug {
     /// signable, or the server's own credentials could not be used.
     async fn sign(&self, request: SignRequest<'_>) -> Result<SignedRequest, SigningError>;
 
+    /// Pre-signs a **read** of one object, as a URL the client fetches directly.
+    ///
+    /// # Why this is a separate operation and not `sign` with a flag
+    ///
+    /// The two differ in when the signature is used and for how long, which is
+    /// the whole security difference between them. A signature from [`sign`] is
+    /// minted for a request the client is about to make and is used once; a
+    /// pre-signed URL carries its authorisation *in the URL* and is replayable by
+    /// anyone holding it until it expires. Giving them one signature and one
+    /// lifetime would let a caller obtain the second by asking for the first.
+    ///
+    /// It is limited to reads on purpose. A pre-signed write is a URL that
+    /// **overwrites an object**, valid for its whole TTL, to whoever it leaks to.
+    /// Nothing in a scan plan needs one.
+    ///
+    /// [`sign`]: RequestSigner::sign
+    ///
+    /// # Errors
+    ///
+    /// [`SigningError`] when no signer serves this location, the URL cannot be
+    /// built, or the server's own credentials could not be used.
+    async fn presign_get(
+        &self,
+        uri: &str,
+        region: &str,
+        expires_in: Duration,
+    ) -> Result<String, SigningError>;
+
     /// Storage locations this signer will sign for, as prefixes.
     ///
     /// The *only* scope question a signer answers. A second one — "does this
@@ -125,6 +154,15 @@ impl RequestSigner for NoopRequestSigner {
         Err(SigningError::NotConfigured)
     }
 
+    async fn presign_get(
+        &self,
+        _uri: &str,
+        _region: &str,
+        _expires_in: Duration,
+    ) -> Result<String, SigningError> {
+        Err(SigningError::NotConfigured)
+    }
+
     fn allowed_prefixes(&self) -> &[String] {
         &[]
     }
@@ -140,11 +178,11 @@ mod sigv4 {
     use async_trait::async_trait;
     use aws_credential_types::provider::ProvideCredentials;
     use aws_sigv4::http_request::{
-        PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SigningSettings,
-        UriPathNormalizationMode, sign as aws_sign,
+        PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SignatureLocation,
+        SigningSettings, UriPathNormalizationMode, sign as aws_sign,
     };
     use aws_sigv4::sign::v4;
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
 
     /// Headers excluded from the signature.
     ///
@@ -324,6 +362,75 @@ mod sigv4 {
             })
         }
 
+        async fn presign_get(
+            &self,
+            uri: &str,
+            region: &str,
+            expires_in: Duration,
+        ) -> Result<String, SigningError> {
+            let credentials = self
+                .credentials
+                .provide_credentials()
+                .await
+                .map_err(|e| SigningError::Failed(format!("no usable AWS credentials: {e}")))?;
+            let identity = credentials.into();
+
+            let mut settings = SigningSettings::default();
+            settings.percent_encoding_mode = PercentEncodingMode::Single;
+            settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+            // The authorisation moves into the query string, which is what makes
+            // the URL fetchable on its own. `expires_in` only applies here: a
+            // header signature is bounded by the request it is attached to.
+            settings.signature_location = SignatureLocation::QueryParams;
+            settings.expires_in = Some(expires_in);
+            // A pre-signed GET carries no body, and demanding a payload checksum
+            // would make the client send a header it has no way to know.
+            settings.payload_checksum_kind = PayloadChecksumKind::NoHeader;
+
+            let params = v4::SigningParams::builder()
+                .identity(&identity)
+                .region(region)
+                .name("s3")
+                .time(SystemTime::now())
+                .settings(settings)
+                .build()
+                .map_err(|e| SigningError::Failed(format!("invalid signing parameters: {e}")))?
+                .into();
+
+            let signable = SignableRequest::new(
+                "GET",
+                uri,
+                std::iter::empty(),
+                SignableBody::UnsignedPayload,
+            )
+            .map_err(|e| SigningError::Unsignable(format!("{e}")))?;
+
+            let (instructions, _signature) = aws_sign(signable, &params)
+                .map_err(|e| SigningError::Failed(format!("{e}")))?
+                .into_parts();
+
+            // Query-string signing puts everything in `params`; the URL is the
+            // object's URI with those appended. A pre-signed URL with no
+            // parameters would be an unsigned URL that looks signed.
+            let params = instructions.params();
+            if params.is_empty() {
+                return Err(SigningError::Failed(
+                    "signing produced no query parameters, so the URL would not be signed"
+                        .to_string(),
+                ));
+            }
+
+            let mut url = reqwest::Url::parse(uri)
+                .map_err(|e| SigningError::Unsignable(format!("not a URL: {e}")))?;
+            {
+                let mut query = url.query_pairs_mut();
+                for (name, value) in params {
+                    query.append_pair(name, value);
+                }
+            }
+            Ok(url.to_string())
+        }
+
         fn allowed_prefixes(&self) -> &[String] {
             &self.allowed_prefixes
         }
@@ -332,6 +439,98 @@ mod sigv4 {
 
 #[cfg(feature = "remote-signing")]
 pub use sigv4::AwsSigV4Signer;
+
+#[cfg(all(test, feature = "remote-signing"))]
+mod presign_tests {
+    use super::*;
+    use aws_credential_types::Credentials;
+    use aws_credential_types::provider::SharedCredentialsProvider;
+
+    fn signer() -> AwsSigV4Signer {
+        AwsSigV4Signer::with_credentials(
+            SharedCredentialsProvider::new(Credentials::for_tests()),
+            vec!["s3://wh".to_string()],
+        )
+    }
+
+    /// A pre-signed URL carries its whole authorisation in the query string —
+    /// that is what makes it fetchable with no headers, and what makes it a
+    /// bearer token with a lifetime.
+    #[tokio::test]
+    async fn a_presigned_url_carries_its_authorisation_in_the_query_string() {
+        let url = signer()
+            .presign_get(
+                "https://wh.s3.eu-west-1.amazonaws.com/db/t/data/f.parquet",
+                "eu-west-1",
+                Duration::from_secs(900),
+            )
+            .await
+            .expect("signs");
+
+        let parsed = reqwest::Url::parse(&url).expect("a URL");
+        let params: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+
+        assert_eq!(
+            params.get("X-Amz-Algorithm").map(String::as_str),
+            Some("AWS4-HMAC-SHA256"),
+            "{url}"
+        );
+        assert_eq!(
+            params.get("X-Amz-Expires").map(String::as_str),
+            Some("900"),
+            "the TTL is the whole difference from a header signature: {url}"
+        );
+        assert!(params.contains_key("X-Amz-Signature"), "{url}");
+        assert!(params.contains_key("X-Amz-Credential"), "{url}");
+        assert!(params.contains_key("X-Amz-Date"), "{url}");
+
+        // The object it names must survive untouched, or the URL fetches
+        // something other than the file the plan selected.
+        assert_eq!(parsed.path(), "/db/t/data/f.parquet", "{url}");
+    }
+
+    /// A different TTL is a different signature, not the same one with a longer
+    /// lease — the expiry is part of what is signed.
+    #[tokio::test]
+    async fn the_ttl_is_covered_by_the_signature() {
+        let uri = "https://wh.s3.eu-west-1.amazonaws.com/db/t/f.parquet";
+        let short = signer()
+            .presign_get(uri, "eu-west-1", Duration::from_secs(60))
+            .await
+            .expect("signs");
+        let long = signer()
+            .presign_get(uri, "eu-west-1", Duration::from_secs(3600))
+            .await
+            .expect("signs");
+
+        let sig = |url: &str| {
+            reqwest::Url::parse(url)
+                .expect("a URL")
+                .query_pairs()
+                .find(|(k, _)| k == "X-Amz-Signature")
+                .map(|(_, v)| v.into_owned())
+                .expect("a signature")
+        };
+        assert_ne!(sig(&short), sig(&long));
+    }
+
+    /// Signing for one region and fetching in another does not verify, so the
+    /// region has to reach the signature rather than only the host.
+    #[tokio::test]
+    async fn the_region_is_covered_by_the_signature() {
+        let uri = "https://wh.s3.eu-west-1.amazonaws.com/db/t/f.parquet";
+        let eu = signer()
+            .presign_get(uri, "eu-west-1", Duration::from_secs(900))
+            .await
+            .expect("signs");
+        let us = signer()
+            .presign_get(uri, "us-east-1", Duration::from_secs(900))
+            .await
+            .expect("signs");
+        assert_ne!(eu, us);
+        assert!(eu.contains("eu-west-1"), "{eu}");
+    }
+}
 
 #[cfg(test)]
 mod tests {

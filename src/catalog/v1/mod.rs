@@ -30,6 +30,7 @@ mod namespace;
 pub mod ownership;
 pub mod pagination;
 pub mod plan;
+pub mod restrictions;
 mod routes;
 pub mod sign;
 pub mod snapshots;

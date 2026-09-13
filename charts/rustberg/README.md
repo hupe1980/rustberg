@@ -218,4 +218,5 @@ survives per your reclaim policy.
 
 ## License
 
-Apache License 2.0
+Dual-licensed under [Apache 2.0](../../LICENSE-APACHE) or
+[MIT](../../LICENSE-MIT), at your option.

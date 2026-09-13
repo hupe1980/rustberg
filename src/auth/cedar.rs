@@ -1427,10 +1427,18 @@ mod tests {
                 .filter(|path| path.extension().is_some_and(|e| e == "md"))
                 .collect();
         files.push(root.join("README.md"));
-        // The design document, which is not part of the published tree and may
-        // simply not be here. Skipped when absent rather than required, like the
-        // optional sources `documented_toml_matches_the_schema` reads.
-        files.push(root.join("CONCEPT.md"));
+        // The design notes, which are not part of the published tree and may
+        // simply not be here: `concepts/` is gitignored, so a fresh clone has
+        // none of this. Discovered rather than listed, like the docs tree above,
+        // and skipped when absent rather than required — the same way the
+        // optional sources `documented_toml_matches_the_schema` reads are.
+        files.extend(
+            std::fs::read_dir(root.join("concepts"))
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| path.extension().is_some_and(|e| e == "md")),
+        );
         files.sort();
 
         let mut checked = 0;

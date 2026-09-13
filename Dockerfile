@@ -109,7 +109,7 @@ FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 LABEL org.opencontainers.image.title="Rustberg"
 LABEL org.opencontainers.image.description="Production-grade Apache Iceberg REST Catalog - 100% Rust"
 LABEL org.opencontainers.image.vendor="hupe1980"
-LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.licenses="Apache-2.0 OR MIT"
 LABEL org.opencontainers.image.source="https://github.com/hupe1980/rustberg"
 LABEL org.opencontainers.image.documentation="https://hupe1980.github.io/rustberg/"
 

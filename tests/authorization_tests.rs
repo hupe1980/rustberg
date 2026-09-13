@@ -593,6 +593,221 @@ async fn load_table_omits_credentials_for_a_restricted_table() {
     );
 }
 
+/// The other half of the same response, and the reason the first half is not the
+/// whole story. Withholding a credential is enforcement against anything reading
+/// *through* this catalog; it does nothing about an engine holding its own
+/// storage credentials. `read-restrictions` is what reaches that engine, and it
+/// must be present on exactly the table the credential was withheld from.
+#[tokio::test]
+async fn a_restricted_table_publishes_read_restrictions() {
+    let policies = r#"
+        @row_filter("{\"type\":\"eq\",\"term\":\"region\",\"value\":\"EU\"}")
+        @column_mask("ssn")
+        permit(principal in Rustberg::Group::"admin", action, resource)
+          when { resource.tenant == principal.tenant };
+    "#;
+
+    let (admin_key, admin_secret) = key("admin", "acme", &["admin"]);
+    let (app, _store) = app_with(policies, vec![admin_key]).await;
+
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces",
+        &admin_secret,
+        Some(serde_json::json!({ "namespace": ["ns"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A table that actually has the columns the policy names.
+    let (status, body) = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/ns/tables",
+        &admin_secret,
+        Some(serde_json::json!({
+            "name": "people",
+            "schema": { "type": "struct", "fields": [
+                { "id": 1, "name": "region", "required": false, "type": "string" },
+                { "id": 2, "name": "ssn", "required": false, "type": "string" }
+            ]}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seed failed: {body}");
+
+    let (status, body) = request(
+        &app,
+        Method::GET,
+        "/v1/namespaces/ns/tables/people",
+        &admin_secret,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+
+    let restrictions = body
+        .get("read-restrictions")
+        .unwrap_or_else(|| panic!("a restricted table must publish them: {body}"));
+
+    // The row filter is rewritten to a field id, which is what keeps it valid
+    // across a rename — and what the specification requires here.
+    let filter = &restrictions["required-row-filter"];
+    assert_eq!(filter["type"], "eq", "{restrictions}");
+    assert_eq!(filter["left"]["type"], "reference", "{restrictions}");
+    assert!(
+        filter["left"]["id"].is_i64(),
+        "the filter must reference a field id, got {restrictions}"
+    );
+    assert_eq!(filter["right"]["value"], "EU", "{restrictions}");
+
+    // The mask becomes a projection addressed by field id. `ssn` is optional
+    // here, so `replace-with-null` is legal; a required column could not use it.
+    let projections = restrictions["required-column-projections"]
+        .as_array()
+        .unwrap_or_else(|| panic!("projections must be an array: {restrictions}"));
+    assert_eq!(projections.len(), 1, "{restrictions}");
+    assert_eq!(projections[0]["action"], "replace-with-null");
+    assert!(projections[0]["field-id"].is_i64(), "{restrictions}");
+
+    // And none of this relaxes what is withheld.
+    assert!(
+        body.get("storage-credentials").is_none(),
+        "publishing a restriction must never hand over a credential: {body}"
+    );
+}
+
+/// The lever that makes the restriction enforceable rather than advisory. The
+/// spec defines `scan-planning-mode: server` as *"Clients MUST use server-side
+/// scan planning"*, so a conforming client never reads a manifest for this table
+/// — which is what stops it seeing the files the filter excluded.
+#[tokio::test]
+async fn a_restricted_table_requires_server_side_planning() {
+    let policies = r#"
+        @row_filter("{\"type\":\"eq\",\"term\":\"region\",\"value\":\"EU\"}")
+        permit(principal in Rustberg::Group::"admin", action, resource)
+          when { resource.tenant == principal.tenant };
+    "#;
+
+    let (admin_key, admin_secret) = key("admin", "acme", &["admin"]);
+    let (app, _store) = app_with(policies, vec![admin_key]).await;
+    seed(&app, &admin_secret, "ns", &["events"]).await;
+
+    let (status, body) = request(
+        &app,
+        Method::GET,
+        "/v1/namespaces/ns/tables/events",
+        &admin_secret,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+
+    assert_eq!(
+        body["config"]["scan-planning-mode"], "server",
+        "a restricted table must pin the client to the planner: {body}"
+    );
+}
+
+/// And an unrestricted one must not, because forcing server-side planning on a
+/// table that needs none narrows which engines can read it for nothing in
+/// return.
+#[tokio::test]
+async fn an_unrestricted_table_does_not_require_server_side_planning() {
+    let policies = r#"
+        permit(principal in Rustberg::Group::"admin", action, resource)
+          when { resource.tenant == principal.tenant };
+    "#;
+
+    let (admin_key, admin_secret) = key("admin", "acme", &["admin"]);
+    let (app, _store) = app_with(policies, vec![admin_key]).await;
+    seed(&app, &admin_secret, "ns", &["events"]).await;
+
+    let (status, body) = request(
+        &app,
+        Method::GET,
+        "/v1/namespaces/ns/tables/events",
+        &admin_secret,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+    assert!(
+        body["config"].get("scan-planning-mode").is_none(),
+        "an unrestricted table plans however the client prefers: {body}"
+    );
+}
+
+/// An unrestricted table must not carry the field at all. A response that always
+/// includes it teaches clients to read an empty object as "no restrictions",
+/// which is a different claim from "this catalog does not restrict".
+#[tokio::test]
+async fn an_unrestricted_table_publishes_no_read_restrictions() {
+    let policies = r#"
+        permit(principal in Rustberg::Group::"admin", action, resource)
+          when { resource.tenant == principal.tenant };
+    "#;
+
+    let (admin_key, admin_secret) = key("admin", "acme", &["admin"]);
+    let (app, _store) = app_with(policies, vec![admin_key]).await;
+    seed(&app, &admin_secret, "ns", &["events"]).await;
+
+    let (status, body) = request(
+        &app,
+        Method::GET,
+        "/v1/namespaces/ns/tables/events",
+        &admin_secret,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+    assert!(
+        body.get("read-restrictions").is_none(),
+        "an unrestricted table publishes nothing: {body}"
+    );
+}
+
+/// A broad permit's filter reaches tables that do not have the column it names.
+/// That must not break the load — it is the ordinary way to write a tenant-wide
+/// policy — and it must not silently publish *no* restriction either, which
+/// would tell a conforming reader the table is unrestricted. It denies instead.
+#[tokio::test]
+async fn a_filter_that_does_not_fit_a_table_denies_every_row() {
+    let policies = r#"
+        @row_filter("{\"type\":\"eq\",\"term\":\"region\",\"value\":\"EU\"}")
+        permit(principal in Rustberg::Group::"admin", action, resource)
+          when { resource.tenant == principal.tenant };
+    "#;
+
+    let (admin_key, admin_secret) = key("admin", "acme", &["admin"]);
+    let (app, _store) = app_with(policies, vec![admin_key]).await;
+
+    // `seed` creates tables with an empty schema, so `region` is absent.
+    seed(&app, &admin_secret, "ns", &["events"]).await;
+
+    let (status, body) = request(
+        &app,
+        Method::GET,
+        "/v1/namespaces/ns/tables/events",
+        &admin_secret,
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "the load must still work: {body}");
+    let body: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+    assert_eq!(
+        body["read-restrictions"]["required-row-filter"],
+        serde_json::Value::Bool(false),
+        "a filter this table cannot carry denies every row: {body}"
+    );
+}
+
 // ============================================================================
 // Paging
 // ============================================================================

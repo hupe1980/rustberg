@@ -53,24 +53,21 @@
 //! — which costs one extra full load in a case nobody hits, and buys a rule that
 //! does not silently start colliding the day signing is configured.
 //!
-//! **And so is the restriction, because it decides the same block.** A table
-//! carrying a `@row_filter` or a `@column_mask` is refused delegation, so the
-//! signer block is dropped from its response — the very block the paragraph
-//! above folds in. Two callers asking for signing on one table therefore
-//! receive two different documents whenever policy restricts one of them and
-//! not the other, and without this input they would receive one tag.
+//! **And so are the restrictions — which ones, not merely whether.** A table
+//! carrying a `@row_filter` or a `@column_mask` drops the signer block *and*
+//! carries `read-restrictions`, so the filter and the masks are in the document.
+//! Two callers restricted differently receive two different documents, and a tag
+//! naming only *restricted* would collide them.
+//!
+//! So [`crate::auth::Obligations::fingerprint`] is folded in. It digests the
+//! obligations rather than the resolved restrictions, which is what keeps the
+//! cheap path: obligations are known from the policy decision, before the
+//! metadata document is fetched, so a `304` still costs one pointer lookup.
 //!
 //! `Cache-Control: private` keeps a shared proxy out of it, so this is not a
-//! poisoning the server can be talked into. What it is, is the rule stated twice
-//! above — *different content, different tag* — with the third input that
-//! changes the content. The case it costs is a client multiplexing identities
-//! against one cache, and that is not an exotic one: a query engine's
-//! coordinator is exactly that.
-//!
-//! Like delegation, it is the *restriction* that is folded in and not the
-//! restriction's contents. A filter that changes while still being a filter
-//! leaves the document the same shape, and anything that changed the table
-//! itself has already changed the metadata location.
+//! poisoning the server can be talked into. The case it costs is a client
+//! multiplexing identities against one cache — a query engine's coordinator is
+//! exactly that.
 
 use axum::http::HeaderMap;
 use sha2::{Digest, Sha256};
@@ -94,7 +91,7 @@ pub fn etag_for(
     metadata_location: Option<&str>,
     scope: SnapshotScope,
     delegation: AccessDelegation,
-    restricted: bool,
+    restrictions: &crate::auth::Obligations,
 ) -> Option<String> {
     // A table with no recorded metadata location has no version to name, so it
     // gets no tag rather than a fabricated one. Staged tables are the case.
@@ -121,16 +118,14 @@ pub fn etag_for(
         b"plain".as_slice()
     });
     hasher.update([0u8]);
-    // The restriction decides the same block the line above does: a table under
-    // a row filter or a column mask is refused delegation, so its response drops
-    // the signer configuration. Two callers asking for signing on one table
-    // therefore hold two different documents whenever policy restricts one of
-    // them, and without this they would hold one tag.
-    hasher.update(if restricted {
-        b"restricted".as_slice()
-    } else {
-        b"unrestricted".as_slice()
-    });
+    // The restriction decides two parts of this document: the signer block, which
+    // a restricted table does not get, and `read-restrictions`, which carries the
+    // filter and the masks themselves. So the tag names *which* restrictions
+    // apply and not merely whether any do — two principals restricted to
+    // different regions hold two different documents, and one tag between them
+    // would let a client multiplexing identities revalidate as the second and
+    // keep the first's filter.
+    hasher.update(restrictions.fingerprint().as_bytes());
 
     let digest = hasher.finalize();
     // 128 bits of a SHA-256 digest. A collision is what would matter here — a
@@ -184,9 +179,25 @@ fn strip_weak(tag: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Obligations;
+
+    /// No restrictions — the ordinary table.
+    fn none() -> Obligations {
+        Obligations::default()
+    }
+
+    /// A caller restricted to one region.
+    fn restricted(region: &str) -> Obligations {
+        Obligations {
+            row_filters: vec![serde_json::json!({
+                "type": "eq", "term": "region", "value": region
+            })],
+            column_masks: std::collections::HashSet::new(),
+        }
+    }
 
     fn tag(location: &str, scope: SnapshotScope) -> String {
-        etag_for(Some(location), scope, AccessDelegation::default(), false)
+        etag_for(Some(location), scope, AccessDelegation::default(), &none())
             .expect("a located table has a tag")
     }
 
@@ -239,7 +250,15 @@ mod tests {
 
     #[test]
     fn a_table_with_no_location_has_no_tag() {
-        assert!(etag_for(None, SnapshotScope::All, AccessDelegation::default(), false).is_none());
+        assert!(
+            etag_for(
+                None,
+                SnapshotScope::All,
+                AccessDelegation::default(),
+                &none()
+            )
+            .is_none()
+        );
     }
 
     /// The bug this exists to prevent: a client that echoes a tag *and* asks for
@@ -256,7 +275,7 @@ mod tests {
                 Some("s3://b/t/1.json"),
                 SnapshotScope::All,
                 delegation,
-                false
+                &none()
             )
             .is_none()
         );
@@ -275,9 +294,14 @@ mod tests {
             Some("s3://b/t/1.json"),
             SnapshotScope::All,
             AccessDelegation::default(),
-            false,
+            &none(),
         );
-        let signed = etag_for(Some("s3://b/t/1.json"), SnapshotScope::All, signing, false);
+        let signed = etag_for(
+            Some("s3://b/t/1.json"),
+            SnapshotScope::All,
+            signing,
+            &none(),
+        );
         assert!(plain.is_some() && signed.is_some());
         assert_ne!(plain, signed);
         assert!(is_revalidatable(&if_none_match("\"x\""), signing));
@@ -294,14 +318,49 @@ mod tests {
         };
         let location = Some("s3://b/t/1.json");
 
-        let unrestricted = etag_for(location, SnapshotScope::All, signing, false);
-        let restricted = etag_for(location, SnapshotScope::All, signing, true);
+        let unrestricted = etag_for(location, SnapshotScope::All, signing, &none());
+        let restricted = etag_for(location, SnapshotScope::All, signing, &restricted("EU"));
 
         assert!(unrestricted.is_some() && restricted.is_some());
         assert_ne!(
             unrestricted, restricted,
             "the signer block is in one response and not the other, so the two must not \
              share a validator"
+        );
+    }
+
+    /// And two callers restricted *differently* must not share one either. The
+    /// response now carries the filter itself, so a tag naming only "restricted"
+    /// would let a client multiplexing identities against one cache revalidate as
+    /// the second caller and keep the first caller's filter. A query engine's
+    /// coordinator is exactly that client.
+    #[test]
+    fn two_differently_restricted_callers_do_not_share_a_tag() {
+        let signing = AccessDelegation {
+            vended_credentials: false,
+            remote_signing: true,
+        };
+        let location = Some("s3://b/t/1.json");
+
+        let eu = etag_for(location, SnapshotScope::All, signing, &restricted("EU"));
+        let us = etag_for(location, SnapshotScope::All, signing, &restricted("US"));
+
+        assert!(eu.is_some() && us.is_some());
+        assert_ne!(
+            eu, us,
+            "two different row filters are two different documents"
+        );
+    }
+
+    /// The same restriction, twice, is the same tag — or every revalidation is a
+    /// miss and the validator buys nothing.
+    #[test]
+    fn the_same_restriction_produces_the_same_tag() {
+        let signing = AccessDelegation::default();
+        let location = Some("s3://b/t/1.json");
+        assert_eq!(
+            etag_for(location, SnapshotScope::All, signing, &restricted("EU")),
+            etag_for(location, SnapshotScope::All, signing, &restricted("EU"))
         );
     }
 

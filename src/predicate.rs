@@ -224,7 +224,7 @@ fn parse_with_polarity(
         }
 
         "is-null" | "not-null" | "is-nan" | "not-nan" => {
-            let Some(name) = operand_name(object)? else {
+            let Some(name) = operand_of(object)?.resolve(schema)? else {
                 return widen(positive, strictness, &format!("the term of '{kind}'"));
             };
             // Bound against the schema like every other column reference. A
@@ -264,7 +264,7 @@ fn parse_with_polarity(
         }
 
         "lt" | "lt-eq" | "gt" | "gt-eq" | "eq" | "not-eq" | "starts-with" | "not-starts-with" => {
-            let Some(name) = comparison_operand(object)? else {
+            let Some(name) = comparison_operand_of(object)?.resolve(schema)? else {
                 return widen(positive, strictness, &format!("the term of '{kind}'"));
             };
             let field = field_named(schema, &name, case)?;
@@ -288,7 +288,7 @@ fn parse_with_polarity(
         }
 
         "in" | "not-in" => {
-            let Some(name) = operand_name(object)? else {
+            let Some(name) = operand_of(object)?.resolve(schema)? else {
                 return widen(positive, strictness, &format!("the term of '{kind}'"));
             };
             let field = field_named(schema, &name, case)?;
@@ -324,36 +324,81 @@ fn child<'a>(object: &'a Map<String, Value>, name: &str) -> Result<&'a Value> {
         .ok_or_else(|| invalid(format!("a filter expression needs '{name}'")))
 }
 
-/// The column an operand names, for the `child`/`term` forms.
-fn operand_name(object: &Map<String, Value>) -> Result<Option<String>> {
+/// What a filter operand refers to.
+///
+/// The spec has two reference forms and deprecated a third. A `NamedReference`
+/// carries a column name; an `IdReference` carries a **field id**, which is the
+/// form `read-restrictions` mandates and the one the spec now prefers
+/// everywhere, because an id survives a column rename. Both bind. A transform or
+/// a function application does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Operand {
+    /// A column, by name.
+    Named(String),
+    /// A column, by field id.
+    Id(i32),
+    /// Well-formed, but naming something this catalog cannot bind — a transform
+    /// or a function application. The caller widens; see [`parse_predicate`].
+    Unbindable,
+}
+
+impl Operand {
+    /// The column name, resolving a field id against the schema.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::DataInvalid`] when a field id names no column in this
+    /// schema — the same answer a name that resolves to nothing already gets,
+    /// since the two are the same mistake spelled differently.
+    fn resolve(&self, schema: &SchemaRef) -> Result<Option<String>> {
+        match self {
+            Self::Named(name) => Ok(Some(name.clone())),
+            Self::Id(id) => schema
+                .name_by_field_id(*id)
+                .map(|name| Some(name.to_string()))
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "the filter references field id {id}, which this table has no"
+                    ))
+                }),
+            Self::Unbindable => Ok(None),
+        }
+    }
+
+    /// Whether this operand can be bound to a column at all, without a schema in
+    /// hand. Used at policy load, where there is no table yet.
+    const fn is_bindable(&self) -> bool {
+        !matches!(self, Self::Unbindable)
+    }
+}
+
+/// The operand of a `child`/`term` form expression.
+fn operand_of(object: &Map<String, Value>) -> Result<Operand> {
     let operand = object
         .get("child")
         .or_else(|| object.get("term"))
         .ok_or_else(|| invalid("a filter expression needs an operand".to_string()))?;
-    reference_name(operand)
+    reference_operand(operand)
 }
 
-/// The column a comparison's left-hand side names.
-fn comparison_operand(object: &Map<String, Value>) -> Result<Option<String>> {
+/// The operand on a comparison's left-hand side.
+fn comparison_operand_of(object: &Map<String, Value>) -> Result<Operand> {
     let operand = object
         .get("left")
         .or_else(|| object.get("term"))
         .ok_or_else(|| invalid("a comparison needs a left-hand side".to_string()))?;
-    reference_name(operand)
+    reference_operand(operand)
 }
 
-/// Reads a column name out of a term or reference.
-///
-/// `None` means the operand is well-formed but names something this catalog
-/// cannot bind — a transform, a function application, a field id. The caller
-/// widens; see [`parse_predicate`].
+/// Reads an operand out of a term or reference.
 ///
 /// # Errors
 ///
-/// [`ErrorKind::DataInvalid`] when the operand is not an operand at all.
-fn reference_name(value: &Value) -> Result<Option<String>> {
+/// [`ErrorKind::DataInvalid`] when the operand is not an operand at all, or is a
+/// reference carrying neither a name nor a usable field id.
+fn reference_operand(value: &Value) -> Result<Operand> {
     if let Some(name) = value.as_str() {
-        return Ok(Some(name.to_string()));
+        return Ok(Operand::Named(name.to_string()));
     }
 
     let object = value.as_object().ok_or_else(|| {
@@ -361,13 +406,19 @@ fn reference_name(value: &Value) -> Result<Option<String>> {
     })?;
 
     match object.get("type").and_then(Value::as_str) {
-        // A named reference binds; a reference by field id does not, because
-        // this catalog binds against the schema by name.
-        Some("reference") => Ok(object
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::to_string)),
-        Some("transform") | Some("apply") => Ok(None),
+        Some("reference") => {
+            if let Some(name) = object.get("name").and_then(Value::as_str) {
+                return Ok(Operand::Named(name.to_string()));
+            }
+            let id = object
+                .get("id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| invalid("a reference needs a 'name' or an 'id'".to_string()))?;
+            i32::try_from(id)
+                .map(Operand::Id)
+                .map_err(|_| invalid(format!("field id {id} is out of range")))
+        }
+        Some("transform") | Some("apply") => Ok(Operand::Unbindable),
         _ => Err(invalid(
             "a filter operand must be a field name or a reference".to_string(),
         )),
@@ -630,14 +681,15 @@ pub fn validate_policy_filter(json: &Value) -> Result<()> {
         .ok_or_else(|| invalid("a predicate expression needs a 'type'"))?;
 
     /// Refuses a term the binder would refuse: one naming no column it can
-    /// resolve, which is a transform, a function application or a field id.
-    fn bindable_operand(name: Option<String>, kind: &str) -> Result<()> {
-        name.map(|_| ()).ok_or_else(|| {
+    /// resolve, which is a transform or a function application. A reference by
+    /// name or by field id binds, so neither reaches here.
+    fn bindable_operand(operand: Operand, kind: &str) -> Result<()> {
+        operand.is_bindable().then_some(()).ok_or_else(|| {
             invalid(format!(
-                "the term of '{kind}' is a transform, a function application or a field id, \
-                 none of which this catalog can bind. In a client's filter that is widened \
-                 away; in a policy row filter widening would remove the restriction, so it \
-                 is refused."
+                "the term of '{kind}' is a transform or a function application, neither of \
+                 which this catalog can bind. In a client's filter that is widened away; in \
+                 a policy row filter widening would remove the restriction, so it is \
+                 refused."
             ))
         })
     }
@@ -650,10 +702,10 @@ pub fn validate_policy_filter(json: &Value) -> Result<()> {
         }
         "not" => validate_policy_filter(child(object, "child")?),
         "is-null" | "not-null" | "is-nan" | "not-nan" => {
-            bindable_operand(operand_name(object)?, kind)
+            bindable_operand(operand_of(object)?, kind)
         }
         "lt" | "lt-eq" | "gt" | "gt-eq" | "eq" | "not-eq" | "starts-with" | "not-starts-with" => {
-            bindable_operand(comparison_operand(object)?, kind)?;
+            bindable_operand(comparison_operand_of(object)?, kind)?;
             object
                 .get("right")
                 .or_else(|| object.get("value"))
@@ -661,7 +713,7 @@ pub fn validate_policy_filter(json: &Value) -> Result<()> {
                 .ok_or_else(|| invalid(format!("comparison '{kind}' needs a value")))
         }
         "in" | "not-in" => {
-            bindable_operand(operand_name(object)?, kind)?;
+            bindable_operand(operand_of(object)?, kind)?;
             object
                 .get("values")
                 .map(|_| ())
@@ -676,23 +728,33 @@ pub fn validate_policy_filter(json: &Value) -> Result<()> {
     }
 }
 
-/// Every column a predicate names, without binding it.
+/// Every column a predicate names, resolved against `schema` but not bound.
 ///
 /// Exact, because the grammar says where a column reference can appear. That is
 /// what a filter written as JSON buys over one written as an opaque string: an
 /// identifier scan over SQL text has to over-report, and this does not.
 ///
-/// A term this catalog cannot bind — a transform, a function application, a
-/// field id — contributes no name. It also contributes no pruning, so a caller
-/// asking "is this filter partition-aligned" gets `false` from the absence,
-/// which is the safe direction.
-pub fn referenced_columns(json: &Value) -> BTreeSet<String> {
+/// **The schema is needed because a reference may be a field id.** `IdReference`
+/// is the form the spec prefers and the one `read-restrictions` mandates, so a
+/// filter that names its columns by id is ordinary rather than exotic, and
+/// reading it without a schema would silently return no columns at all.
+///
+/// A term this catalog cannot bind — a transform or a function application —
+/// still contributes no name, and that is **not** conservative for every caller:
+/// [`crate::auth::filter_alignment::warn_if_cooperative`] stays silent when the
+/// column set is empty, so an unresolvable term suppresses the warning rather
+/// than provoking it. It is safe only because a *policy* filter carrying such a
+/// term is refused outright at plan time
+/// ([`parse_policy_predicate`]), so the table cannot be planned at all and there
+/// is no enforcement claim left to be wrong about. The suppressed warning is a
+/// missing diagnostic, not a missing restriction.
+pub fn referenced_columns(json: &Value, schema: &SchemaRef) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
-    collect_columns(json, &mut names);
+    collect_columns(json, &mut names, schema);
     names
 }
 
-fn collect_columns(json: &Value, names: &mut BTreeSet<String>) {
+fn collect_columns(json: &Value, names: &mut BTreeSet<String>, schema: &SchemaRef) {
     let Some(object) = json.as_object() else {
         return;
     };
@@ -704,19 +766,20 @@ fn collect_columns(json: &Value, names: &mut BTreeSet<String>) {
         "and" | "or" => {
             for side in ["left", "right"] {
                 if let Some(value) = object.get(side) {
-                    collect_columns(value, names);
+                    collect_columns(value, names, schema);
                 }
             }
         }
         "not" => {
             if let Some(value) = object.get("child") {
-                collect_columns(value, names);
+                collect_columns(value, names, schema);
             }
         }
         _ => {
             for key in ["child", "term", "left"] {
                 if let Some(value) = object.get(key)
-                    && let Ok(Some(name)) = reference_name(value)
+                    && let Ok(operand) = reference_operand(value)
+                    && let Ok(Some(name)) = operand.resolve(schema)
                 {
                     names.insert(name);
                 }
@@ -967,7 +1030,9 @@ mod tests {
             "right": { "type": "is-null", "child": { "type": "reference", "name": "ts" } }
         });
         assert_eq!(
-            referenced_columns(&filter).into_iter().collect::<Vec<_>>(),
+            referenced_columns(&filter, &schema())
+                .into_iter()
+                .collect::<Vec<_>>(),
             vec!["region".to_string(), "ts".to_string()]
         );
     }
@@ -1075,5 +1140,54 @@ mod tests {
                 Predicate::AlwaysTrue
             );
         }
+    }
+    /// An `IdReference` binds to its column. This is the form the spec prefers —
+    /// `term` is deprecated — and the only form `read-restrictions` accepts, so a
+    /// conforming client writes filters this way. Reading it as unbindable
+    /// widened every such filter to `AlwaysTrue` and threw away all pruning: a
+    /// full scan, correct but silently far slower, with nothing in the response
+    /// to say why.
+    #[test]
+    fn a_comparison_by_field_id_binds() {
+        let by_id = parse(json!({
+            "type": "eq",
+            "left": { "type": "reference", "id": 1 },
+            "right": { "type": "literal", "value": "EU" }
+        }))
+        .expect("a field id binds");
+
+        let by_name =
+            parse(json!({ "type": "eq", "term": "region", "value": "EU" })).expect("a name binds");
+
+        assert_eq!(
+            format!("{by_id:?}"),
+            format!("{by_name:?}"),
+            "the two spellings must bind to the same predicate"
+        );
+    }
+
+    /// A field id the schema does not have is the same mistake as a name it does
+    /// not have, and gets the same answer.
+    #[test]
+    fn a_comparison_by_unknown_field_id_is_refused() {
+        let refused = parse(json!({
+            "type": "eq",
+            "left": { "type": "reference", "id": 999 },
+            "right": { "type": "literal", "value": "EU" }
+        }));
+        assert!(refused.is_err(), "an unknown field id must not bind");
+    }
+
+    /// A policy row filter written with field ids is bindable, so it is accepted
+    /// at load. It must not be refused as "a transform, a function application or
+    /// a field id" — that message described the old behaviour.
+    #[test]
+    fn a_policy_filter_by_field_id_validates() {
+        validate_policy_filter(&json!({
+            "type": "eq",
+            "left": { "type": "reference", "id": 1 },
+            "right": { "type": "literal", "value": "EU" }
+        }))
+        .expect("a field id is bindable, so a policy filter may use one");
     }
 }

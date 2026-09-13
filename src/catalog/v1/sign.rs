@@ -6,8 +6,11 @@
 //! # What has to be true before a signature is minted
 //!
 //! 1. The caller may `Read` the table (and `Update` it, for anything mutating).
-//! 2. The table carries no row filter or column mask — a signature is
-//!    file-shaped and cannot express a predicate.
+//! 2. The table carries no row filter or column mask. This endpoint signs a URI
+//!    the *client* chose, so it confines to the table and not to the subset a
+//!    filter permits. Such a table is delegated through its scan plan instead,
+//!    where the permitted set is known
+//!    ([`restrictions`](super::restrictions)).
 //! 3. The request is one of the operations this endpoint knows how to
 //!    authorize.
 //! 4. Every location the request touches is inside the table's own location.
@@ -174,7 +177,7 @@ impl UrlStyle {
 }
 
 /// Everything the endpoint needs to know about how storage is addressed.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SigningEndpointConfig {
     /// Whether the endpoint is served at all.
     pub enabled: bool,
@@ -184,6 +187,64 @@ pub struct SigningEndpointConfig {
     pub endpoint_host: Option<String>,
     /// Region used when a client sends none.
     pub fallback_region: Option<String>,
+    /// How long a pre-signed URL in a scan plan stays valid.
+    ///
+    /// Short on purpose. A pre-signed URL carries its authorisation *in the
+    /// string*, so within its lifetime it is replayable by whoever holds it —
+    /// unlike a signature from this endpoint, which is minted for one request a
+    /// caller is making now. The TTL is the whole of the difference, so the
+    /// default is minutes rather than hours.
+    pub presign_ttl: std::time::Duration,
+}
+
+impl Default for SigningEndpointConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url_style: None,
+            endpoint_host: None,
+            fallback_region: None,
+            presign_ttl: std::time::Duration::from_secs(900),
+        }
+    }
+}
+
+/// The HTTPS URL an `s3://bucket/key` location is fetched at.
+///
+/// The inverse of what this endpoint does to a client's URI, and it has to agree
+/// with it: a plan hands back a URL the client fetches directly, so a spelling
+/// this server would not itself recognise is one nothing can verify later.
+///
+/// Three shapes, decided by configuration rather than guessed:
+///
+/// - a custom `endpoint_host` with path style — `https://host/bucket/key`, which
+///   is MinIO and most S3-compatible stores;
+/// - a custom `endpoint_host` with virtual-host style — `https://bucket.host/key`;
+/// - no custom endpoint — AWS's own `https://bucket.s3.region.amazonaws.com/key`.
+///
+/// `None` for anything that is not an `s3://` location, because that is the only
+/// scheme this server can pre-sign.
+pub fn object_url(location: &str, region: &str, config: &SigningEndpointConfig) -> Option<String> {
+    let rest = location.strip_prefix("s3://")?;
+    let (bucket, key) = rest.split_once('/')?;
+    if bucket.is_empty() || key.is_empty() {
+        return None;
+    }
+
+    // Each segment is encoded on its own: `/` separates keys and must survive,
+    // everything else that is not URL-safe must not.
+    let encoded: String = key
+        .split('/')
+        .map(encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/");
+
+    let url = match (config.endpoint_host.as_deref(), config.url_style) {
+        (Some(host), Some(UrlStyle::VirtualHost)) => format!("https://{bucket}.{host}/{encoded}"),
+        (Some(host), _) => format!("https://{host}/{bucket}/{encoded}"),
+        (None, _) => format!("https://{bucket}.s3.{region}.amazonaws.com/{encoded}"),
+    };
+    Some(url)
 }
 
 /// What `LoadTableResult` tells a client about remote signing.
@@ -342,7 +403,7 @@ pub async fn sign_request(
     // what this deployment configured; the namespace's own warehouse says which
     // of those this *table* may live in. Without the second, a mount reporting a
     // table whose location points into this server's warehouse would be signed
-    // for — the mount's own catalog chose that string, and §7 treats what a mount
+    // for — the mount's own catalog chose that string, and what a mount
     // returns as untrusted input. See `AppState::manages_storage_for`.
     if !state.manages_storage_for(namespace, &table_location).await
         || !crate::location::is_vendable(state.request_signer.allowed_prefixes(), &table_location)
@@ -371,7 +432,7 @@ pub async fn sign_request(
     // it received nothing. So minting it first costs no grant — the failure
     // paths below and the fail-closed record after both return an error and drop
     // it on the floor — and it buys a trail that does not claim a signature the
-    // signer then failed to produce. §9's rule is that the trail never describes
+    // signer then failed to produce. The trail never describes
     // something that did not happen; recording first broke that in the quiet
     // direction, by over-reporting a grant.
     let signed = state
@@ -1191,6 +1252,65 @@ mod tests {
             url_style: Some(UrlStyle::Auto),
             endpoint_host: None,
             fallback_region: None,
+            presign_ttl: std::time::Duration::from_secs(900),
+        }
+    }
+
+    /// The URL a plan hands back must be one this server would itself recognise.
+    /// AWS has no custom endpoint, so the bucket goes in the host.
+    #[test]
+    fn an_aws_object_url_is_virtual_hosted() {
+        assert_eq!(
+            object_url("s3://wh/db/t/data/f.parquet", "eu-west-1", &config()).as_deref(),
+            Some("https://wh.s3.eu-west-1.amazonaws.com/db/t/data/f.parquet")
+        );
+    }
+
+    /// A custom endpoint — MinIO and most S3-compatible stores — is path style
+    /// unless the deployment says otherwise, because a bucket in the host needs
+    /// DNS that a self-hosted store usually does not have.
+    #[test]
+    fn a_custom_endpoint_is_path_style_by_default() {
+        let mut config = config();
+        config.endpoint_host = Some("minio.internal:9000".to_string());
+        assert_eq!(
+            object_url("s3://wh/db/t/f.parquet", "us-east-1", &config).as_deref(),
+            Some("https://minio.internal:9000/wh/db/t/f.parquet")
+        );
+
+        config.url_style = Some(UrlStyle::VirtualHost);
+        assert_eq!(
+            object_url("s3://wh/db/t/f.parquet", "us-east-1", &config).as_deref(),
+            Some("https://wh.minio.internal:9000/db/t/f.parquet")
+        );
+    }
+
+    /// Each key segment is encoded on its own, so a space or a `#` cannot end the
+    /// path early while `/` still separates keys. A name may be any Unicode
+    /// outside general category `C`, so this is not a hypothetical.
+    #[test]
+    fn a_key_is_encoded_per_segment() {
+        let url = object_url("s3://wh/db/my table/a#b.parquet", "us-east-1", &config())
+            .expect("an s3 location");
+        assert!(url.ends_with("/db/my%20table/a%23b.parquet"), "{url}");
+        assert_eq!(url.matches('/').count(), 5, "separators survive: {url}");
+    }
+
+    /// Only S3 has a pre-signed form here. Anything else returns `None` and the
+    /// caller refuses rather than inventing a URL.
+    #[test]
+    fn a_non_s3_location_has_no_presigned_form() {
+        for location in [
+            "gs://wh/db/t/f.parquet",
+            "abfss://c@a.dfs.core.windows.net/t/f.parquet",
+            "file:///var/lib/wh/t/f.parquet",
+            "s3://wh",
+            "s3://wh/",
+        ] {
+            assert!(
+                object_url(location, "us-east-1", &config()).is_none(),
+                "{location} must have no pre-signed form"
+            );
         }
     }
 

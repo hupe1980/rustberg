@@ -237,6 +237,20 @@ impl RequestSigner for StubSigner {
         })
     }
 
+    async fn presign_get(
+        &self,
+        uri: &str,
+        region: &str,
+        expires_in: std::time::Duration,
+    ) -> std::result::Result<String, SigningError> {
+        // Shaped like the real thing — authorisation in the query string, with a
+        // lifetime — so a test can tell a pre-signed URL from a bare path.
+        Ok(format!(
+            "{uri}?X-Amz-Algorithm=STUB&X-Amz-Region={region}&X-Amz-Expires={}",
+            expires_in.as_secs()
+        ))
+    }
+
     fn allowed_prefixes(&self) -> &[String] {
         &self.prefixes
     }

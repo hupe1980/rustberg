@@ -1,13 +1,13 @@
 [package]
 name = "rustberg"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "A policy-first Apache Iceberg REST catalog: Cedar authorization on every request, scoped storage access, and an audit trail — in a single binary or as a library"
 readme = "README.md"
-keywords = ["rustberg", "iceberg", "catalog", "lakehouse", "data"]
+keywords = ["iceberg", "catalog", "lakehouse", "authorization", "governance"]
 categories = ["database", "web-programming"]
-license = "Apache-2.0"
+license = "Apache-2.0 OR MIT"
 repository = "https://github.com/hupe1980/rustberg"
 homepage = "https://hupe1980.github.io/rustberg/"
 # The floor the dependency tree imposes, not an aspiration: the AWS SDK crates

@@ -17,7 +17,7 @@ crate.
 <img src="https://img.shields.io/badge/tests-1089%20%2B%2071%20client-brightgreen" alt="1089 Rust tests, 71 client conformance tests">
 <img src="https://img.shields.io/badge/unsafe-forbidden-brightgreen" alt="unsafe forbidden">
 <img src="https://img.shields.io/badge/binary-~24%20MB-blue" alt="~24 MB binary">
-<img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="Apache 2.0">
+<img src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue" alt="Apache-2.0 OR MIT">
 
 </div>
 
@@ -238,12 +238,33 @@ Rustberg declines what it has not built, with a status code — never a silent
 partial success.
 
 - **A table under a row filter or column mask is refused a credential and a
-  signature** rather than handed prefix-wide access. Planning still applies the
-  filter, but a plan is advice: nothing makes an unplanned file unfetchable, so
-  this is selection rather than enforcement against a hostile engine. A filter is
-  real enforcement only where the column is partitioned with an **identity**
-  transform — `days(ts)` and `bucket(16, id)` put permitted and forbidden rows in
-  the same file — and Rustberg warns at table load when it is not.
+  signature** rather than handed prefix-wide access, and is delegated through its
+  scan plan instead. Row filtering is enforced at **file** granularity: an
+  unplanned file has no URL and no credential behind it. Rows *inside* a delivered
+  file are the reader's to filter, so a filter is enforcement end to end only
+  where the column is partitioned with an **identity** transform — `days(ts)` and
+  `bucket(16, id)` put permitted and forbidden rows in the same file — and
+  Rustberg warns at table load when it is not.
+- **A restriction that cannot be applied is never silently dropped.** Masks
+  resolve to Iceberg **field ids**, so a mask on a struct covers the fields
+  beneath it and renaming a masked column cannot quietly unmask it — the table's
+  schema *history* tells a rename (which refuses, loudly) from a column this table
+  never had (which is skipped, so a tenant-wide mask does not break every table it
+  does not fit).
+- **`read-restrictions` is published, and changes nothing about what is
+  withheld.** A restricted `loadTable` carries the spec's row filter and column
+  projections, addressed by field id, so a conforming engine applies them — and
+  still receives no credential and no signer block. It is the only mechanism that
+  reaches an engine reading with its own storage credentials, and it is
+  cooperative: a hostile engine ignores it. A filter a table cannot carry is
+  published as `false` rather than omitted, because omitting it would tell a
+  conforming reader the table is unrestricted.
+- **A restricted table's plan is scoped by pre-signed URLs.** `loadTable` sets
+  `scan-planning-mode: server`, so a conforming client plans through the catalog
+  and never reads the excluded files' manifests; the plan returns one pre-signed
+  URL per file the filter selected, and no credential or signer block either way.
+  S3 only, and the URL is a bearer token for its TTL (`presign_ttl_seconds`,
+  15 minutes by default).
 - **Asynchronous and incremental scan planning** are not implemented. Every plan
   is answered inline, and an incremental scan is declined with `501` rather than
   answered as a full one.
@@ -290,4 +311,16 @@ just site          # serve the documentation site (requires zola)
 
 ## 📄 License
 
-[Apache License 2.0](LICENSE).
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this crate by you, as defined in the Apache-2.0 license, shall
+be dual-licensed as above, without any additional terms or conditions.

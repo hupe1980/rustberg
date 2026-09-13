@@ -97,7 +97,7 @@ enum AccessLevel {
 
 /// Vends storage credentials for a table, subject to policy.
 ///
-/// # Obligations make a table undelegatable
+/// # Obligations withhold a credential
 ///
 /// If the policies that permitted this request carry a `@row_filter` or
 /// `@column_mask`, **no credential is vended**. A credential is prefix-shaped: the
@@ -106,14 +106,11 @@ enum AccessLevel {
 /// vended credential and a row filter are contradictory — whichever the policy
 /// says, the engine reads everything.
 ///
-/// Rustberg does apply the filter where it can: a scan plan is built from it, so
-/// a restricted caller is told about fewer files, and the residual comes back on
-/// every task. But a plan is advice to a cooperating engine — nothing makes an
-/// unplanned file unfetchable — and a signature is confined to the whole table
-/// rather than to the files one plan named. Neither closes the gap a credential
-/// opens. Between vending a broad credential while claiming the filter is
-/// enforced, and declining to vend, only the second is honest — so that is what
-/// happens, and the response says so.
+/// What such a table gets instead is narrower than a credential could express: it
+/// is pinned to server-side planning, and its planned files come back as
+/// pre-signed URLs scoped to the set the filter selected
+/// ([`restrictions`](super::restrictions)). Declining to vend is not declining
+/// access.
 async fn vend_table_credentials(
     state: &AppState,
     authorized: &Authorized,
@@ -531,6 +528,15 @@ pub struct LoadTableResponse {
     /// deployment offers it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_signing_config: Option<super::sign::RemoteSigningConfig>,
+    /// The row filter and column projections a conforming reader must apply.
+    ///
+    /// Present only when policy attaches obligations to this table for this
+    /// caller. It never relaxes what is withheld — a restricted table still gets
+    /// no credential and no signature — and exists for the engine reading with
+    /// its own storage credentials, which is the only one those mechanisms do
+    /// not reach. See [`super::restrictions`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_restrictions: Option<super::restrictions::ReadRestrictions>,
 }
 
 impl LoadTableResponse {
@@ -547,6 +553,7 @@ impl LoadTableResponse {
             config: self.config.clone(),
             storage_credentials: None,
             remote_signing_config: self.remote_signing_config.clone(),
+            read_restrictions: self.read_restrictions.clone(),
         }
     }
 }
@@ -554,7 +561,8 @@ impl LoadTableResponse {
 /// The signer settings and `config` keys a `LoadTableResult` should carry.
 ///
 /// Empty unless the client asked for `remote-signing` and this deployment
-/// offers it.
+/// offers it — with one exception, `scan-planning-mode`, which a restricted
+/// table carries whatever the client asked for.
 fn signing_response(
     state: &AppState,
     delegation: AccessDelegation,
@@ -565,12 +573,28 @@ fn signing_response(
     HashMap<String, String>,
     Option<super::sign::RemoteSigningConfig>,
 ) {
+    // # `scan-planning-mode`, and why it is the lever this design was missing
+    //
+    // The spec defines `server` as *"Clients MUST use server-side scan planning
+    // via the `planTableScan` endpoint"*. For a restricted table that turns the
+    // planner from an option into the only route, which is what makes the filter
+    // enforcement rather than advice: a client that plans server-side never reads
+    // a manifest, so it never sees the files the filter excluded, and the files
+    // it is told about arrive as pre-signed URLs scoped to exactly that set.
+    //
+    // Sent per table rather than per deployment, and only where it buys
+    // something. A table nobody restricts plans however the client prefers.
+    let mut config = HashMap::new();
+    if !obligations.is_empty() {
+        config.insert("scan-planning-mode".to_string(), "server".to_string());
+    }
+
     if !delegation.remote_signing || !state.signing.enabled || !obligations.is_empty() {
-        return (HashMap::new(), None);
+        return (config, None);
     }
 
     let signing = super::sign::signing_config_for(namespace, table_name);
-    let config = HashMap::from([
+    config.extend([
         ("s3.remote-signing-enabled".to_string(), "true".to_string()),
         ("s3.signer".to_string(), "S3V4RestSigner".to_string()),
         ("s3.signer.endpoint".to_string(), signing.endpoint.clone()),
@@ -1032,6 +1056,10 @@ pub async fn create_table(
         config: signing_config,
         storage_credentials,
         remote_signing_config,
+        read_restrictions: super::restrictions::for_table(
+            table.metadata(),
+            &authorized.obligations,
+        )?,
     };
 
     // Build response
@@ -1055,7 +1083,7 @@ pub async fn create_table(
             table.metadata_location(),
             SnapshotScope::All,
             delegation,
-            !authorized.obligations.is_empty(),
+            &authorized.obligations,
         )
     {
         insert_etag(&mut response, &tag);
@@ -1143,7 +1171,7 @@ pub async fn load_table(
             pointer.as_deref(),
             scope,
             delegation,
-            !authorized.obligations.is_empty(),
+            &authorized.obligations,
         ) && freshness::matches(&headers, &tag)
         {
             state.metrics.catalog_load_table_not_modified.inc();
@@ -1158,7 +1186,7 @@ pub async fn load_table(
         table.metadata_location(),
         scope,
         delegation,
-        !authorized.obligations.is_empty(),
+        &authorized.obligations,
     );
 
     // A row filter over a non-partition column cannot be enforced by
@@ -1196,12 +1224,17 @@ pub async fn load_table(
         &authorized.obligations,
     );
 
+    // Resolved against the metadata actually being returned, so a snapshot-scoped
+    // load and a full one cannot disagree about which columns exist.
+    let read_restrictions = super::restrictions::for_table(&metadata, &authorized.obligations)?;
+
     let body = LoadTableResponse {
         metadata_location: table.metadata_location().map(|s| s.to_string()),
         metadata,
         config: signing_config,
         storage_credentials,
         remote_signing_config,
+        read_restrictions,
     };
 
     let mut response = (StatusCode::OK, AxumJson(body)).into_response();
@@ -1612,7 +1645,7 @@ pub async fn commit_table(
         updated_table.metadata_location(),
         SnapshotScope::All,
         AccessDelegation::default(),
-        !authorized.obligations.is_empty(),
+        &authorized.obligations,
     ) {
         insert_etag(&mut response, &tag);
     }
@@ -1743,6 +1776,10 @@ pub async fn register_table(
         config: signing_config,
         storage_credentials,
         remote_signing_config,
+        read_restrictions: super::restrictions::for_table(
+            table.metadata(),
+            &authorized.obligations,
+        )?,
     };
 
     // Build response

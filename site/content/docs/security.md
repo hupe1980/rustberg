@@ -140,25 +140,48 @@ changes that.
 | Scope of a vended credential | **Yes** — an STS session policy restricts it to the table's prefix |
 | Scope of a signed request | **Yes** — every location it touches must be inside the table |
 | Read-only versus writable access | **Yes** — follows the caller's `Update` permission |
-| Row filters (`@row_filter`) | **Against a cooperating engine only** — see below |
-| Column masks (`@column_mask`) | **No** — see below |
+| Row filters (`@row_filter`) | **At file granularity, against any engine that reads through this catalog** — see below |
+| Column masks (`@column_mask`) | **Against a cooperating engine only** — see below |
 
-An annotated table is refused every form of storage access Rustberg grants —
-no credential and no signature — because neither can express a row predicate,
-and granting one while calling the filter enforced would be a false claim.
+An annotated table is refused the two *broad* forms of storage access — no
+credential and no signer block — because neither can express a row predicate, and
+granting one while calling the filter enforced would be a false claim. What it
+gets instead is narrower than both.
 
-What Rustberg *does* enforce is which files it tells you about. A `@row_filter`
-is an Iceberg predicate, so [scan planning](@/docs/api.md#scan-planning) conjoins
-it with the client's own filter: a restricted caller is told about fewer files,
-and the residual on each task carries both halves. An engine that follows the
-plan reads only permitted rows. One carrying its own storage credentials reads
-the table unfiltered, and nothing here changes that.
+**Which files you are told about is enforced.** A `@row_filter` is an Iceberg
+predicate, so [scan planning](@/docs/api.md#scan-planning) conjoins it with the
+client's own filter and a restricted caller is told about fewer files.
 
-That is file-level selection, the enforceable half of row-level security — but
-here it is still *advice*, because nothing makes an unplanned file unfetchable.
-[Signing](@/docs/api.md#remote-signing) would, except a signature is confined to
-the whole table rather than to the files one plan named. A column mask
-additionally needs Parquet modular encryption to be more than advisory, since the
+**And which files you can fetch is enforced with it.** `loadTable` sets
+`scan-planning-mode: server`, which the specification defines as *"Clients MUST
+use server-side scan planning"*, and the plan returns a **pre-signed URL** per
+file the filter selected rather than a bare path. There is no URL for a file the
+filter excluded, and no credential with which to construct one. The scope is
+exact because the permitted set *is* the plan.
+
+Three limits, stated plainly:
+
+- **Row filtering is enforced at *file* granularity.** If permitted and forbidden
+  rows share a Parquet file, that file is delivered and the residual predicate on
+  the task is advice. Partition on the security boundary and file selection *is*
+  row enforcement; otherwise it is selection plus cooperation.
+- **Column masks are cooperative.** They travel as
+  [`read-restrictions`](@/docs/api.md#read-restrictions), which a conforming
+  reader must apply and must fail the query rather than ignore. The bytes are
+  still in the Parquet the engine downloads; only Parquet modular encryption would
+  change that, and Rustberg does not implement it.
+- **An engine carrying its own storage credentials** reads the files directly. It
+  receives `read-restrictions` and nothing compels it to honour them.
+
+A pre-signed URL is also a bearer token for its lifetime — `presign_ttl_seconds`,
+15 minutes by default — and is S3-only today.
+
+That is file-level selection, and here it is enforced rather than advised: an
+unplanned file has no pre-signed URL and no credential behind it. What stays
+advisory is the boundary *inside* a delivered file — where permitted and
+forbidden rows share one Parquet file, the residual predicate is the reader's to
+apply. A column mask needs Parquet modular encryption to be more than advisory
+at all, since the
 masked bytes are in the file the engine downloads.
 
 **The precondition behind all of it:** Rustberg must be the only path to the
@@ -361,13 +384,18 @@ made about [what a name is validated for](#input-validation): `*` is legal in
 Iceberg, and it is dangerous only where it is spliced into IAM's pattern
 language.
 
-### Obligations make a table undelegatable
+### Obligations withhold a broad credential
 
 If the policies that permitted the request carry a `@row_filter` or
 `@column_mask`, **no credential is vended at all** — see
 [authorization](@/docs/authorization.md). A prefix-shaped credential cannot
 express a row filter, so vending one while calling the filter enforced would be
 a false claim.
+
+That is not the same as refusing access. The table's scan plan returns pre-signed
+URLs for exactly the files the filter selected, which is a narrower grant than any
+credential could express — see
+[storage access delegation](@/docs/api.md#server-side-planning-and-pre-signed-urls).
 
 ### Operational notes
 

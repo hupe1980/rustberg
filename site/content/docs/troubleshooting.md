@@ -449,9 +449,10 @@ here. Refused and not ignored, because widening a restriction removes it —
 supposed to bite. The same term in a filter a **client** sent is widened away,
 where a superset only costs time.
 
-Only those two reach this point. A filter naming a transform, `apply`, a
-field-id reference or an operator this catalog does not read cannot bind against
-*any* table, so it is refused when the policy set **loads** — see below. What is
+Only those two reach this point. A filter naming a transform, `apply`, or an
+operator this catalog does not read cannot bind against *any* table, so it is
+refused when the policy set **loads** — see below. A reference by name or by
+field id binds, so neither is refused there. What is
 left here is the two questions that need a table in hand, and one policy covers
 tables that do not exist yet. If the filter is meant for some tables and not
 others, scope the permit to the namespace subtree they live in.
@@ -460,8 +461,7 @@ others, scope the permit to the namespace subtree they live in.
 
 **Symptom:** the server refuses to start: *"policy 'X' has a @row_filter that is
 not a predicate: '…' is not an operator this catalog binds"* — or *"… is a
-transform, a function application or a field id, none of which this catalog can
-bind"*.
+transform or a function application, neither of which this catalog can bind"*.
 
 The filter is well-formed JSON and is not an expression this catalog can ever
 apply. Usually a typo in the operator (`equals` for `eq`, `greater-than` for

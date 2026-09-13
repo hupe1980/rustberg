@@ -2,6 +2,12 @@
 //!
 //! A production-grade, single-binary Iceberg catalog server written in Rust.
 
+// `forbid` is per crate, and `[[bin]]` is a crate of its own: the attribute on
+// `lib.rs` does not reach this file. Without it here, "this crate is
+// `#![forbid(unsafe_code)]`" is true of the library and merely *currently* true
+// of the binary anyone actually runs.
+#![forbid(unsafe_code)]
+
 use clap::{Parser, Subcommand};
 use rustberg::auth::{ApiKeyBuilder, ApiKeyStore, Auditor, InMemoryApiKeyStore};
 use rustberg::server::{ServerConfig, TlsConfig};

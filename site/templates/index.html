@@ -7,7 +7,7 @@
 
 <section class="hero">
   <div class="hero__inner">
-    <p class="hero__eyebrow">Apache Iceberg REST Catalog · Rust · Apache-2.0</p>
+    <p class="hero__eyebrow">Apache Iceberg REST Catalog · Rust · Apache-2.0 OR MIT</p>
     <h1 class="hero__title">A policy-first<br><span class="grad">Iceberg REST catalog</span></h1>
     <p class="hero__lede">
       A whole catalog, not a proxy in front of one: an embedded file, or Postgres
@@ -91,6 +91,17 @@
           policy and the mount's own ceiling, and never wider.
         </p>
         <a class="pillar__link" href="{{ get_url(path='@/docs/security.md') }}#credential-vending">How vending works →</a>
+      </article>
+
+      <article class="pillar">
+        <h3>Row and column policy, enforced</h3>
+        <p>
+          A row filter or column mask travels to the engine as the Iceberg spec's
+          <code>read-restrictions</code> — and is not merely advertised. Such a
+          table is refused a broad credential, pinned to server-side planning, and
+          handed pre-signed URLs for exactly the files the filter selected.
+        </p>
+        <a class="pillar__link" href="{{ get_url(path='@/docs/authorization.md') }}#row-filters-and-column-masks">How restrictions work →</a>
       </article>
 
       <article class="pillar">

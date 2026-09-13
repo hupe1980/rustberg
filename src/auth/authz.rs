@@ -371,29 +371,26 @@ impl AuthzDecision {
 ///
 /// # What Rustberg does with them
 ///
-/// Two things, and the difference between them is the whole of §4.5.
+/// **It applies the row filter when planning.** A scan plan is built from the
+/// client's filter conjoined with what policy permits, so a restricted caller is
+/// told about fewer files, and the residual on every task carries both halves
+/// ([`plan`](crate::catalog::v1::plan)).
 ///
-/// **It applies the row filter where a file-level decision can carry it.** A
-/// scan plan is built from the client's filter conjoined with what policy
-/// permits, so a restricted caller is told about fewer files, and the residual
-/// on every task carries both halves ([`plan`](crate::catalog::v1::plan)). That
-/// is selection performed, not merely reported — and it is enforcement only
-/// against a *cooperating* engine, because nothing makes an unplanned file
-/// unfetchable.
+/// **It refuses broad storage access.** Once an engine holds a file URL and a
+/// credential it reads every row and every column in that file, so a filter
+/// cannot be enforced by *describing* it. An obligation therefore makes a table
+/// unvendable: the metadata is returned, and neither a vended credential nor a
+/// signer block is issued. A plan that could not carry the restriction — a
+/// `@column_mask` over a partition column — is refused on the same rule.
 ///
-/// **And it refuses to hand out storage access.** That is the honest limit of
-/// what a catalog can enforce: once an engine holds a file URL and a credential
-/// it reads every row and every column in that file, so a filter cannot be
-/// enforced by *describing* it — only by not giving out the means to bypass it.
-/// An obligation therefore makes a table **undelegatable**: the request
-/// succeeds, the metadata is returned, and neither a vended credential nor a
-/// signature is issued for it. A plan that could not carry the restriction —
-/// a `@column_mask` over a partition column — is refused on the same rule.
+/// **And it narrows what is left to the planned set.** Such a table is pinned to
+/// server-side planning and its planned files come back as pre-signed URLs, so
+/// what the caller can fetch is exactly what the filter selected
+/// ([`restrictions`](crate::catalog::v1::restrictions)).
 ///
-/// Tying the two together, so that a signature covered only the files a plan
-/// named, is the one thing that would make this architectural rather than
-/// cooperative. What stops it is stated in the design's "what is not built", and
-/// it is a decision rather than an omission.
+/// The restriction is also published to the client, which is the only thing that
+/// reaches an engine reading with its own storage credentials — and is
+/// cooperative, as that implies.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Obligations {
     /// Row filters, to be combined as a disjunction.
@@ -427,6 +424,55 @@ impl Obligations {
     /// caller may see every row.
     pub fn rows_unrestricted(&self) -> bool {
         self.row_filters.is_empty()
+    }
+
+    /// A stable digest of *which* restrictions apply, for cache validators.
+    ///
+    /// [`is_empty`](Self::is_empty) answers whether a table is restricted at all,
+    /// which is what the signer block depends on. It is not enough for an `ETag`
+    /// once the response carries the restrictions themselves: two principals both
+    /// restricted — one to `region = 'EU'`, one to `region = 'US'` — would hold
+    /// one tag for two different documents, and a client multiplexing identities
+    /// against one cache would revalidate as the second and be handed the first's
+    /// filter. A query engine's coordinator is exactly that client.
+    ///
+    /// Sorted before hashing because the order Cedar reports matching policies in
+    /// is not part of the meaning, and letting it vary would churn the validator
+    /// for no change in what it names.
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut filters: Vec<String> = self
+            .row_filters
+            .iter()
+            .map(|filter| filter.to_string())
+            .collect();
+        filters.sort_unstable();
+        let mut masks: Vec<&str> = self.column_masks.iter().map(String::as_str).collect();
+        masks.sort_unstable();
+
+        let mut hasher = Sha256::new();
+        for filter in &filters {
+            hasher.update(filter.as_bytes());
+            // A byte neither a JSON document nor a column name can contain, so
+            // no two different lists hash the same concatenation.
+            hasher.update([0u8]);
+        }
+        hasher.update([1u8]);
+        for mask in &masks {
+            hasher.update(mask.as_bytes());
+            hasher.update([0u8]);
+        }
+
+        hasher
+            .finalize()
+            .iter()
+            .take(16)
+            .fold(String::with_capacity(32), |mut out, byte| {
+                use std::fmt::Write;
+                let _ = write!(out, "{byte:02x}");
+                out
+            })
     }
 
     /// A one-line description of what is restricted, for logs and error bodies.

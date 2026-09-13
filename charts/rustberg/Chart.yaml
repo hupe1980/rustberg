@@ -2,8 +2,8 @@ apiVersion: v2
 name: rustberg
 description: A Helm chart for Rustberg - Apache Iceberg REST Catalog
 type: application
-version: 0.1.1
-appVersion: "0.1.1"
+version: 0.2.0
+appVersion: "0.2.0"
 home: https://github.com/hupe1980/rustberg
 sources:
   - https://github.com/hupe1980/rustberg
@@ -18,5 +18,5 @@ keywords:
   - rust
 icon: https://raw.githubusercontent.com/hupe1980/rustberg/main/docs/assets/logo.png
 annotations:
-  artifacthub.io/license: Apache-2.0
+  artifacthub.io/license: Apache-2.0 OR MIT
   artifacthub.io/category: data-processing
