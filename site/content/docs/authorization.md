@@ -317,9 +317,9 @@ below.
 What startup cannot check is the two questions that are about a *table*: whether
 a column exists, and whether a literal fits it. One policy covers tables that do
 not exist yet. Those are checked when the filter meets a table, and **a policy
-filter that cannot be bound to that table is a `403` naming the term** — a column
-the table does not have, a literal that does not fit one, or a `not-nan` on a
-column that is not a float.
+filter that cannot be bound to that table selects no rows** — it becomes the
+constant `false`, both in the `read-restrictions` a `loadTable` publishes and in
+the pruning `planTableScan` performs.
 
 That is the opposite of what happens to a filter a *client* sends, where an
 unbindable term is widened away and the plan is simply a superset. The
@@ -328,6 +328,12 @@ its own predicate, so extra files cost time and not correctness — and it is a
 *weaker restriction* for a policy. `@row_filter("region = 'EU'")` widening to
 "everything" is the filter silently ceasing to exist at the moment it was
 supposed to bite.
+
+A broad permit is the ordinary shape — `resource in Tenant::"acme"` carrying a
+filter on `region` reaches every table in the tenant, and most have no `region`
+column. Filters from matching permits are OR-ed, and `false` is the identity of
+that union: the branch withholds everything it would have granted, and takes
+nothing else with it.
 
 ### Writing a column mask
 
@@ -449,11 +455,18 @@ permit(principal in Rustberg::Group::"analysts",
        resource in Rustberg::Tenant::"acme");
 ```
 
-The load-time check is deliberately crude. Deciding whether two Cedar policies can
-ever match the same request is undecidable in general, and an approximate warning
-is one operators learn to ignore. The request-time one needs no analysis at all:
-Cedar has already reported which policies matched *that* request, so if one
-carried an annotation and another did not, the restriction was voided — as a fact.
+The load-time check is deliberately crude: it reports that *some* permit carries
+an annotation while *some other* permit does not, without asking whether the two
+can ever match the same request. That question is decidable — Cedar is designed to
+be analyzable, and the
+[symbolic compiler](https://docs.rs/cedar-policy-symcc) answers it exactly, with
+a counterexample request — but it needs an SMT solver, which is an external binary
+this server deliberately does not carry. Running it belongs in a policy pipeline
+before a revision is installed, not in the request path of a catalog.
+
+The request-time warning needs no analysis at all: Cedar has already reported
+which policies matched *that* request, so if one carried an annotation and another
+did not, the restriction was voided — as a fact, with no false positives.
 
 Both name the offending permits by policy id. The request-time warning is emitted
 once per resource per restriction per policy set; editing the policies reports
@@ -501,6 +514,7 @@ scope can be exact:
 | `GET .../credentials` on an annotated table | `403`, naming the restriction |
 | `POST .../sign` on an annotated table | `403`, naming the restriction |
 | `POST .../plan` on an annotated table | `200`, with a **pre-signed URL** per file the filter selected ([details](@/docs/api.md#server-side-planning-and-pre-signed-urls)) |
+| `POST .../plan`, `@row_filter` naming a column this table lacks | `200`, selecting **no files** — the same `false` the table's `read-restrictions` publish |
 | `POST .../plan`, `@column_mask` over a **partition** column | `403`, naming the column |
 | Any of these, on an unannotated table | Access granted normally |
 

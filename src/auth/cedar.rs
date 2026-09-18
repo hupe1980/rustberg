@@ -238,10 +238,9 @@ impl CedarAuthorizer {
     ///
     /// Deliberately crude: it reports that *some* permit carries a filter while
     /// *some other* permit does not, without asking whether the two can ever
-    /// match one request. Answering that is the overlap analysis
-    /// [`Self::warn_voided`] explains is not worth attempting — undecidable in
-    /// general, and approximate enough in practice that operators learn to
-    /// ignore it.
+    /// match one request. Answering that exactly is decidable for Cedar and
+    /// needs an SMT solver this binary does not carry — see
+    /// [`Self::warn_voided`].
     ///
     /// So this does not claim a filter *will* be voided. It says the policy set
     /// has the shape in which that happens, names the unannotated permits, and
@@ -627,10 +626,15 @@ impl CedarAuthorizer {
     ///
     /// The obvious answer is to detect it at load time by finding unannotated
     /// permits that *overlap* annotated ones. That requires deciding whether two
-    /// Cedar policies can ever match the same request, which is undecidable in
-    /// general and approximate in practice: an analysis loose enough to be sound
-    /// warns about policies that never actually meet, and operators learn to
-    /// ignore it.
+    /// Cedar policies can ever match the same request — which, for Cedar
+    /// specifically, is **decidable**: the language was designed to be analyzable
+    /// and `cedar-policy-symcc` answers exactly this question by compiling both
+    /// policies to SMT, with a counterexample request when they do overlap.
+    ///
+    /// It is not done here because that solver is an external binary, and a
+    /// useful deployment of this server is one file and no dependencies. The
+    /// analysis belongs in tooling an operator runs over a policy set before
+    /// installing it, not in the request path of a catalog.
     ///
     /// Here there is nothing to approximate. Cedar has already told us which
     /// policies matched **this** request. If one carried a filter and another did

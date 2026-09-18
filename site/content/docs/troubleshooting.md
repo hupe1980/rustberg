@@ -429,32 +429,29 @@ its own storage credentials reads it unfiltered. See
 The warning appears once per table per policy set; editing your policies makes
 it report again.
 
-### 403 from `planTableScan` naming a policy row filter
+### A restricted table returns no rows
 
-**Symptom:** `403 Forbidden`: *"Policy attaches a row filter to this table that
-cannot be applied to it (…). Planning is refused rather than returning files the
-filter was meant to withhold."*
+**Symptom:** a table loads, `read-restrictions` carries `"required-row-filter":
+false`, and `planTableScan` returns no files.
 
-The `@row_filter` on the permit that matched cannot be **bound to this table**.
-Three things cause it, and the message names which:
+The `@row_filter` on the permit that matched cannot be **bound to this table**,
+so it withholds everything rather than applying. Two things cause it:
 
-| In the message | Means |
+| Cause | Check |
 |---|---|
-| *"the filter names 'X', which this table has no"* | the column is missing, or spelled differently — check case, and check nested paths are dotted in full |
-| *"a filter literal for a … column must be …"* | the value does not fit the column's type; a date is `"2023-01-01"`, a decimal and a UUID are strings, binary is hex |
+| The filter names a column this table does not have | Spelling and case; nested paths must be dotted in full |
+| A literal does not fit its column's type | A date is `"2023-01-01"`, a decimal and a UUID are strings, binary is hex |
 
-A `403` and not a `400`: the request is fine, the *policy* is what does not apply
-here. Refused and not ignored, because widening a restriction removes it —
-`@row_filter("region = 'EU'")` would become "everything" at the moment it was
-supposed to bite. The same term in a filter a **client** sent is widened away,
-where a superset only costs time.
+The server log names the filter and the reason at load.
 
-Only those two reach this point. A filter naming a transform, `apply`, or an
-operator this catalog does not read cannot bind against *any* table, so it is
-refused when the policy set **loads** — see below. A reference by name or by
-field id binds, so neither is refused there. What is
-left here is the two questions that need a table in hand, and one policy covers
-tables that do not exist yet. If the filter is meant for some tables and not
+This is the deny-by-default direction: widening the filter instead would remove
+the restriction — `@row_filter("region = 'EU'")` becoming "everything" at the
+moment it was supposed to bite. The same term in a filter a **client** sent is
+widened away, where a superset only costs time.
+
+A filter naming a transform, `apply`, or an operator this catalog does not read
+cannot bind against *any* table, so it is refused when the policy set **loads**
+rather than here — see below. If the filter is meant for some tables and not
 others, scope the permit to the namespace subtree they live in.
 
 ### Startup fails naming a `@row_filter`

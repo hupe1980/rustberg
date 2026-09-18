@@ -867,6 +867,19 @@ fn has_query_value(url: &reqwest::Url, name: &str, value: &str) -> bool {
 /// decoding introduces a separator is refused: `%2F` hides a `/` from the URL
 /// parser, so the path that was checked and the path that gets signed would be
 /// two different things.
+///
+/// # Empty segments are kept for exactly the same reason
+///
+/// `https://bucket.s3.../​/wh/db/t/x` addresses the key `/wh/db/t/x`, which is
+/// **not** under `wh/db/t`. Dropping the empty segment would hand containment
+/// the key `wh/db/t/x` — squarely inside the table — while the signature covered
+/// the one outside it. That is the same "checked one string, signed another"
+/// failure the URI is canonicalised to prevent, arriving through the path
+/// instead of through a parameter, and it is why
+/// [`location::segments`](crate::location) preserves them too.
+///
+/// Exactly one leading empty segment is dropped, because [`reqwest::Url::path`]
+/// always begins with `/` and that slash separates nothing.
 fn split_bucket_and_key(
     url: &reqwest::Url,
     config: &SigningEndpointConfig,
@@ -883,26 +896,40 @@ fn split_bucket_and_key(
         UrlStyle::Auto => virtual_host_bucket(&host, config.endpoint_host.as_deref()),
     };
 
+    let path = url.path();
+    let path = path.strip_prefix('/').unwrap_or(path);
+
     let mut segments: Vec<String> = Vec::new();
-    for raw in url.path().split('/').filter(|s| !s.is_empty()) {
-        let decoded = percent_decode(raw)?;
-        if decoded.contains('/') || decoded.contains('\\') || decoded.contains('\0') {
-            return Err(AppError::BadRequest(
-                "URI to sign has a path segment that decodes into a separator.".to_string(),
-            ));
+    if !path.is_empty() {
+        for raw in path.split('/') {
+            let decoded = percent_decode(raw)?;
+            if decoded.contains('/') || decoded.contains('\\') || decoded.contains('\0') {
+                return Err(AppError::BadRequest(
+                    "URI to sign has a path segment that decodes into a separator.".to_string(),
+                ));
+            }
+            segments.push(decoded);
         }
-        segments.push(decoded);
     }
 
     match virtual_bucket {
         Some(bucket) => Ok((bucket, segments.join("/"))),
         None => {
-            if segments.is_empty() {
-                return Err(AppError::BadRequest(
-                    "URI to sign names no bucket.".to_string(),
-                ));
-            }
-            let bucket = segments.remove(0);
+            let bucket = match segments.split_first() {
+                // An empty first segment means the URI begins `//`, so the
+                // bucket position is blank and the key would silently absorb
+                // whatever followed. Refused rather than guessed at.
+                Some((first, rest)) if !first.is_empty() => {
+                    let bucket = first.clone();
+                    segments = rest.to_vec();
+                    bucket
+                }
+                _ => {
+                    return Err(AppError::BadRequest(
+                        "URI to sign names no bucket.".to_string(),
+                    ));
+                }
+            };
             Ok((bucket, segments.join("/")))
         }
     }
@@ -1491,6 +1518,56 @@ mod tests {
         let payload = request("https://wh.s3.amazonaws.com/db/t/data/f.parquet");
         let (_, op) = resolve("PUT", &payload, &config()).unwrap();
         assert_eq!(op, SignedOp::Write);
+    }
+
+    /// The string checked and the string signed are one string, and an empty
+    /// path segment is where that stopped being true.
+    ///
+    /// `…amazonaws.com//db/t/x` addresses the key `/db/t/x`. Folding the empty
+    /// segment away handed containment the key `db/t/x` — inside the table —
+    /// while the signature covered the one outside it, so a caller with
+    /// `Update` on its own table could have a signature minted for objects no
+    /// table owns, beyond the reach of a purge.
+    #[test]
+    fn an_empty_path_segment_is_part_of_the_key() {
+        let payload = request("https://wh.s3.amazonaws.com//db/t/data/f.parquet");
+        let (addressed, _) = resolve("PUT", &payload, &config()).unwrap();
+
+        assert_eq!(
+            addressed.locations,
+            vec!["s3://wh//db/t/data/f.parquet"],
+            "the empty segment survives into the location that gets checked"
+        );
+        assert!(
+            confine(&addressed, "s3://wh/db/t").is_err(),
+            "a key outside the table must not be confined to it"
+        );
+    }
+
+    /// The same hole one level along: an empty segment *inside* the key.
+    #[test]
+    fn an_interior_empty_segment_is_part_of_the_key() {
+        let payload = request("https://wh.s3.amazonaws.com/db/t//data/f.parquet");
+        let (addressed, _) = resolve("PUT", &payload, &config()).unwrap();
+        assert_eq!(addressed.locations, vec!["s3://wh/db/t//data/f.parquet"]);
+        // `db/t//data/…` is a key under `db/t/`, so this one is genuinely
+        // inside the table and stays signable.
+        assert!(confine(&addressed, "s3://wh/db/t").is_ok());
+    }
+
+    /// Path style with a blank bucket position names no bucket, and the key
+    /// must not silently absorb what followed it.
+    #[test]
+    fn a_blank_bucket_position_is_refused() {
+        let mut path_style = config();
+        path_style.url_style = Some(UrlStyle::Path);
+        let payload = request("https://minio.internal//wh/db/t/f.parquet");
+        assert_eq!(
+            resolve("GET", &payload, &path_style)
+                .unwrap_err()
+                .status_code(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]

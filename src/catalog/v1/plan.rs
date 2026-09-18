@@ -132,8 +132,10 @@ struct CompletedPlan {
 /// # Errors
 ///
 /// - `404` for a table the caller cannot see, or a snapshot that does not exist.
-/// - `403` when a policy filter cannot be applied to this table, or when
-///   `stats-fields` names a masked column.
+/// - `403` when a mask cannot be resolved against this table, when a mask covers
+///   a partition column, or when `stats-fields` names a masked column. Note that
+///   a policy *row filter* this table cannot carry is not one of these: it
+///   selects no files, matching what `loadTable` publishes for it.
 /// - `400` for a filter this catalog cannot bind, or a scan larger than
 ///   this catalog's per-plan file limit.
 /// - `501` for an incremental scan, which is not implemented.
@@ -441,7 +443,7 @@ async fn build_plan(
     // What policy permits this caller to see, as a predicate. Permits grant, so
     // the matching filters are OR-ed; the scan is the conjunction of that and
     // whatever the client asked for.
-    let filter = match (requested, policy_predicate(obligations, &schema, case)?) {
+    let filter = match (requested, policy_predicate(obligations, &schema, case)) {
         (Some(requested), Some(policy)) => Some(requested.and(policy)),
         (Some(only), None) | (None, Some(only)) => Some(only),
         (None, None) => None,
@@ -459,7 +461,7 @@ async fn build_plan(
     // The residual carries the policy filter too, or a cooperating engine
     // applies only half of what the plan was built from — and the half it drops
     // is the one policy cares about.
-    let residual = residual_filter(request.filter.as_ref(), obligations);
+    let residual = residual_filter(request.filter.as_ref(), obligations, &schema);
 
     // A table with no snapshot has no files. That is a complete plan, not an
     // error: `CREATE TABLE` then `SELECT` is an ordinary sequence.
@@ -682,7 +684,6 @@ pub(crate) fn masked_field_ids(
     }
 
     let schema = metadata.current_schema();
-    let mut masked_paths: Vec<String> = Vec::new();
 
     for mask in &obligations.column_masks {
         let Some(field) = schema
@@ -708,25 +709,89 @@ pub(crate) fn masked_field_ids(
         };
 
         ids.insert(field.id);
-        if let Some(canonical) = schema.name_by_field_id(field.id) {
-            masked_paths.push(canonical.to_lowercase());
-        }
     }
 
-    // A mask on a struct covers everything under it. Iceberg addresses nested
-    // fields by dotted path, so a descendant is any field whose canonical path
-    // is prefixed by a masked one plus a separator.
-    for (id, name) in schema.field_id_to_name_map() {
-        let lowered = name.to_lowercase();
-        if masked_paths
-            .iter()
-            .any(|masked| lowered.starts_with(&format!("{masked}.")))
-        {
-            ids.insert(*id);
-        }
-    }
+    // A mask on a struct covers everything under it, walked structurally rather
+    // than inferred from the dotted path. Iceberg *renders* a nested field as
+    // `user.address.zip`, but nothing forbids a top-level column literally named
+    // `user.address` — and a prefix test cannot tell the two apart. It errs
+    // towards over-masking here and towards *under*-publishing in
+    // [`super::restrictions`], where the same inference decided which projection
+    // is outermost, so the two together could drop a mask the policy asked for.
+    // The nesting is in the schema; there is no need to guess at it.
+    let nested: Vec<i32> = ids
+        .iter()
+        .flat_map(|id| descendant_ids(schema, *id))
+        .collect();
+    ids.extend(nested);
 
     Ok(ids)
+}
+
+/// Every field id nested beneath `id`, by walking the schema's own structure.
+///
+/// A struct's fields, a list's element and both halves of a map. Empty for a
+/// primitive, and for an id this schema does not have.
+pub(crate) fn descendant_ids(schema: &Schema, id: i32) -> Vec<i32> {
+    fn walk(field: &iceberg::spec::NestedFieldRef, out: &mut Vec<i32>) {
+        match &*field.field_type {
+            Type::Struct(structure) => {
+                for nested in structure.fields() {
+                    out.push(nested.id);
+                    walk(nested, out);
+                }
+            }
+            Type::List(list) => {
+                out.push(list.element_field.id);
+                walk(&list.element_field, out);
+            }
+            Type::Map(map) => {
+                out.push(map.key_field.id);
+                walk(&map.key_field, out);
+                out.push(map.value_field.id);
+                walk(&map.value_field, out);
+            }
+            Type::Primitive(_) => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    if let Some(field) = schema.field_by_id(id) {
+        walk(field, &mut out);
+    }
+    out
+}
+
+/// Each field id mapped to the id of the field that encloses it.
+///
+/// Built from the schema's own nesting, which is the only thing that knows it.
+/// Top-level fields are absent, so walking up terminates.
+pub(crate) fn parent_ids(schema: &Schema) -> HashMap<i32, i32> {
+    fn walk(field: &iceberg::spec::NestedFieldRef, out: &mut HashMap<i32, i32>) {
+        let child = |nested: &iceberg::spec::NestedFieldRef, out: &mut HashMap<i32, i32>| {
+            out.insert(nested.id, field.id);
+            walk(nested, out);
+        };
+        match &*field.field_type {
+            Type::Struct(structure) => {
+                for nested in structure.fields() {
+                    child(nested, out);
+                }
+            }
+            Type::List(list) => child(&list.element_field, out),
+            Type::Map(map) => {
+                child(&map.key_field, out);
+                child(&map.value_field, out);
+            }
+            Type::Primitive(_) => {}
+        }
+    }
+
+    let mut out = HashMap::new();
+    for field in schema.as_struct().fields() {
+        walk(field, &mut out);
+    }
+    out
 }
 
 /// The field ids to send statistics for, or `None` when the client asked for
@@ -853,42 +918,54 @@ fn refuse_masked_partition_columns(
 /// `region = 'US'` sees both. `None` means unrestricted, which is also what an
 /// unannotated permit produces.
 ///
-/// # Errors
+/// # A branch this table cannot carry selects nothing
 ///
-/// [`AppError::Forbidden`] when a filter cannot be bound to *this* table — because
-/// it names a column the table does not have, a literal that does not fit one, or
-/// a term outside the grammar this catalog binds. Refusing is the only safe
-/// answer: a filter that cannot be applied is a restriction that would silently
-/// not apply.
-///
-/// Note the third case, which is why this parses with
+/// Never widened, which is why this parses with
 /// [`parse_policy_predicate`](crate::predicate::parse_policy_predicate) rather
-/// than the ordinary reader. A term the catalog cannot bind is *widened* in a
-/// client's filter, where a superset costs time and not correctness. Widening a
-/// restriction inverts it: an unbindable term becomes `AlwaysTrue`, and
-/// `@row_filter("region = 'EU'")` quietly becomes no filter at all.
+/// than the ordinary reader: a term the catalog cannot bind is *widened* in a
+/// client's filter, where a superset costs time and not correctness, and
+/// widening a restriction inverts it — `@row_filter("region = 'EU'")` would
+/// quietly become no filter at all.
+///
+/// But refusing the plan is not the other option, and used to be. A broad permit
+/// is the ordinary shape — `resource in Tenant::"acme"` carrying a filter on
+/// `region` reaches every table in the tenant, and most have no `region` column —
+/// so refusing breaks planning for most of a tenant. Worse, it is incoherent with
+/// the answer the same filter already gets on the wire: `loadTable` publishes it
+/// as the constant `false` and, because the table carries obligations, also sends
+/// `scan-planning-mode: server`. A client that obeys that instruction was being
+/// told it **must** plan here and then refused when it did.
+///
+/// So an unbindable branch contributes `AlwaysFalse` to the disjunction, which is
+/// what [`super::restrictions`] publishes for the same branch, arrived at by the
+/// same argument. Whole-branch rather than per-term, so the plan and the
+/// published restriction cannot disagree about which rows are withheld: `false`
+/// is the identity under OR, so other permits' branches still grant what they
+/// grant, and a filter whose every branch is unbindable selects no files at all —
+/// metadata readable, no rows, exactly as published.
 fn policy_predicate(
     obligations: &Obligations,
     schema: &iceberg::spec::SchemaRef,
     case: CaseSensitivity,
-) -> Result<Option<iceberg::expr::Predicate>> {
+) -> Option<iceberg::expr::Predicate> {
     let mut combined: Option<iceberg::expr::Predicate> = None;
 
     for filter in &obligations.row_filters {
-        let predicate = parse_policy_predicate(filter, schema, case).map_err(|e| {
-            AppError::Forbidden(format!(
-                "Policy attaches a row filter to this table that cannot be applied to it \
-                 ({e}). Planning is refused rather than returning files the filter was \
-                 meant to withhold."
-            ))
-        })?;
+        let predicate = parse_policy_predicate(filter, schema, case).unwrap_or_else(|reason| {
+            tracing::warn!(
+                reason = %reason,
+                "A policy row filter cannot be bound to this table; it selects no files, \
+                 matching the `false` this table's read-restrictions publish"
+            );
+            iceberg::expr::Predicate::AlwaysFalse
+        });
         combined = Some(match combined {
             Some(existing) => existing.or(predicate),
             None => predicate,
         });
     }
 
-    Ok(combined)
+    combined
 }
 
 /// The filter the client must still apply to the rows it reads.
@@ -897,12 +974,22 @@ fn policy_predicate(
 /// needed: pruning is conservative, so a file that survives may hold rows the
 /// policy filter excludes, and an engine that applied only the half it sent
 /// would read them.
-fn residual_filter(requested: Option<&Value>, obligations: &Obligations) -> Option<Value> {
-    let policy = obligations
-        .row_filters
-        .iter()
-        .cloned()
-        .reduce(|left, right| json!({ "type": "or", "left": left, "right": right }));
+///
+/// # The policy half is the published one, not the raw annotation
+///
+/// It comes from [`super::restrictions::row_filter`] — the same function that
+/// builds `required-row-filter` on `loadTable` — so the two cannot disagree.
+/// That matters for the branch this table cannot carry: the annotation names a
+/// column this schema does not have, and handing it over raw gives a conforming
+/// reader a filter it cannot apply, which the spec says it must then fail the
+/// query over. The published form says `false` for that branch, which the reader
+/// can apply, and which is what [`policy_predicate`] already pruned by.
+fn residual_filter(
+    requested: Option<&Value>,
+    obligations: &Obligations,
+    schema: &iceberg::spec::Schema,
+) -> Option<Value> {
+    let policy = super::restrictions::row_filter(schema, obligations);
 
     match (requested, policy) {
         (Some(requested), Some(policy)) => {
@@ -1366,6 +1453,149 @@ mod tests {
         let metadata = metadata();
         let types = partition_types(&metadata);
         assert_eq!(types.len(), metadata.partition_specs_iter().len());
+    }
+
+    /// Iceberg *renders* a nested field as `user.ssn`, and nothing stops a table
+    /// having a top-level column literally called `user.ssn` beside a struct
+    /// called `user`. Ancestry inferred from the dotted name cannot tell them
+    /// apart, and got it wrong in the disclosing direction: masking both `user`
+    /// and `user.ssn` published a projection for `user` only, because `user.ssn`
+    /// looked like a field inside it — so the column the policy named by hand
+    /// came back unmasked.
+    #[test]
+    fn a_dotted_column_name_is_not_a_child_of_the_column_it_is_prefixed_by() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(
+                    1,
+                    "user",
+                    Type::Struct(iceberg::spec::StructType::new(vec![
+                        NestedField::optional(2, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    ])),
+                )
+                .into(),
+                // A top-level column whose *name* contains a dot.
+                NestedField::optional(3, "user.ssn", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .expect("schema builds");
+
+        let parents = parent_ids(&schema);
+        assert_eq!(
+            parents.get(&2),
+            Some(&1),
+            "the nested field really is inside the struct"
+        );
+        assert_eq!(
+            parents.get(&3),
+            None,
+            "the dotted top-level column is nobody's child"
+        );
+
+        let masked = HashSet::from([1, 3]);
+        let projections = super::super::restrictions::read_restrictions(
+            &schema,
+            &Obligations {
+                row_filters: Vec::new(),
+                column_masks: HashSet::from(["user".to_string(), "user.ssn".to_string()]),
+            },
+            &masked,
+        )
+        .expect("restrictions build")
+        .expect("some restrictions");
+
+        let ids: HashSet<i32> = projections
+            .required_column_projections
+            .iter()
+            .map(|projection| projection.field_id)
+            .collect();
+        assert_eq!(
+            ids,
+            HashSet::from([1, 3]),
+            "both masked columns are published; neither swallows the other"
+        );
+    }
+
+    /// A broad permit's filter naming a column *this* table does not have is the
+    /// ordinary shape, not an error: `resource in Tenant::"acme"` with a filter
+    /// on `region` reaches every table in the tenant and most have no `region`.
+    ///
+    /// It must select **no files**, and — this is the part that used to be
+    /// wrong — it must select no files rather than refusing the plan. Such a
+    /// table carries obligations, so its `loadTable` sends
+    /// `scan-planning-mode: server`; refusing here told a conforming client it
+    /// *must* plan through this endpoint and then denied it when it did.
+    #[test]
+    fn a_policy_filter_this_table_cannot_carry_selects_nothing() {
+        let schema = std::sync::Arc::new(nested_schema());
+        let obligations = Obligations {
+            row_filters: vec![json!({
+                "type": "eq",
+                "term": "region",
+                "value": "EU",
+            })],
+            column_masks: HashSet::new(),
+        };
+
+        let predicate = policy_predicate(&obligations, &schema, CaseSensitivity::Sensitive);
+        assert_eq!(
+            predicate,
+            Some(iceberg::expr::Predicate::AlwaysFalse),
+            "an unbindable branch denies every row instead of refusing the plan"
+        );
+    }
+
+    /// One unbindable branch must not take the others with it: permits grant, so
+    /// the filters are OR-ed and `false` is the identity of that union.
+    #[test]
+    fn an_unbindable_branch_does_not_void_the_branches_beside_it() {
+        let schema = std::sync::Arc::new(nested_schema());
+        let obligations = Obligations {
+            row_filters: vec![
+                json!({ "type": "eq", "term": "region", "value": "EU" }),
+                json!({ "type": "eq", "term": "amount", "value": 7 }),
+            ],
+            column_masks: HashSet::new(),
+        };
+
+        let predicate = policy_predicate(&obligations, &schema, CaseSensitivity::Sensitive)
+            .expect("a predicate");
+        assert_ne!(
+            predicate,
+            iceberg::expr::Predicate::AlwaysFalse,
+            "the bindable branch still grants what it grants"
+        );
+        assert_ne!(
+            predicate,
+            iceberg::expr::Predicate::AlwaysTrue,
+            "and the unbindable one is never widened away"
+        );
+    }
+
+    /// The plan prunes by the same filter `loadTable` publishes. Two functions
+    /// answering this differently is how a caller is told to apply one
+    /// restriction while the server enforced another.
+    #[test]
+    fn the_residual_is_the_filter_load_table_publishes() {
+        let schema = nested_schema();
+        let obligations = Obligations {
+            row_filters: vec![json!({ "type": "eq", "term": "region", "value": "EU" })],
+            column_masks: HashSet::new(),
+        };
+
+        let residual = residual_filter(None, &obligations, &schema).expect("a residual");
+        assert_eq!(
+            residual,
+            Value::Bool(false),
+            "the residual carries the published form, which a reader can apply — not the \
+             raw annotation, which names a column this table does not have and which a \
+             conforming reader would have to fail the query over"
+        );
+        assert_eq!(
+            residual,
+            super::super::restrictions::row_filter(&schema, &obligations).expect("published"),
+            "and it is literally the same function"
+        );
     }
 
     fn nested_schema() -> Schema {

@@ -84,7 +84,7 @@ pub fn read_restrictions(
     }
 
     let projections = column_projections(schema, masked)?;
-    let filter = row_filter(schema, obligations)?;
+    let filter = row_filter(schema, obligations);
 
     if projections.is_empty() && filter.is_none() {
         return Ok(None);
@@ -149,10 +149,18 @@ fn column_projections(schema: &Schema, masked: &HashSet<i32>) -> Result<Vec<Colu
 
     // Rule 2: keep only the outermost masked field of each chain. A field whose
     // ancestor is masked is already covered by that ancestor's projection.
+    //
+    // The chain comes from the schema's own nesting, not from splitting the
+    // dotted name Iceberg renders a nested field with. Nothing forbids a
+    // top-level column literally called `user.address`, and inferring ancestry
+    // from the name treats it as a child of `user` — so masking both `user` and
+    // `user.address` published only `user`, and the column the policy explicitly
+    // named came back unmasked.
+    let parents = super::plan::parent_ids(schema);
     let outermost: BTreeSet<i32> = masked
         .iter()
         .copied()
-        .filter(|id| !ancestors(schema, *id).iter().any(|up| masked.contains(up)))
+        .filter(|id| !has_masked_ancestor(&parents, *id, masked))
         .collect();
 
     outermost
@@ -176,28 +184,23 @@ fn column_projections(schema: &Schema, masked: &HashSet<i32>) -> Result<Vec<Colu
         .collect()
 }
 
-/// The ancestors of a field, outermost first, by walking the schema's dotted
-/// names. `user.address.zip` has ancestors `user` and `user.address`.
+/// Whether any field enclosing `id` is itself masked.
 ///
-/// Names rather than a structural walk because `Schema` indexes fields by their
-/// full dotted path and not by parent, and because the two agree: Iceberg builds
-/// that path from the nesting.
-fn ancestors(schema: &Schema, id: i32) -> Vec<i32> {
-    let Some(name) = schema.name_by_field_id(id) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut prefix = String::new();
-    for segment in name.split('.').take(name.matches('.').count()) {
-        if !prefix.is_empty() {
-            prefix.push('.');
+/// Walks up the schema's nesting until it reaches a top-level field, which has
+/// no parent and therefore terminates the loop.
+fn has_masked_ancestor(
+    parents: &std::collections::HashMap<i32, i32>,
+    id: i32,
+    masked: &HashSet<i32>,
+) -> bool {
+    let mut current = id;
+    while let Some(&parent) = parents.get(&current) {
+        if masked.contains(&parent) {
+            return true;
         }
-        prefix.push_str(segment);
-        if let Some(parent) = schema.field_id_by_name(&prefix) {
-            out.push(parent);
-        }
+        current = parent;
     }
-    out
+    false
 }
 
 /// Every field id that is the key half of a map.
@@ -253,7 +256,7 @@ fn map_key_field_ids(schema: &Schema) -> HashSet<i32> {
 /// metadata and no rows of it. That is deny-by-default, it is expressible, and it
 /// agrees with what [`super::plan`] already does with the same filter — refuse to
 /// plan — rather than inventing a third behaviour for the same policy.
-fn row_filter(schema: &Schema, obligations: &Obligations) -> Result<Option<Value>> {
+pub(super) fn row_filter(schema: &Schema, obligations: &Obligations) -> Option<Value> {
     let mut combined: Option<Value> = None;
     for filter in &obligations.row_filters {
         // `false` is absorbing under OR only if every branch is false, so an
@@ -273,7 +276,7 @@ fn row_filter(schema: &Schema, obligations: &Obligations) -> Result<Option<Value
             Some(left) => json!({ "type": "or", "left": left, "right": bound }),
         });
     }
-    Ok(combined)
+    combined
 }
 
 /// Rewrites one predicate into the spec's preferred form with id references.
@@ -549,9 +552,7 @@ mod tests {
             vec![json!({ "type": "eq", "term": "region", "value": "EU" })],
             &[],
         );
-        let filter = row_filter(&schema, &obligations)
-            .expect("expressible")
-            .expect("a filter is present");
+        let filter = row_filter(&schema, &obligations).expect("a filter is present");
         assert_eq!(
             filter,
             json!({
@@ -573,9 +574,7 @@ mod tests {
             ],
             &[],
         );
-        let filter = row_filter(&schema, &obligations)
-            .expect("expressible")
-            .expect("a filter is present");
+        let filter = row_filter(&schema, &obligations).expect("a filter is present");
         assert_eq!(filter["type"], "or");
         assert_eq!(filter["left"]["left"]["id"], 1);
         assert_eq!(filter["right"]["right"]["value"], "US");
@@ -596,7 +595,7 @@ mod tests {
             &[],
         );
         assert_eq!(
-            row_filter(&schema, &obligations).expect("never errors"),
+            row_filter(&schema, &obligations),
             Some(Value::Bool(false)),
             "an inexpressible filter denies every row"
         );
@@ -614,10 +613,7 @@ mod tests {
             vec![json!({ "type": "eq", "term": "nope", "value": 1 })],
             &[],
         );
-        assert_eq!(
-            row_filter(&schema, &obligations).expect("never errors"),
-            Some(Value::Bool(false))
-        );
+        assert_eq!(row_filter(&schema, &obligations), Some(Value::Bool(false)));
     }
 
     /// One expressible filter and one that is not: the disjunction keeps both,
@@ -633,9 +629,7 @@ mod tests {
             ],
             &[],
         );
-        let filter = row_filter(&schema, &obligations)
-            .expect("never errors")
-            .expect("present");
+        let filter = row_filter(&schema, &obligations).expect("present");
         assert_eq!(filter["type"], "or");
         assert_eq!(filter["right"], Value::Bool(false));
         assert_eq!(filter["left"]["left"]["id"], 1);
@@ -654,9 +648,7 @@ mod tests {
             })],
             &[],
         );
-        let filter = row_filter(&schema, &obligations)
-            .expect("expressible")
-            .expect("present");
+        let filter = row_filter(&schema, &obligations).expect("present");
         assert_eq!(filter["left"]["id"], 1);
 
         let bad = obs(
@@ -668,7 +660,7 @@ mod tests {
             &[],
         );
         assert_eq!(
-            row_filter(&schema, &bad).expect("never errors"),
+            row_filter(&schema, &bad),
             Some(Value::Bool(false)),
             "an id this table does not have denies rather than widening"
         );

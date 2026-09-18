@@ -263,6 +263,9 @@ pub(super) fn record_decision(
     .with_tenant_id(context.principal.tenant_id())
     .with_optional_client_ip(context.request.source_ip)
     .with_optional_request_id(context.request.request_id.as_deref())
+    // How the request said it got here. Recorded, never consulted: see
+    // `RequestContext::referenced_by`.
+    .with_referenced_by(&context.request.referenced_by)
     // Which rule decided, and which policy set it came from. Without these the
     // record says what happened but never why, which is the half an operator
     // actually needs.

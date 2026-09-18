@@ -1,6 +1,6 @@
 [package]
 name = "rustberg"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "A policy-first Apache Iceberg REST catalog: Cedar authorization on every request, scoped storage access, and an audit trail — in a single binary or as a library"

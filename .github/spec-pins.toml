@@ -1,0 +1,63 @@
+# Upstream documents this project's conformance claims are read from, pinned by
+# content digest.
+#
+# # Why a digest and not the document
+#
+# The obvious design is to commit the documents and let CI `diff` them. It does
+# not work here: the corpus lives in `concepts/references/`, which is gitignored
+# because most of it is third-party material this repository may not
+# redistribute — so a CI checkout has no copy to diff against. A digest is not a
+# copy. It carries no licensed content, it is four lines per document, and it
+# works the same for a permissively-licensed spec and for a vendor page that
+# could never be committed.
+#
+# What it costs is the diff itself: a mismatch says a document moved, not what
+# moved in it. The maintainer has the retrieved copy locally, so `just
+# spec-check` names the file and `git diff --no-index` against a fresh fetch
+# shows the change. Detecting drift is the job; reading it is a person's.
+#
+# # Why only these four
+#
+# Every entry must be a document whose bytes change *only* when its content
+# does. These are raw Markdown and YAML served from a branch, so a change is a
+# commit to the document.
+#
+# The rendered HTML pages in `concepts/references/` are deliberately absent.
+# `iceberg.apache.org/spec/` re-renders on every site build, so pinning it would
+# fire on a footer change and teach everyone to ignore the job — which is the
+# failure this control exists to prevent, arriving one level up.
+#
+# # When this fires
+#
+# Read the change, decide whether it touches anything Rustberg implements or
+# claims, then re-retrieve the corpus and run `just spec-pins` to re-stamp these
+# digests. Updating a digest without reading the diff defeats the entire
+# mechanism.
+
+[[pin]]
+name = "iceberg/rest-catalog-open-api.yaml"
+url = "https://raw.githubusercontent.com/apache/iceberg/main/open-api/rest-catalog-open-api.yaml"
+sha256 = "be7273e50a7e37651bd3bd3a9401e749634912814a7f30b21580642eea0019f2"
+retrieved = "2026-09-18"
+governs = "The wire protocol. Every endpoint, request and response shape, and every capability /v1/config advertises."
+
+[[pin]]
+name = "iceberg/table-spec.md"
+url = "https://raw.githubusercontent.com/apache/iceberg/main/format/spec.md"
+sha256 = "af9123ae77d68e76e99df9d6ab47d7771fad2bf5518e86b73712d69a76f4c1b1"
+retrieved = "2026-09-18"
+governs = "Format versions 1/2/3, row lineage, partition specs and transforms, and the JSON single-value serialization a scan plan encodes partition values with."
+
+[[pin]]
+name = "iceberg/view-spec.md"
+url = "https://raw.githubusercontent.com/apache/iceberg/main/format/view-spec.md"
+sha256 = "a98308ab9e2d858c40086b5470cc9734e7723f10db2f8cb0e3c9bdb28113995c"
+retrieved = "2026-09-18"
+governs = "The view metadata document, and the basis for update_view taking the metadata location its caller loaded."
+
+[[pin]]
+name = "iceberg/puffin-spec.md"
+url = "https://raw.githubusercontent.com/apache/iceberg/main/format/puffin-spec.md"
+sha256 = "f70a4ef5ce49966bc4f49a0fc4b445a9d0f3eead9fc7506b041b996a4092d2ce"
+retrieved = "2026-09-18"
+governs = "The statistics blobs SetStatistics and SetPartitionStatistics point at, and a purge deletes."

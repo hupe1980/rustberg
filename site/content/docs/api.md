@@ -454,6 +454,21 @@ history that no ref points at; pruning by default would silently break them. A
 value that is neither is `400`, not a silent fallback — a client that asked for
 less must not be handed the full document while believing otherwise.
 
+#### View chain (`referenced-by`)
+
+When a load is reached through views, a client may name the chain — outermost
+first, comma-separated, each entry `{namespace}{separator}{name}` with the
+separator `/config` defines and defaults to `%1F`:
+
+```http
+GET /v1/namespaces/analytics/tables/events?referenced-by=prod%1Fanalytics%1Fquarterly
+```
+
+It is recorded in the audit trail and changes no decision: the load is authorized
+against the caller either way, so a chain grants nothing. One this server cannot
+read is ignored rather than refused. A name containing a comma must be sent as
+`%2C`.
+
 ### Staged creation (`CREATE TABLE AS SELECT`)
 
 `CREATE TABLE AS SELECT` has a chicken-and-egg problem: the engine must write
@@ -1069,7 +1084,7 @@ GET /ready
 ```json
 {
   "status": "ready",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "timestamp": 1704067200,
   "components": {
     "catalog": { "status": "ready" },
@@ -1309,8 +1324,9 @@ no literal to type-check.
 
 > **A Cedar `@row_filter` is the other way round.** Widening a *restriction*
 > removes it — `@row_filter("region = 'EU'")` silently becoming everything — so a
-> policy filter that cannot be bound to the table being planned is a `403` naming
-> the term. Same grammar, opposite safe direction: one is a request, the other a
+> policy filter that cannot be bound to the table being planned selects **no
+> files** instead, which is the same `false` the table's `read-restrictions`
+> publish. Same grammar, opposite safe direction: one is a request, the other a
 > limit.
 >
 > An operator or a term outside the table below cannot bind against *any* table,

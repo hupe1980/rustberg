@@ -14,7 +14,7 @@ crate.
 [API reference](https://hupe1980.github.io/rustberg/docs/api/) ·
 [Security](https://hupe1980.github.io/rustberg/docs/security/)
 
-<img src="https://img.shields.io/badge/tests-1089%20%2B%2071%20client-brightgreen" alt="1089 Rust tests, 71 client conformance tests">
+<img src="https://img.shields.io/badge/tests-1139%20%2B%2071%20client-brightgreen" alt="1139 Rust tests, 71 client conformance tests">
 <img src="https://img.shields.io/badge/unsafe-forbidden-brightgreen" alt="unsafe forbidden">
 <img src="https://img.shields.io/badge/binary-~24%20MB-blue" alt="~24 MB binary">
 <img src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue" alt="Apache-2.0 OR MIT">
@@ -292,10 +292,10 @@ that fail the build.
 
 | | Target | Measured (p99) |
 |---|---|---|
-| Authorization overhead | < 1 ms for point operations | **31 µs** |
-| `loadTable` | < 5 ms native | **370 µs** |
-| Cold start to serving | < 100 ms | **45 ms** |
-| Idle footprint | < 50 MB RSS | gated on Linux |
+| Authorization overhead | < 1 ms for point operations | **23 µs** |
+| `loadTable` | < 5 ms native | **373 µs** |
+| Cold start to serving | < 100 ms | **31 ms** |
+| Idle footprint | < 50 MB RSS | **15 MB** |
 
 → [Performance](https://hupe1980.github.io/rustberg/docs/benchmarks/)
 

@@ -137,20 +137,60 @@ fn is_absolute(path: &str) -> bool {
     path.starts_with('/')
 }
 
-/// Splits a path into non-empty segments.
+/// Splits a path into segments, preserving the ones that mean something.
 ///
-/// Empty segments are dropped so that `bucket//wh` and `bucket/wh` agree; a
-/// doubled slash is a typo, not a different location.
+/// # An empty segment is a real segment in an object store
 ///
-/// A `.` segment is **kept**, and that is deliberate. On a filesystem it means
-/// "this directory" and could be dropped; in an object store it is an ordinary
-/// key segment, and `wh/./t` and `wh/t` are two different objects. Dropping it
-/// would make containment agree with the filesystem reading and disagree with
-/// the store the credential is scoped to — and the comparison here has to be
-/// about the bytes the storage service will address. `..` is refused outright by
-/// the callers below rather than resolved, for the same reason.
-fn segments(path: &str) -> Vec<&str> {
-    path.split('/').filter(|s| !s.is_empty()).collect()
+/// A doubled slash reads as a typo and is not one. S3 keys are opaque byte
+/// strings: `wh/db/t/x` and `/wh/db/t/x` are two different objects, and neither
+/// is inside the other. So `bucket//wh` is **not** `bucket/wh`, and folding the
+/// two together is what let a signed request address a key outside the table it
+/// was authorized for — the checked string and the signed string stopped being
+/// one string, which is the whole contract
+/// [`sign::Addressed`](crate::catalog::v1::sign) rests on.
+///
+/// This is the same argument that already keeps `.`: on a filesystem it means
+/// "this directory" and could be dropped, but in an object store it is an
+/// ordinary key segment and `wh/./t` and `wh/t` are two different objects. The
+/// comparison here has to be about the bytes the storage service will address.
+/// `..` is refused outright by the callers below rather than resolved, for the
+/// same reason.
+///
+/// # And a filesystem is the exception, because there it really is a typo
+///
+/// POSIX collapses interior `//`, so `/srv/wh//db` and `/srv/wh/db` are one
+/// directory and refusing the first would be a false alarm. There is no signing
+/// path for `file://`, so nothing downstream depends on the distinction. Empty
+/// segments are therefore folded for `file` and preserved everywhere else —
+/// scheme-dependent because the underlying storage semantics genuinely differ.
+///
+/// One leading empty segment is always dropped: it comes from the path's own
+/// leading `/`, which [`split`] leaves on for `file` and for the authority-less
+/// `s3:/bucket/wh` spelling, and it separates nothing.
+fn segments<'a>(path: &'a str, scheme: &str) -> Vec<&'a str> {
+    if scheme == "file" {
+        return path.split('/').filter(|s| !s.is_empty()).collect();
+    }
+    let path = path.strip_prefix('/').unwrap_or(path);
+    if path.is_empty() {
+        return Vec::new();
+    }
+    path.split('/').collect()
+}
+
+/// Trims the trailing empty segments a root's own trailing slash produces.
+///
+/// `s3://bucket/wh` and `s3://bucket/wh/` name the same prefix — every operator
+/// writes both — so a root is compared without them. A *candidate* keeps its
+/// trailing empty, because for [`is_prefix_within`] a trailing slash is the
+/// difference between a prefix confined to one table and one that also matches
+/// its siblings.
+fn root_segments<'a>(path: &'a str, scheme: &str) -> Vec<&'a str> {
+    let mut segments = segments(path, scheme);
+    while segments.last().is_some_and(|last| last.is_empty()) {
+        segments.pop();
+    }
+    segments
 }
 
 /// True when `candidate` is `root` itself, or something nested inside it.
@@ -175,8 +215,8 @@ pub fn is_within(root: &str, candidate: &str) -> bool {
         return false;
     }
 
-    let root_segments = segments(root_path);
-    let candidate_segments = segments(candidate_path);
+    let root_segments = root_segments(root_path, &root_scheme);
+    let candidate_segments = segments(candidate_path, &candidate_scheme);
 
     // Checked before the length test: a traversal segment invalidates the
     // location regardless of how deep it appears.
@@ -212,8 +252,8 @@ pub fn is_prefix_within(root: &str, candidate: &str) -> bool {
         return false;
     }
 
-    let root_segments = segments(root_path);
-    let candidate_segments = segments(candidate_path);
+    let root_segments = root_segments(root_path, &root_scheme);
+    let candidate_segments = segments(candidate_path, &candidate_scheme);
 
     if candidate_segments.contains(&"..") || candidate_segments.len() < root_segments.len() {
         return false;
@@ -228,7 +268,9 @@ pub fn is_prefix_within(root: &str, candidate: &str) -> bool {
 
     // Deeper, or the same depth with a trailing slash — both name only what is
     // under the root. The same depth without one names the root as a string,
-    // which matches its siblings too.
+    // which matches its siblings too. For a non-`file` scheme a trailing slash
+    // *is* a trailing empty segment, so the length test already caught it; the
+    // explicit check remains for `file`, where empty segments are folded.
     candidate_segments.len() > root_segments.len() || candidate_path.ends_with('/')
 }
 
@@ -1066,9 +1108,42 @@ mod tests {
         assert!(!is_within("s3://bucket/./wh", "s3://bucket/wh/t"));
     }
 
+    /// An empty segment is a real segment in an object store, and this is the
+    /// assertion that stops a signed request from addressing a key outside the
+    /// table it was authorized for: `bucket//wh/db/t/x` is the key
+    /// `/wh/db/t/x`, which no table named `wh/db/t` contains.
     #[test]
-    fn doubled_slashes_do_not_change_the_location() {
-        assert!(is_within("s3://bucket/wh", "s3://bucket//wh//db/t"));
+    fn a_doubled_slash_is_a_different_object_store_location() {
+        assert!(!is_within("s3://bucket/wh", "s3://bucket//wh//db/t"));
+        assert!(!is_within("s3://bucket/wh/db/t", "s3://bucket//wh/db/t/x"));
+        assert!(!is_within("s3://bucket/wh/db/t", "s3://bucket/wh//db/t/x"));
+        // The ordinary spelling is unaffected.
+        assert!(is_within("s3://bucket/wh/db/t", "s3://bucket/wh/db/t/x"));
+    }
+
+    /// A trailing slash on the *root* is notational — every operator writes
+    /// both spellings of a warehouse — so it is trimmed before comparison.
+    #[test]
+    fn a_trailing_slash_on_the_root_is_notational() {
+        assert!(is_within("s3://bucket/wh/", "s3://bucket/wh/db/t"));
+        assert!(is_within("s3://bucket/wh", "s3://bucket/wh/db/t"));
+        assert!(is_within("s3://bucket/wh/", "s3://bucket/wh/"));
+    }
+
+    /// Both spellings of an authority-less URI name one location, so the
+    /// leading slash the second one carries must not become a segment.
+    #[test]
+    fn the_authority_less_spelling_agrees_with_the_ordinary_one() {
+        assert!(is_within("s3://bucket/wh", "s3:/bucket/wh/db/t"));
+        assert!(is_within("s3:/bucket/wh", "s3://bucket/wh/db/t"));
+    }
+
+    /// On a filesystem a doubled slash really is a typo: POSIX collapses
+    /// interior separators, and nothing signs a `file://` request.
+    #[test]
+    fn a_doubled_slash_is_folded_on_a_filesystem() {
+        assert!(is_within("/srv/wh", "/srv/wh//db/t"));
+        assert!(is_within("file:///srv/wh", "file:///srv/wh//db/t"));
     }
 
     #[test]

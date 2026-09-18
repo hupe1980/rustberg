@@ -74,3 +74,25 @@ jobs:
         with:
           fail-on-severity: moderate
           deny-licenses: GPL-3.0, AGPL-3.0
+
+  # ===========================================================================
+  # Upstream specification drift, on the same schedule and for the same reason
+  # ===========================================================================
+  # The REST OpenAPI document carries no version (`version: 0.0.1`, unchanged),
+  # lives on a branch, and produces no release event — so there is nothing to
+  # subscribe to, and six fields have landed in it without these notes noticing.
+  # Like an advisory, a spec change applies to a tree nobody has pushed to, so it
+  # has to be found by the clock rather than by a commit.
+  #
+  # Scheduled runs only. On a pull request this would fail for a reason the
+  # author did not cause and cannot fix in their branch, which is how a required
+  # check gets marked non-blocking and stops being read.
+  spec-drift:
+    name: Specification Drift
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Diff pinned upstream documents
+        run: ./.github/spec-drift.sh

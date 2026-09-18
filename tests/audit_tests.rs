@@ -867,3 +867,71 @@ async fn a_denied_mutation_is_denied_not_unavailable() {
         "a broken sink must not turn a refusal into an outage"
     );
 }
+
+/// A `referenced-by` chain reaches the record, so the trail can answer *how did
+/// this request say it got here* rather than only *what did it touch*.
+///
+/// The chain is a caller's claim and grants nothing — this asserts it is
+/// **recorded**, and the encoded comma asserts the one thing that is easy to get
+/// wrong: the raw parameter is split before it is decoded, so a view name
+/// containing a comma stays one view.
+#[tokio::test]
+async fn a_view_chain_is_recorded_as_the_caller_claimed_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let auditor = Arc::new(Auditor::new(Box::new(FileSink::open(&path).unwrap()), true));
+    let (app, secret) = app_with(auditor).await;
+
+    // `%1F` is the namespace separator the spec defaults to, and `%2C` is a
+    // comma that belongs to a *name* rather than separating two views.
+    let chain = "prod%1Fanalytics%1Fquarterly,prod%1Fa%2Cb%1Fmonthly";
+    let _ = send(
+        &app,
+        Method::GET,
+        &format!("/v1/namespaces?referenced-by={chain}"),
+        &secret,
+        None,
+    )
+    .await;
+
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line is one JSON object"))
+        .collect();
+
+    let recorded = records
+        .iter()
+        .find_map(|r| r.get("referenced_by"))
+        .expect("a decision record carries the chain");
+
+    assert_eq!(
+        recorded,
+        &serde_json::json!(["prod/analytics/quarterly", "prod/a,b/monthly"]),
+        "outermost first, rendered like a resource path, and the encoded comma \
+         stayed inside the second view's name instead of splitting it"
+    );
+}
+
+/// No chain, no field — so a reader can tell a load that named one from a load
+/// that did not.
+#[tokio::test]
+async fn a_request_without_a_chain_records_no_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let auditor = Arc::new(Auditor::new(Box::new(FileSink::open(&path).unwrap()), true));
+    let (app, secret) = app_with(auditor).await;
+
+    let _ = send(&app, Method::GET, "/v1/namespaces", &secret, None).await;
+
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line is one JSON object"))
+        .collect();
+
+    assert!(
+        records.iter().all(|r| r.get("referenced_by").is_none()),
+        "an absent chain leaves the field off the record entirely"
+    );
+}

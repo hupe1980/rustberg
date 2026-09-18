@@ -245,6 +245,18 @@ pub struct RequestContext {
     /// Not readable from a policy: it is chosen per request and means nothing to
     /// an authorization decision.
     pub request_id: Option<String>,
+    /// Views this load arrived through, outermost first, from `referenced-by`.
+    ///
+    /// Empty when the client sent none, or sent one this server would not
+    /// repeat into a record ([`crate::names::parse_view_chain`]).
+    ///
+    /// **A claim, never a grant**, and deliberately not readable from a policy.
+    /// The caller writes it, so a chain that granted anything would be a caller
+    /// granting itself something; every load is authorized against the caller on
+    /// its own, and this only ever answers *how did the request say it got
+    /// here*. Same standing as [`request_id`](Self::request_id) — recorded,
+    /// never consulted.
+    pub referenced_by: Vec<String>,
 }
 
 impl RequestContext {
@@ -253,7 +265,15 @@ impl RequestContext {
         Self {
             source_ip: Some(source_ip),
             request_id: None,
+            referenced_by: Vec::new(),
         }
+    }
+
+    /// Attaches the view chain a `referenced-by` parameter named.
+    #[must_use]
+    pub fn with_referenced_by(mut self, chain: Vec<String>) -> Self {
+        self.referenced_by = chain;
+        self
     }
 
     /// Attaches the correlation id.

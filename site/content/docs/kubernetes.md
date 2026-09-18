@@ -17,7 +17,7 @@ Rustberg is designed for Kubernetes from the ground up:
 
 | Feature | Benefit |
 |---------|---------|
-| **~35 ms startup** | Fast rescheduling, near-instant readiness |
+| **~31 ms startup** | Fast rescheduling, near-instant readiness |
 | **~15 MB idle RSS** | Dense packing, low cost per replica |
 | **Stateless pods** | Catalog in Postgres, warehouse in object storage |
 | **No leader election** | Concurrency resolved by the database |

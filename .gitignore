@@ -26,12 +26,17 @@ BACKLOG.md
 FINDINGS.md
 _prompts
 
-# Internal-only documents (not published) — the design notes CONCEPT.md was split into.
+# Internal-only documents (not published) — the design notes CONCEPT.md was split
+# into, plus concepts/references/, the third-party specifications and RFCs they
+# are written against. Those are copyrighted publications, so this entry is a
+# licensing boundary as well as an editorial one: publishing the notes would mean
+# extracting them from the material they sit beside.
 concepts/
 
-# Third-party specifications, standards and RFCs (copyrighted; indexed with
-# retrieval URLs in concepts/REFERENCES.md so the folder can be rebuilt).
-specs/
+# Agent instructions. The round procedure reads concepts/ on every phase, so it
+# describes a tree a clone does not have — and it is internal working method
+# rather than anything a consumer of this crate needs.
+.claude/
 
 # Python
 .venv/

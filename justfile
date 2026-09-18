@@ -105,6 +105,22 @@ fmt-check:
 check: fmt-check lint test test-doc
     @echo "✅ All checks passed!"
 
+# The same script the daily `spec-drift` CI job runs. It needs no local corpus —
+# it compares digests against .github/spec-pins.toml — so it answers on a bare
+# checkout as well as on a working tree.
+#
+# Has an upstream specification moved since it was last retrieved?
+spec-check:
+    ./.github/spec-drift.sh
+
+# Deliberately a separate recipe from `spec-check`, and never run by CI: making
+# the check pass is one keystroke away from the check meaning nothing. Read the
+# diff first.
+#
+# Re-stamp the pinned specification digests, after reading what changed.
+spec-pins:
+    ./.github/spec-drift.sh --update
+
 # Check every optional feature on its own
 features:
     #!/usr/bin/env bash

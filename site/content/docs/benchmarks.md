@@ -38,17 +38,21 @@ API-key-authenticated request.
 
 ### Request latency
 
-Release build, `--all-features`, Apple M-series, redb catalog on local disk. The
-targets are design goals; the measurements next to them are asserted on every
-pull request against looser ceilings — see [Gated in CI](#gated-in-ci).
+`rustberg bench --iterations 200`, release build with `--all-features`, redb
+catalog on local disk — **Rustberg 0.3.0, Apple M4 Pro (14 core), macOS 26.6.2,
+rustc 1.98.1, 2026-09-18**. One developer machine on one day, so read them as an
+order of magnitude. The targets are design goals; the measurements are asserted
+on every pull request against looser ceilings — see [Gated in CI](#gated-in-ci).
 
 | | p50 | p99 | Target |
 |---|---|---|---|
-| **Authorization** (one Cedar decision) | 24 µs | **31 µs** | < 1 ms |
-| **`loadTable`** (full HTTP stack) | 285 µs | **370 µs** | < 5 ms |
-| `loadTable` answering `304` | 265 µs | 321 µs | — |
-| Policy compile + validate (startup) | 525 µs | 704 µs | — |
-| Cold start (build → first answer) | 30 ms | **45 ms** | < 100 ms |
+| **Authorization** (one Cedar decision) | 22.6 µs | **23.4 µs** | < 1 ms |
+| **`loadTable`** (full HTTP stack) | 326 µs | **373 µs** | < 5 ms |
+| Policy compile + validate (startup) | 591 µs | 944 µs | — |
+| Cold start (build → first answer) | 29.1 ms | **30.9 ms** | < 100 ms |
+
+Run it yourself with `rustberg bench`; the harness lives in the library, so it
+and CI measure the same code path.
 
 Authorization is the number with the most leverage: it runs on every request, so
 a regression there is paid by everything.
@@ -64,7 +68,7 @@ network round trip, and skipping it is the point of
 | | Value |
 |---|---|
 | Cold start (exec → accepting connections) | ~30 ms |
-| Idle RSS | gated at < 50 MB, measured on Linux in CI |
+| Idle RSS | **15.4 MB** idle on macOS (`ps` against a `--dev` server); gated at < 50 MB on Linux in CI |
 | Binary (`--all-features`, stripped) | ~24 MB |
 
 Reproduce with:

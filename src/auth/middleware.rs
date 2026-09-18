@@ -470,14 +470,48 @@ where
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(RequestFacts(
-            parts
-                .extensions
-                .get::<RequestContext>()
-                .cloned()
-                .unwrap_or_default(),
-        ))
+        let context = parts
+            .extensions
+            .get::<RequestContext>()
+            .cloned()
+            .unwrap_or_default();
+
+        // Read off the **raw** query string rather than through `Query<T>`,
+        // which percent-decodes before anything can look: the spec encodes a
+        // comma inside a view name as `%2C`, so decoding first and splitting
+        // afterwards turns one view into two and records a view nobody named.
+        // `parse_view_chain` owns that order; this only has to hand it bytes
+        // nothing has rewritten.
+        let chain = parts
+            .uri
+            .query()
+            .and_then(raw_parameter)
+            .and_then(crate::names::parse_view_chain)
+            .unwrap_or_default();
+
+        Ok(RequestFacts(context.with_referenced_by(chain)))
     }
+}
+
+/// The still-encoded value of `referenced-by`, or `None` when the query string
+/// does not carry exactly one.
+///
+/// A repeated parameter is refused rather than resolved, for the reason the
+/// signer refuses one: which of the two the server acts on is unspecified, so a
+/// record naming either is a coin toss. Here the cost of guessing wrong is only
+/// a wrong audit line, which is precisely the thing this parameter exists to get
+/// right.
+fn raw_parameter(query: &str) -> Option<&str> {
+    let mut found = None;
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("referenced-by=") {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(value);
+        }
+    }
+    found
 }
 
 impl std::ops::Deref for RequestFacts {

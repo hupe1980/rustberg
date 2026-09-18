@@ -225,6 +225,22 @@ pub struct AuditEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_set_version: Option<String>,
 
+    /// Views this request said it arrived through, outermost first.
+    ///
+    /// From the `referenced-by` parameter, and a **claim by the caller** rather
+    /// than anything this server resolved — no grant ever followed from it. It
+    /// is a first-class field for the reason
+    /// [`matched_policies`](Self::matched_policies) is: *"why did this principal
+    /// load `payroll`"* is a question the trail is kept to answer, and it has a
+    /// different answer when the chain says the load came through
+    /// `finance/summary`.
+    ///
+    /// Empty both when the client sent no chain and when it sent one this server
+    /// would not repeat — a `details` entry names the second case, so the two are
+    /// distinguishable.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub referenced_by: Vec<String>,
+
     /// Anything else the recording site wanted to carry.
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub details: HashMap<String, String>,
@@ -265,6 +281,7 @@ impl AuditEvent {
             resource_type: None,
             resource_id: None,
             matched_policies: Vec::new(),
+            referenced_by: Vec::new(),
             policy_set_version: None,
             details: HashMap::new(),
             error: None,
@@ -419,6 +436,18 @@ impl AuditEvent {
             Some(id) => self.with_request_id(id),
             None => self,
         }
+    }
+
+    /// Records the view chain the request claimed to arrive through.
+    ///
+    /// An empty chain leaves the field off the record entirely rather than
+    /// writing an empty list, so a reader can tell *no chain was sent* from
+    /// *a chain was sent and could not be read* — the latter is a `details`
+    /// entry the caller of this sets.
+    #[must_use]
+    pub fn with_referenced_by(mut self, chain: &[String]) -> Self {
+        self.referenced_by = chain.to_vec();
+        self
     }
 
     /// Sets what was acted on.

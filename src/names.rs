@@ -431,9 +431,178 @@ pub fn validate_properties(properties: &std::collections::HashMap<String, String
     Ok(())
 }
 
+/// The view chain a `referenced-by` parameter names, rendered for the audit
+/// trail — outermost view first.
+///
+/// # What the parameter is
+///
+/// The spec lets a client say which views it reached a table or view *through*:
+/// a comma-separated list of `{namespace}{separator}{viewName}` composites,
+/// outermost first, where the separator is the one `/config` names and defaults
+/// to [`PART_SEPARATOR`] — which is the one this server uses, so the two already
+/// agree.
+///
+/// # It is a claim, never a grant
+///
+/// The caller writes it. It may name views that do not exist, or a chain that
+/// never resolved, and nothing here checks: every load is authorized against the
+/// caller on its own, so a chain cannot launder access to anything. What it is
+/// good for is the audit trail, where *"why did this principal load `payroll`"*
+/// has a different answer when the chain says it arrived through
+/// `finance/summary`.
+///
+/// So this returns `None` rather than an error for anything it cannot read. A
+/// malformed chain has no security consequence, and refusing the load over one
+/// would break a read for a reason the caller could not act on.
+///
+/// # Splitting comes before decoding, and that order is the whole function
+///
+/// The spec says a view name containing a comma arrives percent-encoded as
+/// `%2C`. Decoding the parameter first and splitting afterwards turns
+/// `a%2Cb,c` — two views — into three, and the record then names a view nobody
+/// referenced. So the **raw** parameter value is split on `,`, and each part is
+/// decoded after. Checking a normalised copy of what will be acted on is the
+/// same mistake the signer makes if its path segments are folded.
+///
+/// # What comes back
+///
+/// Each identifier is rendered `tenant-less path/with/slashes`, the spelling
+/// [`crate::auth::Resource::path`] already uses in a record, so a chain and a
+/// `resource_id` read alike. Every segment is held to [`validate_name`], because
+/// this string goes into an audit line and a name carrying `\u{202E}` reverses
+/// the rest of it.
+#[must_use]
+pub fn parse_view_chain(raw_parameter: &str) -> Option<Vec<String>> {
+    if raw_parameter.is_empty() {
+        return None;
+    }
+
+    let mut chain = Vec::new();
+    for raw_identifier in raw_parameter.split(',') {
+        let decoded = percent_decode(raw_identifier)?;
+
+        // The last separator divides the namespace from the view name, which is
+        // what makes a multi-part namespace unambiguous: every separator before
+        // the last one is a namespace boundary.
+        let mut segments: Vec<&str> = decoded.split(PART_SEPARATOR).collect();
+        if segments.len() < 2 {
+            // A bare name with no namespace. The spec's own example always
+            // carries one, and a record naming a view with no namespace cannot
+            // be resolved by whoever reads it.
+            return None;
+        }
+        if segments
+            .iter()
+            .any(|segment| validate_name(segment, "view chain").is_err())
+        {
+            return None;
+        }
+
+        let name = segments.pop()?;
+        chain.push(format!("{}/{name}", segments.join("/")));
+    }
+
+    (!chain.is_empty()).then_some(chain)
+}
+
+/// Decodes one percent-encoded component, or `None` for a malformed escape or a
+/// result that is not UTF-8.
+///
+/// Strict on purpose: a component this cannot read exactly is one the audit
+/// record must not repeat. See [`parse_view_chain`] for why decoding happens
+/// per-component rather than over the whole parameter.
+fn percent_decode(component: &str) -> Option<String> {
+    let bytes = component.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = bytes
+                .get(index + 1..index + 3)
+                .and_then(|pair| std::str::from_utf8(pair).ok())
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())?;
+            out.push(hex);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+
+    String::from_utf8(out).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── referenced-by: the view chain ───────────────────────────────────
+
+    /// The ordinary shape: outermost view first, rendered the way a record
+    /// already spells a resource.
+    #[test]
+    fn a_view_chain_renders_like_a_resource_path() {
+        let raw = format!(
+            "prod{s}analytics{s}quarterly,prod{s}analytics{s}monthly",
+            s = PART_SEPARATOR
+        );
+        assert_eq!(
+            parse_view_chain(&raw),
+            Some(vec![
+                "prod/analytics/quarterly".to_string(),
+                "prod/analytics/monthly".to_string(),
+            ])
+        );
+    }
+
+    /// The whole reason the raw parameter is split before it is decoded. A view
+    /// name containing a comma arrives as `%2C`; decoding first turns two views
+    /// into three, and the record then names a view nobody referenced.
+    #[test]
+    fn a_comma_inside_a_name_is_one_view_not_two() {
+        let raw = format!("db{s}a%2Cb,db{s}c", s = PART_SEPARATOR);
+        let chain = parse_view_chain(&raw).expect("parses");
+        assert_eq!(
+            chain,
+            vec!["db/a,b".to_string(), "db/c".to_string()],
+            "the encoded comma stayed inside the first view's name"
+        );
+        assert_eq!(chain.len(), 2, "and did not split it into a third entry");
+    }
+
+    /// The chain reaches an audit line, so a name that would rewrite one is
+    /// refused exactly as it is everywhere else — this is invariant 10 applied
+    /// to a value that arrives in a query string.
+    #[test]
+    fn a_chain_carrying_an_unrenderable_name_is_unusable() {
+        for bad in ["db\u{1F}ev\u{202E}il", "db\u{1F}zero\u{200B}width"] {
+            assert_eq!(
+                parse_view_chain(bad),
+                None,
+                "{bad:?} must not reach a record"
+            );
+        }
+    }
+
+    /// Unreadable rather than refused: the chain grants nothing, so there is
+    /// nothing to fail closed about.
+    #[test]
+    fn an_unreadable_chain_is_none_rather_than_an_error() {
+        let bare = format!("justaname");
+        assert_eq!(parse_view_chain(""), None, "empty parameter");
+        assert_eq!(parse_view_chain(&bare), None, "no namespace");
+        assert_eq!(parse_view_chain("db%2"), None, "truncated escape");
+        assert_eq!(parse_view_chain("db%ZZname"), None, "not hex");
+    }
+
+    /// A multi-part namespace is unambiguous because the *last* separator is
+    /// the one that divides it from the view name.
+    #[test]
+    fn the_last_separator_divides_the_namespace_from_the_name() {
+        let raw = format!("a{s}b{s}c{s}v", s = PART_SEPARATOR);
+        assert_eq!(parse_view_chain(&raw), Some(vec!["a/b/c/v".to_string()]));
+    }
 
     /// The whole encoding rests on this: a validated name cannot contain either
     /// separator, so joining parts with one is injective and truncating an

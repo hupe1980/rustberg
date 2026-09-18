@@ -289,6 +289,15 @@ merely spells like `s3://bucket/wh`; it is a different prefix and is refused.
 `s3a://` and `s3://` name the same bucket and are treated as one. A `..`
 segment is refused outright.
 
+An **empty** segment is a segment. Object-store keys are opaque byte strings, so
+`s3://bucket//wh/db/t` is the key `/wh/db/t`, which is not inside `wh` — and a
+request naming it is refused rather than quietly compared as though the doubled
+slash were a typo. This is what keeps the string that was checked and the string
+that gets signed the same string; on a `file://` warehouse the separators really
+are equivalent and are folded, because POSIX collapses them and nothing signs a
+local path. A trailing slash on the *warehouse* is notational either way:
+`s3://bucket/wh` and `s3://bucket/wh/` name one prefix.
+
 Under [federation](@/docs/configuration.md#federation) the governing
 warehouse is the **mount's**, not the server's: each mount has its own, and a
 table created in a mount belongs in that one. The boundary is per-mount rather
@@ -724,6 +733,21 @@ caller's value while the record named nothing — which lets a caller unjoin its
 own requests from the trail by sending an oversized id, turning a bound meant to
 stop the trail growing into a way around it. Every request has exactly one id,
 and the echo and the record always name it.
+
+#### How the request said it got here
+
+`referenced_by` appears when a client sent the spec's `referenced-by` parameter:
+the views a table or view was reached *through*, outermost first, rendered like
+any other resource path. *"Why did this principal load `payroll`"* has a
+different answer when the chain says the load came through `finance/summary`.
+
+It is a **claim by the caller**, not something the catalog resolved. Every load
+is authorized against the caller on its own, so a chain grants nothing and
+changes no decision — it is recorded and never consulted, exactly like
+`request_id`. A chain naming views that do not exist is recorded as sent; a chain
+this server cannot read is dropped rather than refused, since it could not have
+widened anything. The field is absent entirely when no chain was sent, so a load
+that named one is distinguishable from a load that did not.
 
 #### Which rule decided
 
