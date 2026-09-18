@@ -74,6 +74,12 @@ controls that make a claim check itself.
 
 ### Changed
 
+- **Breaking (wire):** a scan task's `residual-filter` now spells its policy half
+  with `left`/`right` and an `IdReference`, rather than the deprecated
+  `term`/`value` form. It is the same predicate and the same form the table's
+  `read-restrictions` already carried — both are built by one function now, so
+  they cannot disagree — but a client that pattern-matched on `term` will not
+  recognise it.
 - **Breaking:** a location containing an empty path segment is now refused rather
   than silently normalised. `s3://bucket//wh` and `s3://bucket/wh` are different
   prefixes. A trailing slash on a warehouse remains notational, and `file://`

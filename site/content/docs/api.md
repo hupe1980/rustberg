@@ -1255,7 +1255,11 @@ curl -X POST http://localhost:8000/v1/namespaces/analytics/tables/events/plan \
         "file-size-in-bytes": 1234,
         "record-count": 2
       },
-      "residual-filter": { "type": "eq", "term": "region", "value": "EU" }
+      "residual-filter": {
+        "type": "eq",
+        "left": { "type": "reference", "id": 2 },
+        "right": { "type": "literal", "value": "EU" }
+      }
     }
   ]
 }
@@ -1335,7 +1339,9 @@ no literal to type-check.
 > query happens to hit it first.
 
 The `residual-filter` on each task is the filter you sent, plus whatever a
-matching permit's `@row_filter` added. Both halves are needed: pruning is
+matching permit's `@row_filter` added. The policy half references its columns by
+**field id** — the current spec spelling, and the same form the table's
+`read-restrictions` carry, so a reader that applies one applies the other. Both halves are needed: pruning is
 conservative, so a file that survives may still hold rows the policy filter
 excludes, and an engine that applied only the half it sent would read them.
 

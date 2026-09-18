@@ -203,11 +203,19 @@ def test_a_row_filter_prunes_the_plan(policy_server: str):
 
     # And the residual carries it, so a cooperating engine applies the same
     # restriction to the rows inside the file it reads.
-    assert tasks[0]["residual-filter"] == {
+    #
+    # The column is referenced **by field id**, not by name. That is the current
+    # spec spelling — `term`/`value` is deprecated in favour of `left`/`right`
+    # with an `IdReference` or a `NamedReference` — and it is the same form the
+    # table's `read-restrictions` publish, because both come from one function.
+    # A reader that applied the residual by name would lose it the moment
+    # somebody renamed the column.
+    residual = tasks[0]["residual-filter"]
+    assert residual == {
         "type": "eq",
-        "term": "region",
-        "value": "EU",
-    }
+        "left": {"type": "reference", "id": 2},
+        "right": {"type": "literal", "value": "EU"},
+    }, residual
 
 
 @pytest.mark.pyiceberg
