@@ -63,6 +63,15 @@ controls that make a claim check itself.
   HTML pages are deliberately excluded: they re-render on every site build, and a
   check that cries wolf is one nobody reads.
 
+### Security
+
+- **`rustls` 0.23.43 → 0.23.45**, for
+  [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285): TLS 1.3
+  handshake messages were accepted across encryption-level boundaries. The
+  transcript stays authenticated, so a handshake could not be altered or
+  completed by a network attacker; the effect is that a peer could send in
+  plaintext what should have been encrypted.
+
 ### Changed
 
 - **Breaking:** a location containing an empty path segment is now refused rather

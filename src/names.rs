@@ -589,9 +589,8 @@ mod tests {
     /// nothing to fail closed about.
     #[test]
     fn an_unreadable_chain_is_none_rather_than_an_error() {
-        let bare = format!("justaname");
         assert_eq!(parse_view_chain(""), None, "empty parameter");
-        assert_eq!(parse_view_chain(&bare), None, "no namespace");
+        assert_eq!(parse_view_chain("justaname"), None, "no namespace");
         assert_eq!(parse_view_chain("db%2"), None, "truncated escape");
         assert_eq!(parse_view_chain("db%ZZname"), None, "not hex");
     }

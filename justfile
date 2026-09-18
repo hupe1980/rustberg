@@ -87,7 +87,7 @@ test-clients:
 
 # Run clippy linter
 lint:
-    cargo clippy --all-features -- -D warnings
+    cargo clippy --all-targets --all-features -- -D warnings
 
 # Run clippy with fixes
 lint-fix:
