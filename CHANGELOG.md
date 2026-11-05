@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the major version is `0`, a minor bump may carry breaking changes.
 
+## [0.4.1] - 2026-11-05
+
+### Fixed
+
+- **Published to crates.io.** 0.4.0 shipped binaries, images and the Homebrew
+  formula, but not the crate; 0.4.1 is the same release, with it.
+
 ## [0.4.0] - 2026-11-05
 
 iceberg-rust 0.11, a built-in web console, and API keys a policy can name.

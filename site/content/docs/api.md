@@ -983,7 +983,7 @@ GET /ready
 ```json
 {
   "status": "ready",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "timestamp": 1704067200,
   "components": {
     "catalog": { "status": "ready" },

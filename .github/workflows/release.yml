@@ -272,4 +272,6 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
           RUSTBERG_REQUIRE_CONSOLE: "1"
-        run: cargo publish --locked --all-features
+        # --allow-dirty: ui/dist is git-ignored build output the package includes on
+        # purpose; the checkout is otherwise clean.
+        run: cargo publish --locked --all-features --allow-dirty

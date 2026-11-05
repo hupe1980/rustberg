@@ -189,7 +189,7 @@ docker-smoke tag="smoke":
 
 # Verify the crate package
 publish-dry:
-    cargo publish --dry-run --locked --all-features
+    RUSTBERG_REQUIRE_CONSOLE=1 cargo publish --dry-run --locked --all-features --allow-dirty
 
 # Tag and push a release; the release workflow builds and publishes it
 tag version:
