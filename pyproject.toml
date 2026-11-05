@@ -1,82 +1,29 @@
-# =============================================================================
-# Rustberg Python Integration Tests
-# =============================================================================
-# All Python tooling for Rustberg integration tests.
-# Use `uv sync` to install dependencies.
-# =============================================================================
+# The client conformance suites (tests/python). `just test-clients` runs them.
 
 [project]
 name = "rustberg-tests"
 version = "0.1.0"
-description = "Integration tests for Rustberg Iceberg REST Catalog"
-readme = "README.md"
+description = "Client conformance tests for the Rustberg Iceberg REST catalog"
+readme = "tests/python/README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0 OR MIT" }
 
 dependencies = [
-    # PyIceberg for REST catalog testing.
-    #
-    # `pyiceberg-core` is the Rust-backed transform kernel PyIceberg needs to
-    # *write* a table partitioned by anything but identity. Without it a
-    # `days(ts)` table — the most ordinary partition spec there is — cannot be
-    # appended to, so the suite could only ever cover string partitions, and the
-    # types whose JSON form differs from their literal went untested.
+    # pyiceberg-core: needed to write tables partitioned by anything but identity.
     "pyiceberg[pyiceberg-core]>=0.10.0",
-    # DuckDB for embedded analytics
     "duckdb>=1.2.0",
-    # PyArrow for data handling
     "pyarrow>=18.0.0",
-    # Testing framework
     "pytest>=9.0.0",
-    "pytest-asyncio>=1.0.0",
     "pytest-timeout>=2.4.0",
-    # HTTP client
     "httpx>=0.28.0",
-    # Testcontainers for Docker-based testing
-    "testcontainers>=4.0.0",
 ]
-
-[project.optional-dependencies]
-dev = [
-    "ruff>=0.14.0",
-    "mypy>=1.15.0",
-]
-
-# =============================================================================
-# Tool Configuration
-# =============================================================================
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
-asyncio_mode = "auto"
-asyncio_default_fixture_loop_scope = "session"
-timeout = 300  # 5 minute timeout per test
+timeout = 300
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
     "pyiceberg: marks tests using PyIceberg client",
     "duckdb: marks tests using DuckDB client",
-]
-
-[tool.ruff]
-line-length = 100
-target-version = "py312"
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "W", "B", "C4", "UP"]
-ignore = ["E501"]  # Line length handled by formatter
-
-[tool.ruff.format]
-quote-style = "double"
-
-[tool.mypy]
-python_version = "3.12"
-strict = true
-warn_return_any = true
-warn_unused_ignores = true
-
-[dependency-groups]
-dev = [
-    "ruff>=0.14.0",
-    "mypy>=1.15.0",
 ]

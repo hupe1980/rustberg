@@ -4,20 +4,18 @@ description = "Deploying Rustberg on Kubernetes: the Helm chart, replica shapes,
 weight = 11
 +++
 > **Use the Postgres catalog.** The embedded redb catalog is a file with an
-> exclusive lock, so a second pod cannot start — not even the extra pod a rolling
-> update creates. On Kubernetes, point `catalog_url` at Postgres and the replicas
-> are ordinary stateless pods. The Helm chart defaults to this.
+> exclusive lock, so a second pod cannot start, including the extra pod of a
+> rolling update. With `catalog_url` pointing at Postgres, replicas are ordinary
+> stateless pods. The Helm chart defaults to this.
 
 
 Production Kubernetes deployment: stateless replicas over a shared catalog.
 
 ## Overview
 
-Rustberg is designed for Kubernetes from the ground up:
-
 | Feature | Benefit |
 |---------|---------|
-| **~31 ms startup** | Fast rescheduling, near-instant readiness |
+| **~31 ms startup** | Fast rescheduling and readiness |
 | **~15 MB idle RSS** | Dense packing, low cost per replica |
 | **Stateless pods** | Catalog in Postgres, warehouse in object storage |
 | **No leader election** | Concurrency resolved by the database |
@@ -29,9 +27,8 @@ Startup and memory are measured; see [performance](@/docs/benchmarks.md).
 
 ## Helm Chart (Recommended)
 
-The easiest way to deploy Rustberg on Kubernetes is using the Helm chart included in the repository.
-
-> The Helm chart is not published to a registry. You must clone the repository to install it.
+The chart lives in the repository and is not published to a registry; clone the
+repository to install it.
 
 ### Installation
 
@@ -139,22 +136,20 @@ shutdown:
 
 ### Rolling updates without dropped requests
 
-Kubernetes removes a pod from its Service's endpoints and sends it `SIGTERM` **at
-the same time**, and the removal still has to reach every kube-proxy and ingress
-controller. A pod that stops accepting the instant it is signalled refuses
-whatever arrives in that window — connection errors on every rolling update.
+Kubernetes sends `SIGTERM` **while** removing the pod from Service endpoints,
+and kube-proxies and ingress controllers learn of the removal later. A pod that
+stops accepting at once refuses requests in that window.
 
-A `preStop` hook that sleeps cannot fix it here: the image is distroless, so
-there is no shell. Rustberg waits itself. After `SIGTERM` it keeps serving for
+The distroless image has no shell for a `preStop` sleep. Instead, after
+`SIGTERM` Rustberg keeps serving for
 `shutdown.drainDelaySeconds` (passed as `--shutdown-delay`), then drains
-in-flight requests, which get 30 seconds.
+in-flight requests for up to 30 seconds.
 
-`terminationGracePeriodSeconds` must cover the delay *plus* the drain, or the
-kubelet `SIGKILL`s the process partway through. The chart sets both.
-
-A readiness probe does not replace this — it fails once the pod stops answering,
-which is after the ingress has already routed to it. A `podDisruptionBudget`
-bounds how many pods drain at once.
+- `terminationGracePeriodSeconds` must cover the delay *plus* the drain, or the
+  kubelet `SIGKILL`s the process. The chart sets both.
+- A readiness probe does not replace the delay: it fails after the ingress has
+  already routed to the pod.
+- A `podDisruptionBudget` bounds how many pods drain at once.
 
 ### Helm Commands
 
@@ -175,7 +170,7 @@ helm upgrade rustberg charts/rustberg -f values.yaml
 helm uninstall rustberg
 ```
 
-For full Helm chart documentation, see [charts/rustberg/README.md](https://github.com/hupe1980/rustberg/tree/main/charts/rustberg).
+Full chart documentation: [charts/rustberg/README.md](https://github.com/hupe1980/rustberg/tree/main/charts/rustberg).
 
 ---
 
@@ -540,9 +535,9 @@ metadata:
 
 ### Enabling credential vending
 
-The `sts:AssumeRole` grant above lets the pod *reach* the vending role. It does
-not switch vending on — that needs a `[credentials]` section, or the endpoint
-answers `501` and clients fall back to their own storage credentials.
+The `sts:AssumeRole` grant only lets the pod *reach* the vending role. Vending
+needs a `[credentials]` section; otherwise the endpoint answers `501` and
+clients use their own storage credentials.
 
 ```yaml
 rustberg:
@@ -559,23 +554,17 @@ rustberg:
     duration_seconds = 3600
 ```
 
-Two roles, doing different jobs:
-
 | Role | Held by | Purpose |
 |---|---|---|
 | `rustberg-role` | the pod, via IRSA | Read and write catalog metadata |
 | `rustberg-vending` | assumed per request | Downscoped and handed to clients |
 
-`rustberg-vending` needs access to the whole warehouse; the inline session
-policy narrows each vended credential to the one table the client asked for. Its
-trust policy must allow `rustberg-role` to assume it.
-
-`allowed_prefixes` is unset here, so it defaults to the warehouse — which is
-what you want. Set it only to narrow vending further.
-
-A misconfigured section is a **startup failure**, not a silently degraded pod:
-the container will not become ready if the role is missing or an environment
-variable it names is unset.
+- `rustberg-vending` needs the whole warehouse; an inline session policy
+  narrows each credential to the requested table. Its trust policy must allow
+  `rustberg-role`.
+- `allowed_prefixes` defaults to the warehouse. Set it only to narrow vending.
+- A misconfigured section (missing role, unset environment variable) is a
+  **startup failure**: the container never becomes ready.
 
 ---
 
@@ -726,9 +715,7 @@ spec:
 
 ### Grafana
 
-There is no dashboard to import — a JSON blob in the repository goes stale
-against every Grafana release and against its own metric names. Build one from
-what `/metrics` actually exports:
+No dashboard is shipped. Build one from what `/metrics` exports:
 
 | Metric | Type | Labels |
 |---|---|---|
@@ -739,8 +726,8 @@ what `/metrics` actually exports:
 | `rustberg_auth_attempts_total` | counter | `method`, `result` |
 | `rustberg_rate_limit_exceeded_total` | counter | — |
 
-`curl http://<pod>:8000/metrics` is the authoritative list; it is what the
-`ServiceMonitor` above scrapes.
+`curl http://<pod>:8000/metrics` is the authoritative list (what the
+`ServiceMonitor` scrapes).
 
 ---
 
@@ -758,10 +745,9 @@ kubectl logs -l app=rustberg -n rustberg --tail=100
 
 ### S3 Permission Issues
 
-The image is **distroless** — no shell, no `aws`, no `curl` — so nothing can be
-`exec`d into it except the `rustberg` binary itself. To test the pod's
-credentials, run a throwaway pod with the *same* service account, which is what
-actually decides the identity:
+The **distroless** image has no shell, `aws` or `curl`; only `rustberg` can be
+`exec`d. Test from a throwaway pod with the *same* service account (it sets the
+identity):
 
 ```bash
 kubectl run s3-probe -n rustberg --rm -it --restart=Never \
@@ -770,13 +756,13 @@ kubectl run s3-probe -n rustberg --rm -it --restart=Never \
   -- s3 ls s3://my-bucket/rustberg-catalog/
 ```
 
-A `403` here and a `403` from Rustberg are the same problem; a success here and a
-failure there is a Rustberg configuration problem, not an IAM one.
+A `403` here is the same IAM problem. Success here but failure in Rustberg is a
+Rustberg configuration problem.
 
 ### Health Check Failures
 
-The readiness probe is an `httpGet` made by the kubelet, so it needs nothing
-inside the container. To ask the same question by hand:
+The readiness probe is a kubelet `httpGet`; it needs nothing in the container.
+By hand:
 
 ```bash
 # From outside — the probe's own view
@@ -788,9 +774,8 @@ curl -s localhost:8000/ready | jq
 kubectl exec deployment/rustberg -n rustberg -- rustberg healthcheck
 ```
 
-`/ready` names the component that is not ready — the catalog store or the
-warehouse — which is the part worth reading. `/health` only reports that the
-process is up.
+`/ready` names the component that is not ready (catalog store or warehouse).
+`/health` only reports that the process is up.
 
 ---
 
@@ -805,10 +790,10 @@ process is up.
 
 ### High Availability
 
-Rustberg achieves high availability through **optimistic concurrency control** rather than leader election:
+Rustberg uses **optimistic concurrency control**, not leader election:
 
 ```yaml
-# Deploy 3+ replicas for HA
+# Two or more replicas, with a Postgres catalog
 replicaCount: 2
 
 # Use pod anti-affinity to spread across nodes
@@ -826,19 +811,13 @@ affinity:
         topologyKey: kubernetes.io/hostname
 ```
 
-**How It Works:**
-- All pods accept writes simultaneously (no active/passive)
-- Version-based CAS prevents conflicting updates
-- Conflicts return `409` status and clients retry
-- No coordination overhead for reads
+- All pods are equal: each accepts writes and serves reads. No active/passive,
+  no failover, no replica to promote.
+- Version-based CAS prevents dual writes (no split-brain); conflicts return
+  `409` and clients retry.
+- Reads need no coordination; pod restarts have no impact.
 
-**Benefits:**
-- **No split-brain:** Version numbers prevent dual writes
-- **No leader failover:** All pods are equal
-- **Read scaling:** every pod serves reads; there is no replica to promote
-- **Automatic recovery:** Pod restarts have no impact
-
-> - Run **exactly 1 replica** with `strategy: Recreate`
+> - With the embedded redb catalog: **exactly 1 replica**, `strategy: Recreate`
 > - Use **PodDisruptionBudget** to prevent simultaneous pod loss
 > - Spread across **availability zones** with topology constraints
 > - Monitor **409 Conflict** rate in metrics (should be low)

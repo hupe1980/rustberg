@@ -41,7 +41,7 @@
 
 <section class="strip" aria-label="At a glance">
   <div class="strip__inner">
-    <div class="stat"><span class="stat__n">23&thinsp;µs</span><span class="stat__l">authorization, p99</span></div>
+    <div class="stat"><span class="stat__n">33&thinsp;µs</span><span class="stat__l">authorization, p99</span></div>
     <div class="stat"><span class="stat__n">&lt;&thinsp;1&thinsp;ms</span><span class="stat__l">loadTable, p99</span></div>
     <div class="stat"><span class="stat__n">~15&thinsp;MB</span><span class="stat__l">idle memory</span></div>
     <div class="stat"><span class="stat__n">0</span><span class="stat__l">required services</span></div>
@@ -136,6 +136,16 @@
         </p>
         <a class="pillar__link" href="{{ get_url(path='@/docs/storage.md') }}">Catalog and warehouse →</a>
       </article>
+
+      <article class="pillar">
+        <h3>A console that shows what you may see</h3>
+        <p>
+          Built into the binary at <code>/ui</code>. Every screen is drawn with your
+          own credential, so each table says whether it is restricted for you and
+          how. Policy is edited as a document: review the diff, save, undo.
+        </p>
+        <a class="pillar__link" href="{{ get_url(path='@/docs/console.md') }}">Tour the console →</a>
+      </article>
     </div>
   </div>
 </section>
@@ -157,7 +167,7 @@ permit(
 
 // A pipeline writes to one namespace, outside business hours only.
 permit(
-  principal == Rustberg::User::"svc-etl",
+  principal == Rustberg::ApiKey::"svc-etl",
   action    in [Rustberg::Action::"Create", Rustberg::Action::"Update"],
   resource  in Rustberg::Namespace::"acme\u{1F}analytics\u{1F}web"
 ) when { context.utc_hour &lt; 6 || context.utc_hour &gt; 20 };
@@ -208,7 +218,7 @@ forbid(
       </article>
       <article class="shape">
         <h3>Replicated</h3>
-        <p>Several stateless replicas over one Postgres catalog. Policies, keys and mount configuration live in the database, so every replica agrees.</p>
+        <p>Several stateless replicas over one Postgres catalog. Policy revisions live in the database, so every replica enforces the same rules.</p>
 <pre><code class="language-bash">rustberg \
   --catalog-url postgres://rustberg@db/rustberg \
   --warehouse   s3://acme/warehouse</code></pre>

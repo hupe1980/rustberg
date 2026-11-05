@@ -18,7 +18,7 @@ use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use serde::{Deserialize, Serialize};
 
 use super::middleware::AuthenticatedPrincipal;
-use super::principal::{AuthMethod, PrincipalType};
+use super::principal::AuthMethod;
 use crate::app::AppState;
 
 /// Response for `GET /auth/context`.
@@ -62,13 +62,7 @@ pub async fn get_auth_context(
     State(_state): State<AppState>,
     AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
 ) -> Result<Json<AuthContextResponse>, (StatusCode, &'static str)> {
-    let principal_type = match principal.principal_type() {
-        PrincipalType::User => "user",
-        PrincipalType::Service => "service",
-        PrincipalType::ApiKey => "api_key",
-        PrincipalType::System => "system",
-        PrincipalType::Anonymous => "anonymous",
-    };
+    let principal_type = principal.principal_type().as_str();
 
     let auth_method = match principal.auth_method() {
         AuthMethod::ApiKey => "api_key",
@@ -152,7 +146,7 @@ pub fn create_public_routes() -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::principal::PrincipalBuilder;
+    use crate::auth::principal::{PrincipalBuilder, PrincipalType};
 
     fn principal() -> crate::auth::Principal {
         PrincipalBuilder::new(

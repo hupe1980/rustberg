@@ -1,10 +1,10 @@
 +++
 title = "Library"
 description = "Using Rustberg as a Rust crate: the catalog, Cedar policy and credential vending in-process, no server."
-weight = 13
+weight = 14
 +++
-The catalog, the policy engine and credential vending as Rust types — the same
-operations the server exposes, authorized the same way, with no router.
+The catalog, policy engine and credential vending as Rust types: the server's
+operations, authorized the same way, with no router.
 
 ## Two ways in
 
@@ -24,17 +24,15 @@ From there, either:
 | `app.as_principal(p)` | A [`Session`](#a-session) — typed Rust, authorized | Your service holds the catalog itself |
 | `app.into_router()` | An `axum::Router` | You are serving the Iceberg REST API |
 
-They are the **same operations over the same authorization guard**, not two
-implementations. That matters more than it sounds: a second authorization path
-that enforces *almost* the same rules is worse than no second path, because it
-looks correct and nothing keeps it honest.
+Both are the **same operations over the same authorization guard**, not two
+implementations.
 
 ---
 
 ## A session
 
-A session binds a principal — one your own identity system has already
-authenticated — to the catalog.
+A session binds a principal, already authenticated by your identity system, to
+the catalog.
 
 ```rust
 use iceberg::{NamespaceIdent, TableIdent};
@@ -81,39 +79,35 @@ let edited = metadata
 session.commit_view(&summary, &location, edited).await?;
 ```
 
-`commit_view` takes the `location` that `load_view` returned, and that is the
-compare-and-swap witness rather than bookkeeping. The caller loads, edits and
-hands back a finished document, so the store cannot re-derive what the edit was
-based on — comparing against a read of its own would confirm a commit that landed
-in between rather than detect it. A stale location answers `409`; reload and
-re-apply.
+`commit_view` takes the `location` that `load_view` returned as its
+compare-and-swap witness. A stale location answers `409`; reload and re-apply.
 
 ### Authentication is yours
 
-Rustberg does not authenticate an in-process caller. Your host has already
-decided who it is and should not have to attach a JWKS client to say so.
+Rustberg does not authenticate an in-process caller; your host already has.
 
-If you also serve `app.into_router()`, that surface *does* need an authenticator,
-and one is installed for **every mechanism you configure**: `with_jwt_config` for
-OIDC, `build_with_api_keys` for API keys, `with_authenticator` for your own, and
-any combination of them tried in order. Configuring nothing leaves every caller
-anonymous — legitimate for an embedded host that never serves HTTP, and logged as
-a warning at startup so it is never a surprise. A mechanism that is configured but
-cannot be built (an OIDC config missing its audience, say) fails the `build()`
-rather than being quietly dropped.
+`app.into_router()` installs an authenticator for **every mechanism you
+configure**, tried in order:
 
-`tenant` is the load-bearing argument: every policy compares a resource's
-recorded owner against it, so passing the wrong one grants access across a tenant
-boundary. It is the **caller's** tenant, never the resource's.
+- `with_jwt_config`: OIDC
+- `build_with_api_keys`: API keys
+- `with_authenticator`: your own
 
-Roles become Cedar groups, so `.with_role("writer")` is what makes
+Configuring nothing leaves every caller anonymous and logs a warning at startup.
+A configured mechanism that cannot be built (e.g. OIDC without an audience) fails
+`build()`.
+
+`tenant` is the **caller's** tenant, never the resource's. Every policy compares
+a resource's recorded owner against it, so a wrong value grants cross-tenant
+access.
+
+Roles become Cedar groups: `.with_role("writer")` makes
 `principal in Rustberg::Group::"writer"` match.
 
 ### Policies that read the request context
 
-A policy conditioned on `context.source_ip` **fails closed** in-process, because
-there is genuinely no connection behind the call. If your host is itself serving
-a remote caller and wants policy to see that caller's address, forward it:
+A policy conditioned on `context.source_ip` **fails closed** in-process (there is
+no connection). To let policy see a remote caller's address, forward it:
 
 ```rust
 let session = app
@@ -127,22 +121,17 @@ let session = app
 
 Everything the endpoint of the same name enforces:
 
-- **Ownership resolution** — the tenant that owns the namespace decides, never
-  the caller's own claim about itself.
-- **The `404` rule** — a resource you cannot see is "not found", whether or not
-  it exists. A `403` only ever tells you something you already knew. This is
-  what stops the error code becoming an oracle for enumerating another tenant's
-  catalog.
-- **Listing filters** — `list_namespaces`, `list_tables` and `list_views` return
+- **Ownership resolution**: the tenant that owns the namespace decides, never
+  the caller's claim.
+- **The `404` rule**: a resource you cannot see is "not found", whether or not
+  it exists. A `403` only tells you something you already knew.
+- **Listing filters**: `list_namespaces`, `list_tables` and `list_views` return
   the subset you may read, filtered before the page is cut.
-- **Location confinement** — a `location` you supply to `create_table`, or a
-  `set-location` you commit, is confined to the prefix the table's own name puts
-  it in. Your host is the *server* here, not a trusted caller, so the check runs
-  on this side of the boundary too.
-- **The cross-tenant rename refusal** — a rename is not a way to move data
-  between tenants.
-- **Audit** — every decision is recorded, permit and deny alike, and a mutation
-  whose record cannot be written fails.
+- **Location confinement**: a `location` passed to `create_table`, or a committed
+  `set-location`, is confined to the prefix the table's name puts it in.
+- **Cross-tenant rename refusal**: a rename cannot move data between tenants.
+- **Audit**: every decision is recorded, permit and deny alike; a mutation whose
+  record cannot be written fails.
 
 ### Paging
 
@@ -165,18 +154,16 @@ loop {
 }
 ```
 
-Page until the token is **absent**, not until a page looks small. Filtering can
-empty a page whose successors still hold matches.
+Page until the token is **absent**; filtering can empty a page whose successors
+still hold matches.
 
-The token is opaque. One that Rustberg did not produce restarts the listing
-rather than seeking, so a hand-built token silently repeats work instead of doing
-what it looks like it does.
+The token is opaque. A token Rustberg did not produce restarts the listing.
 
 ---
 
 ## What a session deliberately does not do
 
-Four things exist only because HTTP does, and are absent:
+Four HTTP-only features are absent:
 
 | | Why |
 |---|---|
@@ -187,14 +174,13 @@ Four things exist only because HTTP does, and are absent:
 
 ### The one real asymmetry
 
-A table under a `@row_filter` or `@column_mask` is refused storage access
-over HTTP — that is [invariant 4](@/docs/security.md). In-process **there is
-no credential to withhold**, because your host already holds whatever storage
-access it has.
+Over HTTP, a table under a `@row_filter` or `@column_mask` is refused storage
+access ([invariant 4](@/docs/security.md)). In-process **there is no credential
+to withhold**: your host already has its storage access.
 
-So the restriction is *reported* rather than enforced, and a host that reads
-table files directly must check it. `row_filters` are Iceberg predicates, so a
-host that plans its own scan can conjoin them:
+The restriction is therefore *reported*, not enforced. A host that reads table
+files directly must check it; `row_filters` are Iceberg predicates a host
+planning its own scan can conjoin:
 
 ```rust
 let obligations = session.obligations_for(&events).await?;
@@ -209,15 +195,11 @@ if !obligations.is_empty() {
 }
 ```
 
-This is not an oversight that better API design would close. Rustberg is not in
-the data path of a caller that already has the bytes.
-
 ---
 
 ## Serving HTTP as well
 
-Both surfaces can be live at once — they share one catalog, one policy set and
-one audit stream:
+Both surfaces can run at once, sharing one catalog, policy set and audit stream:
 
 ```rust
 let session = app.as_principal(principal);       // in-process work

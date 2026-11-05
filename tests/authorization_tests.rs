@@ -679,6 +679,82 @@ async fn a_restricted_table_publishes_read_restrictions() {
     );
 }
 
+/// A `variant` column is a leaf like any other: it carries one field id and no
+/// nested ones, and a mask over it follows the same nullable/required rule. The
+/// specification defines its fixed value as an empty variant object, so
+/// `mask-to-fixed-value` is legal for the required one.
+#[tokio::test]
+async fn a_variant_column_is_served_and_masked() {
+    let policies = r#"
+        @column_mask("payload,envelope")
+        permit(principal in Rustberg::Group::"admin", action, resource)
+          when { resource.tenant == principal.tenant };
+    "#;
+
+    let (admin_key, admin_secret) = key("admin", "acme", &["admin"]);
+    let (app, _store) = app_with(policies, vec![admin_key]).await;
+
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces",
+        &admin_secret,
+        Some(serde_json::json!({ "namespace": ["ns"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/ns/tables",
+        &admin_secret,
+        Some(serde_json::json!({
+            "name": "events",
+            "schema": { "type": "struct", "fields": [
+                { "id": 1, "name": "id", "required": true, "type": "long" },
+                { "id": 2, "name": "payload", "required": false, "type": "variant" },
+                { "id": 3, "name": "envelope", "required": true, "type": "variant" }
+            ]},
+            "properties": { "format-version": "3" }
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a variant table must be creatable: {body}"
+    );
+
+    let (status, body) = request(
+        &app,
+        Method::GET,
+        "/v1/namespaces/ns/tables/events",
+        &admin_secret,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+
+    let projections = body["read-restrictions"]["required-column-projections"]
+        .as_array()
+        .unwrap_or_else(|| panic!("both masks must be published: {body}"))
+        .iter()
+        .map(|p| {
+            (
+                p["field-id"].as_i64().unwrap(),
+                p["action"].as_str().unwrap(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        projections,
+        [(2, "replace-with-null"), (3, "mask-to-fixed-value")].into(),
+        "{body}"
+    );
+}
+
 /// The lever that makes the restriction enforceable rather than advisory. The
 /// spec defines `scan-planning-mode: server` as *"Clients MUST use server-side
 /// scan planning"*, so a conforming client never reads a manifest for this table
@@ -1867,4 +1943,41 @@ async fn the_loose_location_scope_accepts_what_the_default_refuses() {
         body.contains("outside this catalog's warehouse"),
         "the refusal names the boundary it did apply: {body}"
     );
+}
+
+/// A policy names an API key by the name it was configured under — the same principal on every restart and
+/// every replica, which a per-boot identifier is not.
+#[tokio::test]
+async fn a_policy_names_an_api_key_by_its_name() {
+    let (svc, svc_secret) = key("svc-etl", "acme", &[]);
+    let (app, _) = app_with(
+        r#"permit(
+  principal == Rustberg::ApiKey::"svc-etl",
+  action == Rustberg::Action::"List",
+  resource
+);"#,
+        vec![svc],
+    )
+    .await;
+
+    let (status, body) = request(&app, Method::GET, "/v1/namespaces", &svc_secret, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Rotation: two secrets configured under one name are one principal, so the rule naming it admits both while
+/// the pipeline moves from the old to the new — no request is refused in between.
+#[tokio::test]
+async fn both_secrets_of_a_rotating_key_are_the_one_principal() {
+    let (old, old_secret) = key("svc-etl", "acme", &[]);
+    let (new, new_secret) = key("svc-etl", "acme", &[]);
+    let (app, _) = app_with(
+        r#"permit(principal == Rustberg::ApiKey::"svc-etl", action == Rustberg::Action::"List", resource);"#,
+        vec![old, new],
+    )
+    .await;
+
+    for secret in [&old_secret, &new_secret] {
+        let (status, body) = request(&app, Method::GET, "/v1/namespaces", secret, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
 }

@@ -14,6 +14,7 @@
 pub mod capabilities;
 pub mod federated;
 pub mod file_io;
+mod metadata_file;
 pub mod purge;
 mod redb;
 mod rest;

@@ -18,6 +18,8 @@ pub mod observability;
 pub mod predicate;
 pub mod remote_ip;
 pub mod server;
+#[cfg(feature = "ui")]
+pub mod ui;
 mod utils;
 
 pub use app::*;

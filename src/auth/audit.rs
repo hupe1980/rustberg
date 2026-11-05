@@ -176,6 +176,11 @@ pub struct AuditEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub principal_id: Option<String>,
 
+    /// What kind of principal that is (`api_key`, `user`, …): a key and a token subject may share a name and
+    /// are still two principals.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal_type: Option<String>,
+
     /// Tenant the principal belongs to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
@@ -275,6 +280,7 @@ impl AuditEvent {
             severity: AuditSeverity::of(outcome),
             operation: None,
             principal_id: None,
+            principal_type: None,
             tenant_id: None,
             client_ip: None,
             request_id: None,
@@ -391,6 +397,14 @@ impl AuditEvent {
     #[must_use]
     pub fn with_principal_id<S: Into<String>>(mut self, id: S) -> Self {
         self.principal_id = Some(id.into());
+        self
+    }
+
+    /// Sets the principal and its kind — what every record of an authenticated request carries.
+    #[must_use]
+    pub fn with_principal(mut self, principal: &crate::auth::Principal) -> Self {
+        self.principal_id = Some(principal.id().to_string());
+        self.principal_type = Some(principal.principal_type().as_str().to_string());
         self
     }
 

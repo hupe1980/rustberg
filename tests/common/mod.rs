@@ -339,6 +339,82 @@ pub async fn failed_requirement_is_a_commit_conflict(catalog: &dyn CatalogStore)
     );
 }
 
+/// The catalog writes a table's metadata files with its own storage role, so
+/// where it writes them cannot be a table property a caller sets. Every file
+/// lands under the table's own `metadata/` folder, the property stays on the
+/// table for engines, and no value of it — outside, inside, empty — fails the
+/// create or a commit.
+pub async fn write_metadata_path_does_not_move_the_catalogs_write(catalog: &dyn CatalogStore) {
+    use iceberg::TableUpdate;
+
+    const PROPERTY: &str = "write.metadata.path";
+
+    let ns = given_namespace(catalog, &["metadata_path_ns"]).await;
+    let creation = TableCreation::builder()
+        .name("events".to_string())
+        .schema(simple_schema())
+        .properties(HashMap::from([(
+            PROPERTY.to_string(),
+            "file:///elsewhere/other_tenant".to_string(),
+        )]))
+        .build();
+    let created = catalog
+        .create_table(&ns, creation)
+        .await
+        .expect("a table may be created with the property set");
+    let ident = TableIdent::new(ns, "events".to_string());
+
+    #[track_caller]
+    fn assert_inside(table: &iceberg::table::Table, versions: &mut Vec<i32>, what: &str) {
+        let root = format!("{}/metadata/", table.metadata().location());
+        let location = table.metadata_location().expect("a metadata location");
+        let name = location
+            .strip_prefix(&root)
+            .unwrap_or_else(|| panic!("{what}: wrote {location}, outside {root}"));
+        let version: i32 = name.split('-').next().unwrap().parse().unwrap();
+        assert!(
+            versions.last().is_none_or(|last| version > *last),
+            "{what}: version {version} after {versions:?}"
+        );
+        versions.push(version);
+    }
+
+    let mut versions = Vec::new();
+    assert_inside(&created, &mut versions, "create");
+    let mut last = created.metadata_location().map(str::to_string);
+
+    for value in ["file:///elsewhere/another_tenant", ""] {
+        let committed = catalog
+            .commit_table(
+                &ident,
+                vec![],
+                vec![TableUpdate::SetProperties {
+                    updates: [(PROPERTY.to_string(), value.to_string())].into(),
+                }],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("setting {PROPERTY} to {value:?} must not fail: {e}"));
+        assert_inside(&committed, &mut versions, &format!("commit with {value:?}"));
+        assert_eq!(
+            committed
+                .metadata()
+                .properties()
+                .get(PROPERTY)
+                .map(String::as_str),
+            Some(value),
+            "the property is the table's, and is kept as set"
+        );
+        last = committed.metadata_location().map(str::to_string);
+    }
+
+    let reloaded = catalog.load_table(&ident).await.expect("load");
+    assert_eq!(
+        reloaded.metadata_location(),
+        last.as_deref(),
+        "the registry points at the file the last commit wrote"
+    );
+}
+
 /// Listing must page over every table exactly once, with no repeats and no
 /// gaps, however small the page.
 pub async fn paging_visits_every_table_exactly_once(catalog: &dyn CatalogStore) {
@@ -1248,6 +1324,7 @@ where
         rename_onto_existing_table_is_already_exists,
         rename_missing_table_is_not_found,
         failed_requirement_is_a_commit_conflict,
+        write_metadata_path_does_not_move_the_catalogs_write,
         paging_visits_every_table_exactly_once,
         listing_returns_direct_children_only,
         // Views that need no warehouse

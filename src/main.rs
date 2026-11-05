@@ -598,6 +598,7 @@ fn apply_shared_config(
             builder = builder.with_rate_limit_config(rate_config);
         }
         builder = builder.with_cors_config(config.server.cors.clone());
+        builder = builder.with_console(config.server.ui.enabled);
         builder = builder.with_trusted_proxies(config.server.trusted_proxies.clone());
         builder = builder.with_credentials_config(config.credentials.clone());
     }
@@ -779,27 +780,29 @@ fn generate_api_key(name: &str, tenant: &str, roles_str: &str, description: Opti
     }
 
     let (key, plaintext) = builder.build();
+    let env: String = std::iter::once("RUSTBERG_KEY_".to_string())
+        .chain(key.name.chars().map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase().to_string()
+            } else {
+                "_".to_string()
+            }
+        }))
+        .collect();
 
-    println!("\n✅ API Key Generated Successfully");
-    println!("┌─────────────────────────────────────────────────────────┐");
-    println!("│ IMPORTANT: Save this key securely!                     │");
-    println!("│ It will NOT be shown again.                            │");
-    println!("└─────────────────────────────────────────────────────────┘\n");
-    println!("API Key:     {}", plaintext.as_str());
-    println!("Name:        {}", key.name);
-    println!("Tenant:      {}", key.tenant_id);
-    println!("Roles:       {:?}", key.roles);
-    println!("ID:          {}", key.id);
-    if let Some(desc) = key.description {
-        println!("Description: {}", desc);
+    // Everything an operator needs next, in the order they need it; the secret is shown once.
+    println!("\n✅ API key `{}` — shown once, store it now:\n", key.name);
+    println!("export {env}=\"{}\"\n", plaintext.as_str());
+    println!("Then add it to the configuration:\n");
+    if let Some(desc) = &key.description {
+        println!("# {desc}");
     }
-    println!("\n⚠️  Store this key in your environment as:");
-    println!("   export X_API_KEY=\"{}\"", plaintext.as_str());
-    println!();
-    println!("🔒 Security reminder: clear your shell history to avoid leaking the key:");
-    println!("   history -d $(history 1 | awk '{{print $1}}')   # bash");
-    println!("   fc -W                                         # zsh");
-    println!();
+    println!("[[server.auth.api_keys]]");
+    println!("name    = {:?}", key.name);
+    println!("tenant  = {:?}", key.tenant_id);
+    println!("roles   = {:?}", key.roles);
+    println!("key_env = {env:?}\n");
+    println!("A policy names it Rustberg::ApiKey::{:?}.\n", key.name);
 }
 
 /// Generates a self-signed TLS certificate.

@@ -31,7 +31,7 @@
 //! burst_size = 200
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::time::Duration;
 
@@ -68,6 +68,10 @@ pub struct ServerConfig {
     /// CORS configuration
     #[serde(default)]
     pub cors: CorsConfig,
+
+    /// The console at `/ui`.
+    #[serde(default)]
+    pub ui: UiConfig,
 
     /// Address ranges that are forwarding infrastructure rather than callers.
     ///
@@ -121,6 +125,7 @@ impl Default for ServerConfig {
             port: default_port(),
             auth: AuthConfig::default(),
             cors: CorsConfig::default(),
+            ui: UiConfig::default(),
             trusted_proxies: Vec::new(),
             shutdown_delay_seconds: 0,
         }
@@ -220,6 +225,16 @@ impl ApiKeyConfig {
             )));
         }
 
+        // The authenticator's own check, so a key that loads is a key that can authenticate.
+        crate::auth::ApiKeyAuthenticator::validate_key_format(&secret).map_err(|reason| {
+            ConfigError::ValidationError(format!(
+                "API key '{}': ${} is not a usable key ({reason}). A key is `rb_` followed by \
+                 10–61 characters of A–Z, a–z, 0–9, `-` or `_`, e.g. \
+                 \"rb_$(openssl rand -hex 24)\".",
+                self.name, self.key_env
+            ))
+        })?;
+
         // The same rule the JWT path applies to a claim, applied to a config
         // value — a tenant id is the first segment of every Cedar entity id
         // either way, and `acme␟analytics` would build the ids of tenant
@@ -228,6 +243,11 @@ impl ApiKeyConfig {
         // believes something about the deployment that is not true.
         crate::names::validate_tenant_id(&self.tenant)
             .map_err(|e| ConfigError::ValidationError(format!("API key '{}': {e}", self.name)))?;
+
+        // The name is the key's principal (`ApiKey::"<name>"`, the audit `principal_id`), so it is held to
+        // the rule a token's subject is. `{:?}` keeps a refused name from corrupting the log line.
+        crate::names::validate_principal_id(&self.name)
+            .map_err(|e| ConfigError::ValidationError(format!("API key {:?}: {e}", self.name)))?;
 
         // And the same rule for a role, which becomes `Group::"…"`. A token's
         // roles are *dropped* when they cannot be rendered, because the caller
@@ -332,6 +352,22 @@ impl From<JwtConfigSerde> for JwtConfig {
             jwks_cache_ttl: Duration::from_secs(config.jwks_cache_ttl_seconds),
             ..Default::default()
         }
+    }
+}
+
+/// The console at `/ui`. On by default: it grants nothing, since every request it makes is authorized
+/// like any client's. Has no effect without the `ui` feature.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiConfig {
+    /// Serve the console at `/ui`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -1046,6 +1082,32 @@ impl RustbergConfig {
     ///
     /// Returns [`ConfigError::ValidationError`] describing the first problem found.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        // Entries sharing a name are one principal with several secrets — how a key is rotated. One principal
+        // has one tenant and one set of roles, or which grants apply would depend on which secret was shown.
+        let mut seen: HashMap<&str, &ApiKeyConfig> = HashMap::new();
+        for key in &self.server.auth.api_keys {
+            let Some(first) = seen.insert(&key.name, key) else {
+                continue;
+            };
+            if first.tenant != key.tenant {
+                return Err(ConfigError::ValidationError(format!(
+                    "API key {:?} is configured twice with different tenants ({:?}, {:?}). Entries sharing a \
+                     name are one principal — two secrets for one key — so they must agree.",
+                    key.name, first.tenant, key.tenant
+                )));
+            }
+            let roles = |k: &ApiKeyConfig| k.roles.iter().cloned().collect::<BTreeSet<String>>();
+            if roles(first) != roles(key) {
+                return Err(ConfigError::ValidationError(format!(
+                    "API key {:?} is configured twice with different roles ({:?}, {:?}). Entries sharing a \
+                     name are one principal — two secrets for one key — so they must agree.",
+                    key.name,
+                    roles(first),
+                    roles(key)
+                )));
+            }
+        }
+
         // TLS needs both halves of the keypair, or neither.
         if self.tls.enabled && (self.tls.cert_path.is_none() != self.tls.key_path.is_none()) {
             return Err(ConfigError::ValidationError(
@@ -1099,6 +1161,7 @@ impl RustbergConfig {
                     api_keys: Vec::new(),
                 },
                 cors: CorsConfig::default(),
+                ui: UiConfig::default(),
                 trusted_proxies: Vec::new(),
                 shutdown_delay_seconds: 0,
             },
@@ -1265,6 +1328,7 @@ mod tests {
                     oauth2_server_uri: None,
                 }),
             },
+            ui: UiConfig::default(),
             cors: CorsConfig::default(),
             trusted_proxies: vec!["10.0.0.0/8".to_string()],
         };
@@ -1417,6 +1481,104 @@ key_env = "RUSTBERG_KEY_CI"
         assert!(
             err.to_string()
                 .contains("RUSTBERG_TEST_KEY_DEFINITELY_UNSET")
+        );
+    }
+
+    fn keys(entries: &[(&str, &str, &[&str])]) -> RustbergConfig {
+        let mut config = RustbergConfig::default();
+        config.server.auth.api_keys = entries
+            .iter()
+            .map(|(name, tenant, roles)| ApiKeyConfig {
+                name: (*name).into(),
+                tenant: (*tenant).into(),
+                roles: roles.iter().map(|r| (*r).to_string()).collect(),
+                key_env: format!("RUSTBERG_TEST_{name}"),
+            })
+            .collect();
+        config
+    }
+
+    /// Two entries sharing a name are one principal with two secrets — how a key is rotated without a refused
+    /// request — so they load, and both secrets authenticate as that one principal.
+    #[test]
+    fn entries_sharing_a_name_are_one_principal() {
+        let config = keys(&[
+            ("svc-etl", "acme", &["etl", "writer"]),
+            ("svc-etl", "acme", &["writer", "etl"]),
+        ]);
+        config.validate().expect("a rotation pair loads");
+
+        let entries = &config.server.auth.api_keys;
+        let (old, new) = (
+            entries[0].build_from(Some("rb_old_secret")).unwrap(),
+            entries[1].build_from(Some("rb_new_secret")).unwrap(),
+        );
+        assert_ne!(old.key_hash, new.key_hash);
+        assert_eq!(
+            (old.name.as_str(), old.tenant_id.as_str()),
+            (new.name.as_str(), new.tenant_id.as_str())
+        );
+    }
+
+    /// One principal cannot have two tenants or two role sets: a disagreeing pair is a configuration error that
+    /// names the key and both values, rather than a principal whose grants depend on which secret it showed.
+    #[test]
+    fn entries_sharing_a_name_must_agree() {
+        let tenants = keys(&[("svc-etl", "acme", &[]), ("svc-etl", "beta", &[])])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            tenants.contains("svc-etl") && tenants.contains("acme") && tenants.contains("beta"),
+            "{tenants}"
+        );
+
+        let roles = keys(&[
+            ("svc-etl", "acme", &["etl"]),
+            ("svc-etl", "acme", &["admin"]),
+        ])
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            roles.contains("svc-etl") && roles.contains("etl") && roles.contains("admin"),
+            "{roles}"
+        );
+    }
+
+    /// A key's name is its principal, written into every audit record, so it is held to the rule a token's
+    /// subject is.
+    #[test]
+    fn a_key_name_is_held_to_the_principal_rule() {
+        let cfg = ApiKeyConfig {
+            name: "svc\u{7}etl".into(),
+            tenant: "acme".into(),
+            roles: vec![],
+            key_env: "RUSTBERG_TEST_KEY_BELL".into(),
+        };
+        let err = cfg
+            .build_from(Some("rb_a_valid_secret"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("svc") && err.contains("U+0007"), "{err}");
+    }
+
+    /// A secret the authenticator would refuse on every request is refused at startup instead, naming the
+    /// key — `openssl rand -hex 32` alone lacks the `rb_` prefix.
+    #[test]
+    fn a_secret_that_could_never_authenticate_fails_startup() {
+        let cfg = ApiKeyConfig {
+            name: "ci".into(),
+            tenant: "acme".into(),
+            roles: vec![],
+            key_env: "RUSTBERG_TEST_KEY_HEX".into(),
+        };
+        let hex = "9f".repeat(32);
+        let err = cfg.build_from(Some(&hex)).unwrap_err().to_string();
+        assert!(err.contains("ci") && err.contains("rb_"), "{err}");
+        assert!(
+            cfg.build_from(Some(&format!("rb_{}", "9f".repeat(24))))
+                .is_ok()
         );
     }
 

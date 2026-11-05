@@ -1250,7 +1250,7 @@ fn record_signature(
     };
 
     let event = crate::auth::AuditEvent::request_sign(verb, &authorized.resource_path(), allowed)
-        .with_principal_id(authorized.principal().id())
+        .with_principal(authorized.principal())
         .with_tenant_id(authorized.principal().tenant_id())
         .with_optional_client_ip(authorized.request().source_ip)
         .with_optional_request_id(authorized.request().request_id.as_deref())

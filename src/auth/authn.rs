@@ -125,7 +125,7 @@ impl ApiKeyAuthenticator {
     /// Validates the format of an API key.
     ///
     /// Returns `Ok(())` if the key is valid, `Err` with a description otherwise.
-    fn validate_key_format(key: &str) -> std::result::Result<(), &'static str> {
+    pub(crate) fn validate_key_format(key: &str) -> std::result::Result<(), &'static str> {
         // Check length bounds (fast fail before any other processing)
         if key.len() > MAX_API_KEY_LENGTH {
             return Err("API key too long");
@@ -192,8 +192,10 @@ impl ApiKeyAuthenticator {
 
     /// Creates a principal from a validated API key.
     fn key_to_principal(api_key: &ApiKey) -> Principal {
+        // The configured name, not the per-secret id: it is what a policy names and the audit trail records,
+        // and it is the same on every start, every replica, and every secret configured under it.
         let mut builder = PrincipalBuilder::new(
-            api_key.id.to_string(),
+            api_key.name.clone(),
             api_key.name.clone(),
             PrincipalType::ApiKey,
             api_key.tenant_id.clone(),
@@ -328,6 +330,26 @@ impl Authenticator for ChainAuthenticator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One configured key, built twice — as two restarts or two replicas do — is one principal, named by the
+    /// key's name, of the key kind. Its per-secret identifier stays bookkeeping and never reaches policy.
+    #[test]
+    fn a_key_is_the_same_principal_on_every_build() {
+        let build = || {
+            super::super::store::ApiKeyBuilder::new("svc-etl", "acme")
+                .build_with_key("rb_same_secret")
+        };
+        let (first, second) = (build(), build());
+        assert_ne!(first.id, second.id, "the bookkeeping id is per build");
+
+        let (a, b) = (
+            ApiKeyAuthenticator::key_to_principal(&first),
+            ApiKeyAuthenticator::key_to_principal(&second),
+        );
+        assert_eq!(a.id(), "svc-etl");
+        assert_eq!(a.id(), b.id());
+        assert_eq!(*a.principal_type(), PrincipalType::ApiKey);
+    }
 
     #[tokio::test]
     async fn test_allow_all_authenticator() {

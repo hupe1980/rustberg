@@ -178,7 +178,7 @@ pub async fn auth_middleware(
 
             auth_state.auditor.record_lossy(
                 &AuditEvent::authentication(auth_method, true)
-                    .with_principal_id(principal.id())
+                    .with_principal(&principal)
                     .with_tenant_id(principal.tenant_id())
                     .with_optional_client_ip(client_ip)
                     .with_optional_request_id(request_id.as_deref()),
@@ -191,7 +191,7 @@ pub async fn auth_middleware(
             {
                 auth_state.auditor.record_lossy(
                     &AuditEvent::rate_limit("tenant")
-                        .with_principal_id(principal.id())
+                        .with_principal(&principal)
                         .with_tenant_id(principal.tenant_id())
                         .with_optional_client_ip(client_ip)
                         .with_optional_request_id(request_id.as_deref()),

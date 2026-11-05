@@ -1,141 +1,77 @@
-# Rustberg - Apache Iceberg REST Catalog
-# https://github.com/hupe1980/rustberg
-#
-# Run `just --list` to see all available recipes
+# Rustberg — `just --list` shows every recipe.
 
-# Default recipe - show help
 default:
     @just --list
 
-# ============================================================================
-# Development
-# ============================================================================
+# ── Develop ─────────────────────────────────────────────────────────────────
 
-# Build in debug mode
-build:
-    cargo build --all-features
-
-# Build in release mode
-build-release:
-    cargo build --release --all-features
-
-# Run the catalog server (development mode)
+# Run the server, e.g. `just run --dev --insecure-http`
 run *ARGS:
     cargo run --all-features -- {{ARGS}}
 
-# Run with hot reload (requires cargo-watch)
-watch:
-    cargo watch -x 'run --all-features'
+# Build the console into ui/dist, which the binary embeds (Node 24)
+ui:
+    cd ui && npm ci --no-audit --no-fund && npm run build
 
-# Clean build artifacts
-clean:
-    cargo clean
+# The console with live reload, against a server on port 8000
+ui-dev:
+    cd ui && npm run dev
 
-# ============================================================================
-# Testing
-# ============================================================================
+# Retake the console screenshots in the docs, from a real server (needs Chrome)
+shots: ui
+    cargo build
+    cd ui && npm run shots
 
-# Run all tests
+# ── Check ───────────────────────────────────────────────────────────────────
+
+# The local gate: format, clippy, tests, doc tests
+check: fmt-check lint test test-doc
+    @echo "✅ All checks passed!"
+
+# Formatting, as CI checks it
+fmt-check:
+    cargo fmt --all -- --check
+
+# Clippy over every target and feature, warnings denied
+lint:
+    cargo clippy --all-targets --all-features -- -D warnings
+
+# Every Rust test
 test:
     cargo test --all-features
 
-# Run tests with output
-test-verbose:
-    cargo test --all-features -- --nocapture
-
-# Run unit tests only
-test-unit:
-    cargo test --lib --all-features
-
-# Run integration tests only
-test-integration:
-    cargo test --test '*' --all-features
-
-# Run doc tests only
+# Doc tests
 test-doc:
     cargo test --doc --all-features
 
-# Run tests with coverage (requires cargo-llvm-cov)
-coverage:
-    cargo llvm-cov --all-features --html
-    @echo "Coverage report: target/llvm-cov/html/index.html"
-
-# Run ignored tests (requires Docker)
-test-ignored:
-    cargo test --all-features -- --ignored
-
-# Run Trino integration tests
-test-trino:
-    cargo test --test trino_integration_tests --all-features -- --ignored --nocapture
-
-# Run the Postgres catalog and two-replica suites (requires Docker)
-test-postgres:
-    cargo test --all-features --test postgres_catalog_tests --test clustered_tests -- --ignored
-
-# Run the performance gate the way CI does
-test-perf:
-    cargo test --release --all-features --test performance_tests -- --ignored --nocapture --test-threads=1
-
-# Run the client conformance suites against a freshly built binary
+# PyIceberg and DuckDB against a freshly built binary
 test-clients:
     cargo build --all-features
     RUSTBERG_BINARY=target/debug/rustberg uv run pytest tests/python -v --tb=short
 
-# ============================================================================
-# Code Quality
-# ============================================================================
+# The console's types, components, contrast and accessibility
+ui-test:
+    cd ui && npm run check && npm test
 
-# Run clippy linter
-lint:
-    cargo clippy --all-targets --all-features -- -D warnings
+# The Postgres catalog and two-replica suites (Docker)
+test-postgres:
+    cargo test --all-features --test postgres_catalog_tests --test clustered_tests -- --ignored
 
-# Run clippy with fixes
-lint-fix:
-    cargo clippy --all-features --fix --allow-dirty
+# Trino against the binary (Docker)
+test-trino:
+    cargo test --test trino_integration_tests --all-features -- --ignored --nocapture
 
-# Format code
-fmt:
-    cargo fmt --all
+# The performance gate, as CI runs it
+test-perf:
+    cargo test --release --all-features --test performance_tests -- --ignored --nocapture --test-threads=1
 
-# Check formatting
-fmt-check:
-    cargo fmt --all -- --check
-
-# Run all checks (CI simulation)
-check: fmt-check lint test test-doc
-    @echo "✅ All checks passed!"
-
-# The same script the daily `spec-drift` CI job runs. It needs no local corpus —
-# it compares digests against .github/spec-pins.toml — so it answers on a bare
-# checkout as well as on a working tree.
-#
-# Has an upstream specification moved since it was last retrieved?
-spec-check:
-    ./.github/spec-drift.sh
-
-# Deliberately a separate recipe from `spec-check`, and never run by CI: making
-# the check pass is one keystroke away from the check meaning nothing. Read the
-# diff first.
-#
-# Re-stamp the pinned specification digests, after reading what changed.
-spec-pins:
-    ./.github/spec-drift.sh --update
-
-# Check every optional feature on its own
+# Every optional feature builds on its own
 features:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Cargo features are additive and unify across a dependency graph, so a
-    # feature that compiles under --all-features can be broken alone: some other
-    # crate was switching on the thing it needed. --all-features and
-    # --no-default-features are the two ends of the range, and the middle is
-    # where that breaks.
-    #
-    # The list is read from Cargo.toml rather than written here. A hardcoded one
-    # silently stops covering the feature added after it — which is how
-    # `remote-signing` went unchecked while this recipe claimed to check
-    # everything. `default` and `storage-all` are skipped: both are aggregates
-    # of entries already in the list, so checking them proves nothing new.
+    # Features unify across the graph, so one can build under --all-features and
+    # fail alone. The list is read from Cargo.toml (aggregates skipped), so a new
+    # feature is covered without editing this.
     cargo check --no-default-features
     features=$(cargo metadata --no-deps --format-version 1 \
       | python3 -c 'import json,sys; print(" ".join(
@@ -148,7 +84,7 @@ features:
     cargo check --quiet --all-features
     echo "✅ Every feature builds alone: $features"
 
-# Verify the crate still compiles on its declared minimum Rust version
+# The crate builds on its declared minimum Rust version
 msrv:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -160,36 +96,25 @@ msrv:
     rustup run "$msrv" cargo check --all-features
     echo "✅ Builds on $msrv"
 
-# Security audit
-# Advisories, using the same tool and ignore list the CI gate uses.
-audit:
-    cargo deny --all-features check advisories
-
-# Check for outdated dependencies
-outdated:
-    cargo outdated
-
-# Deny check (advisories, bans, licences, sources).
-#
-# `--all-features`, because the ban list is what keeps OpenSSL and native-tls
-# out of *every* feature combination, and it can only do that over a graph that
-# has the optional dependencies in it.
+# Advisories, licences, bans and sources (deny.toml), over every feature
 deny:
     cargo deny --all-features check
 
-# ============================================================================
-# Documentation
-# ============================================================================
-
-# Build documentation, failing on a broken intra-doc link as CI does
+# Rustdoc, failing on a broken link as CI does
 doc:
     RUSTDOCFLAGS=-Dwarnings cargo doc --all-features --no-deps --open
 
-# ============================================================================
-# Site
-# ============================================================================
+# Has a pinned upstream Iceberg specification moved? (.github/spec-pins.toml)
+spec-check:
+    ./.github/spec-drift.sh
 
-# Serve the site locally with live reload (requires zola)
+# Re-stamp the pinned digests — only after reading what changed
+spec-pins:
+    ./.github/spec-drift.sh --update
+
+# ── Site ────────────────────────────────────────────────────────────────────
+
+# Serve the docs site with live reload (zola)
 site:
     cd site && zola serve
 
@@ -197,7 +122,7 @@ site:
 site-build:
     cd site && zola build
 
-# Validate every internal and external link on the site
+# Check every internal and external link
 site-check:
     cd site && zola check
 
@@ -205,11 +130,7 @@ site-check:
 site-syntax: site-build
     #!/usr/bin/env bash
     set -euo pipefail
-    # Zola's `class` highlighting stamps both theme class sets onto every token,
-    # so light and dark cannot be selected with two `<link media>` elements —
-    # that follows the OS preference and breaks the moment a reader uses the
-    # theme toggle. Wrapping each theme in a mixin lets one stylesheet scope
-    # them; see the header this writes into the generated file.
+    # Why mixins rather than two stylesheets: see the header written below.
     cd site
     out=sass/_syntax.scss
     cat > "$out" <<'NOTES'
@@ -239,146 +160,38 @@ site-syntax: site-build
     done
     echo "regenerated site/sass/_syntax.scss"
 
-# ============================================================================
-# Release
-# ============================================================================
+# ── Release ─────────────────────────────────────────────────────────────────
 
-# Create a release build for current platform
-release:
-    cargo build --release --all-features
-    @echo "Binary: target/release/rustberg"
-    @ls -lh target/release/rustberg
-
-# Build release for all platforms (requires cross)
-release-all:
-    @echo "Building for Linux x86_64..."
-    cross build --release --all-features --target x86_64-unknown-linux-gnu
-    @echo "Building for Linux ARM64..."
-    cross build --release --all-features --target aarch64-unknown-linux-gnu
-    @echo "Building for macOS x86_64..."
-    cross build --release --all-features --target x86_64-apple-darwin
-    @echo "Building for macOS ARM64..."
-    cross build --release --all-features --target aarch64-apple-darwin
-
-# Build Docker image
-docker-build tag="latest":
-    docker build -t rustberg:{{tag}} .
-
-# Start the image the way the README says to, and check that it serves
+# Build the image and check it starts, reports healthy and serves
 docker-smoke tag="smoke":
     #!/usr/bin/env bash
     set -euo pipefail
-    # `--version` and `--help` prove the binary links; they do not prove the
-    # image *starts*, which is a different question and the one that has been
-    # wrong before. This is what CI runs.
+    # Proves the image starts and serves, not just that the binary links. CI runs this.
     docker build -t rustberg:{{tag}} .
     docker rm -f rustberg-smoke >/dev/null 2>&1 || true
     docker run -d --name rustberg-smoke -p 8000:8000 \
       -e RUSTBERG_INSECURE_HTTP=true rustberg:{{tag}}
     trap 'docker rm -f rustberg-smoke >/dev/null 2>&1 || true' EXIT
     for _ in $(seq 1 30); do
-      state=$(docker inspect -f '{{{{.State.Health.Status}}}}' rustberg-smoke)
+      state=$(docker inspect -f '{{{{.State.Health.Status}}' rustberg-smoke)
       [ "$state" = healthy ] && break
       [ "$state" = unhealthy ] && break
       sleep 2
     done
     docker logs rustberg-smoke
-    test "$(docker inspect -f '{{{{.State.Health.Status}}}}' rustberg-smoke)" = healthy
+    test "$(docker inspect -f '{{{{.State.Health.Status}}' rustberg-smoke)" = healthy
     # Authentication is on by default, so 401 is the proof that the router is
     # serving — a connection refused or a 500 would not be.
-    code=$(curl -s -o /dev/null -w '%{{{{http_code}}}}' http://localhost:8000/v1/config)
+    code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/v1/config)
     echo "GET /v1/config -> $code"
     test "$code" = 401
     echo "✅ the image starts, reports healthy, and serves"
 
-# Push Docker image
-docker-push tag="latest" registry="ghcr.io/hupe1980":
-    docker tag rustberg:{{tag}} {{registry}}/rustberg:{{tag}}
-    docker push {{registry}}/rustberg:{{tag}}
-
-# ============================================================================
-# Kubernetes / Helm
-# ============================================================================
-
-# Lint Helm chart
-helm-lint:
-    helm lint charts/rustberg
-
-# Template Helm chart (dry-run)
-helm-template:
-    helm template rustberg charts/rustberg
-
-# Install Helm chart locally
-helm-install namespace="default":
-    helm install rustberg charts/rustberg -n {{namespace}}
-
-# Upgrade Helm chart
-helm-upgrade namespace="default":
-    helm upgrade rustberg charts/rustberg -n {{namespace}}
-
-# Uninstall Helm chart
-helm-uninstall namespace="default":
-    helm uninstall rustberg -n {{namespace}}
-
-# Package Helm chart
-helm-package:
-    helm package charts/rustberg
-
-# ============================================================================
-# Development Utilities
-# ============================================================================
-
-# Start a local MinIO for S3 testing
-minio:
-    docker run -d --name minio \
-        -p 9000:9000 -p 9001:9001 \
-        -e MINIO_ROOT_USER=minioadmin \
-        -e MINIO_ROOT_PASSWORD=minioadmin \
-        minio/minio server /data --console-address ":9001"
-    @echo "MinIO started: http://localhost:9001 (minioadmin/minioadmin)"
-
-# Stop all dev containers
-dev-stop:
-    docker stop minio 2>/dev/null || true
-    docker rm minio 2>/dev/null || true
-
-# Generate self-signed TLS certificate
-gen-cert:
-    cargo run --all-features -- generate-cert \
-        --common-name localhost \
-        --output-dir ./certs
-
-# Show project statistics
-stats:
-    @echo "=== Lines of Code ==="
-    @tokei src tests
-    @echo ""
-    @echo "=== Binary Size ==="
-    @ls -lh target/release/rustberg 2>/dev/null || echo "Run 'just release' first"
-    @echo ""
-    @echo "=== Dependencies ==="
-    @cargo tree --depth 1 | wc -l | xargs echo "Direct dependencies:"
-
-# ============================================================================
-# CI/CD Helpers
-# ============================================================================
-
-# Prepare for release (run all checks)
-pre-release version: check
-    @echo "Preparing release {{version}}..."
-    @grep -q "version = \"{{version}}\"" Cargo.toml || \
-        (echo "ERROR: Update version in Cargo.toml first" && exit 1)
-    @echo "✅ Ready for release {{version}}"
-
-# Publish to crates.io (dry-run)
+# Verify the crate package
 publish-dry:
-    cargo publish --dry-run --all-features
+    cargo publish --dry-run --locked --all-features
 
-# Publish to crates.io
-publish:
-    cargo publish --all-features
-
-# Create git tag
+# Tag and push a release; the release workflow builds and publishes it
 tag version:
     git tag -a v{{version}} -m "Release v{{version}}"
     git push origin v{{version}}

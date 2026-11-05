@@ -297,7 +297,7 @@ fn record_vend(
     let granted_write = matches!(outcome, Delegated::Granted(_)) && write_access == Some(true);
     let mut event =
         crate::auth::AuditEvent::credential_vend(access, &authorized.resource_path(), result)
-            .with_principal_id(authorized.principal().id())
+            .with_principal(authorized.principal())
             .with_tenant_id(authorized.principal().tenant_id())
             .with_optional_client_ip(authorized.request().source_ip)
             .with_optional_request_id(authorized.request().request_id.as_deref());

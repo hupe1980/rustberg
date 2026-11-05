@@ -5,10 +5,7 @@
 # Reads `.github/spec-pins.toml`; see that file for why this pins digests rather
 # than committing the documents, and for what to do when it fires.
 #
-# One implementation, two callers: the daily `spec-drift` job in
-# `security.yml`, and `just spec-check` for a maintainer who wants the answer
-# now. A second copy of this logic would be one edit away from the two
-# disagreeing about whether the tree is current.
+# Run by `just spec-check` (and `just spec-pins` with --update).
 #
 #   --update   rewrite the digests in place instead of failing, for use after
 #              the change has been read. Never run this from CI.

@@ -153,7 +153,7 @@ pub async fn purge_table_data(table: &Table) -> Result<()> {
     // deployment that points two tables at one set of files has said so, and a
     // purge must not act on the assumption it did not.
     let mut skipped = 0usize;
-    if metadata.table_properties()?.gc_enabled {
+    if deletes_data_files(&metadata)? {
         let (data_files, unreadable_manifests) = read_data_file_paths(table, &manifests).await;
         unreadable += unreadable_manifests;
         skipped += delete_confined(table, &root, data_files).await?;
@@ -230,6 +230,13 @@ pub async fn purge_table_data(table: &Table) -> Result<()> {
 /// the purge. Said once, at the moment it becomes true, because "the purge left
 /// data behind" and "this table writes its data somewhere else" are the same
 /// fact and an operator reading only the first cannot get to the second.
+/// Whether a purge may delete the table's data files: the table's own
+/// `gc.enabled`, default `true`. A value that does not parse is an error rather
+/// than a guess, because either guess is wrong for somebody.
+fn deletes_data_files(metadata: &iceberg::spec::TableMetadata) -> Result<bool> {
+    metadata.table_properties().gc_enabled()
+}
+
 fn warn_about_write_paths(table: &Table) {
     let metadata = table.metadata();
     let location = metadata.location();
@@ -376,4 +383,49 @@ async fn read_data_file_paths(table: &Table, manifests: &HashSet<String>) -> (Ve
     }
 
     (paths, unreadable)
+}
+
+#[cfg(test)]
+mod gc_tests {
+    use std::collections::HashMap;
+
+    use iceberg::TableCreation;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, TableMetadataBuilder, Type};
+
+    use super::deletes_data_files;
+
+    fn with_gc(value: Option<&str>) -> iceberg::spec::TableMetadata {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+        let properties: HashMap<String, String> = value
+            .map(|v| [("gc.enabled".to_string(), v.to_string())].into())
+            .unwrap_or_default();
+        let creation = TableCreation::builder()
+            .name("t".to_string())
+            .location("file:///wh/db/t".to_string())
+            .schema(schema)
+            .properties(properties)
+            .build();
+        TableMetadataBuilder::from_table_creation(creation)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata
+    }
+
+    #[test]
+    fn data_files_are_deleted_unless_the_table_says_otherwise() {
+        assert!(deletes_data_files(&with_gc(None)).unwrap());
+        assert!(deletes_data_files(&with_gc(Some("true"))).unwrap());
+        assert!(!deletes_data_files(&with_gc(Some("false"))).unwrap());
+    }
+
+    #[test]
+    fn an_unparseable_gc_enabled_is_an_error_not_a_guess() {
+        assert!(deletes_data_files(&with_gc(Some("maybe"))).is_err());
+    }
 }

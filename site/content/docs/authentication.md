@@ -5,35 +5,27 @@ weight = 3
 +++
 ## Rustberg does not issue tokens
 
-There is no working `/v1/oauth/tokens`. The Iceberg REST spec marks that endpoint
-**deprecated for removal** and says: *"It is not recommended to implement this
-endpoint, unless you are fully aware of the potential security implications."* It
-leaves the spec in Iceberg 2.0.
+There is no working `/v1/oauth/tokens`: the Iceberg REST spec marks it
+**deprecated for removal**, advises against implementing it, and drops it in
+Iceberg 2.0. Token lifetime and revocation belong to your identity provider.
 
-The reasoning is the same as Rustberg's own: a catalog that mints the credentials
-it also validates has become an authorization server, and token lifetime and
-revocation belong to the identity provider that owns them.
-
-Two consequences for client configuration:
+Configure clients as follows:
 
 | You have | Use |
 |----------|-----|
 | An API key | The client's **`token`** property |
 | OIDC | `oauth2-server-uri` pointing at **your identity provider's** token endpoint |
 
-**Do not use `credential`.** That property makes the client perform an OAuth2
-client-credentials exchange against the catalog, which fails before any catalog
-call. Requesting a token from Rustberg returns `501` with this explanation rather
-than a bare `401`.
+**Do not use `credential`.** It triggers an OAuth2 client-credentials exchange
+against the catalog, which fails before any catalog call: Rustberg returns `501`
+with an explanation, not a bare `401`.
 
-When `[server.auth.jwt].oauth2_server_uri` is configured, `/v1/config` advertises
-it as `oauth2-server-uri`, so a client given only the catalog URI can find where
-to authenticate.
+When `[server.auth.jwt].oauth2_server_uri` is set, `/v1/config` advertises it as
+`oauth2-server-uri`, so a client given only the catalog URI can find where to
+authenticate.
 
 
 ## Overview
-
-Rustberg supports multiple authentication mechanisms:
 
 | Method | Use Case | Production Ready |
 |--------|----------|------------------|
@@ -41,7 +33,7 @@ Rustberg supports multiple authentication mechanisms:
 | **JWT/OIDC** | User authentication, SSO | ✅ Ready |
 | **Chain Auth** | JWT with API Key fallback | ✅ Ready |
 
-> All authentication is **required by default**. Anonymous access must be explicitly enabled (not recommended).
+> Authentication is **required by default**. Anonymous access must be explicitly enabled (not recommended).
 
 ---
 
@@ -66,77 +58,47 @@ Rustberg supports multiple authentication mechanisms:
 
 #### Why not a password KDF
 
-A password KDF makes each guess expensive, which matters when the secret is
-low-entropy: a human-chosen password has perhaps 30 bits, so an attacker holding
-the hash can enumerate the space. A Rustberg API key has 256 bits of uniform
-entropy — there is nothing to enumerate.
+A work factor protects low-entropy secrets such as passwords. A key with 256
+bits of uniform entropy has nothing to enumerate, so a work factor would only
+cost the server on every request, including unauthenticated ones: Argon2id at
+OWASP parameters (19 MiB, two passes) would be a memory-hard amplification
+primitive.
 
-So a work factor multiplies an already-impossible search by a constant, while the
-*server* pays that constant on every authenticated request, and on requests
-bearing no valid key at all. Argon2id at OWASP password parameters (19 MiB, two
-passes) would hand unauthenticated callers a memory-hard amplification primitive.
-
-SHA-256 over a high-entropy bearer token is what GitHub, Stripe and AWS do. No
-salt: salting defeats precomputation across a shared, low-entropy input space,
-and there is no such space here.
+No salt: there is no shared, low-entropy input space to precompute.
 
 ### Performance
 
-Verification takes **~0.55 µs**, measured with `rustberg bench` — cheap
-enough that caching results would only add a window in which a rotated key keeps
-working.
+Verification is one SHA-256 and a constant-time compare, so results are not
+cached; a cache would only let a rotated key keep working longer.
 
 ### Creating API Keys
 
-#### Programmatic (Recommended)
-
-```rust
-use rustberg::auth::ApiKeyStore;
-
-// Create store (in-memory or persistent)
-let store = ApiKeyStore::new();
-
-// Generate new API key
-let (key_id, plaintext) = store.create_key(
-    "spark-etl",           // name
-    Some("tenant-123"),    // tenant_id
-    vec!["data-writer"],   // roles
-).await?;
-
-// plaintext = "rb_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-// Store this securely! It cannot be retrieved later.
-```
-
-#### CLI Tool
-
 ```bash
-# Generate API key (outputs to stdout)
-./rustberg generate-key \
-    --name "spark-etl" \
-    --tenant "tenant-123" \
-    --roles "data-writer,data-reader"
+./rustberg generate-key --name spark-etl --tenant acme --roles writer
 ```
+
+It prints the secret once, as an `export`, and the `[[server.auth.api_keys]]`
+entry to paste into the configuration. A key is `rb_` followed by 10–61
+URL-safe characters; a secret that is not one fails startup.
 
 ### Using API Keys
 
 ```bash
-# HTTP Header
+# A bearer token, as Iceberg clients send it (X-API-Key works too)
 curl -H "Authorization: Bearer rb_..." \
      http://localhost:8000/v1/namespaces
-
-# Query parameter (not recommended)
-# Credentials are read from headers only — never a query parameter, which
-# would land the secret in access logs and browser history.
 ```
+
+Credentials are read from headers only, never from a query parameter.
 
 ### Configuring API keys
 
-API keys are **configuration, not state**. There is no key store: nothing to
-encrypt at rest, back up, or guard with a "who may mint keys" policy. Rotation is
+API keys are **configuration, not state**: no key store to encrypt, back up, or
+guard with a "who may mint keys" policy. Adding, rotating or revoking a key is
 a config change plus a restart.
 
-The secret itself lives in an environment variable, so the config file holds no
-usable credential and can be committed:
+The secret lives in an environment variable, so the config file can be
+committed:
 
 ```toml
 [[server.auth.api_keys]]
@@ -153,18 +115,42 @@ key_env = "RUSTBERG_KEY_ANALYTICS"
 ```
 
 ```bash
-export RUSTBERG_KEY_CI="$(openssl rand -hex 32)"
-export RUSTBERG_KEY_ANALYTICS="$(openssl rand -hex 32)"
+export RUSTBERG_KEY_CI="rb_$(openssl rand -hex 24)"
+export RUSTBERG_KEY_ANALYTICS="rb_$(openssl rand -hex 24)"
 ```
 
-The plaintext is hashed at startup and never retained, so the running
-process holds no usable credential either.
+The plaintext is hashed at startup and never retained.
 
-A referenced variable that is unset or empty is a **startup failure**. That is
-deliberate: a key that silently does not exist is indistinguishable from one
-revoked on purpose, and the difference matters when you are debugging a 401.
+A referenced variable that is unset or empty is a **startup failure**, so a
+missing key is never mistaken for a revoked one.
 
 `roles` become Cedar groups — see [authorization](@/docs/authorization.md).
+
+**The name is the principal.** A key authenticates as
+`Rustberg::ApiKey::"<name>"` — a separate kind from a token subject,
+`Rustberg::User::"<sub>"`. Policies, the audit trail and policy history use that
+name, stable across restarts and replicas. A name follows the token-subject rule
+(no control or formatting characters); breaking it is a startup failure.
+
+**Rotating a key** uses two entries with the same name and different secrets:
+add the new one, deploy, move the client over, then delete the old entry. Both
+secrets are the one principal, so no request is refused and the audit trail is
+unbroken. Entries sharing a name must agree on
+`tenant` and `roles`, or startup fails.
+
+```toml
+[[server.auth.api_keys]]          # the secret being retired
+name    = "ci-pipeline"
+tenant  = "acme"
+roles   = ["writer"]
+key_env = "RUSTBERG_KEY_CI"
+
+[[server.auth.api_keys]]          # its replacement
+name    = "ci-pipeline"
+tenant  = "acme"
+roles   = ["writer"]
+key_env = "RUSTBERG_KEY_CI_NEXT"
+```
 
 ### Embedding
 
@@ -184,19 +170,18 @@ let (app, _keys) = App::builder()
 
 ### Revocation
 
-Remove the entry (or unset its variable) and restart. For a deployment that is
-already single-writer with `strategy: Recreate`, that is a few seconds.
+Remove the entry and restart — a few seconds for a
+single-writer deployment with `strategy: Recreate`.
 
-If you need revocation without a restart, use **OIDC/JWT** instead — token
-lifetime and revocation are then the identity provider's job, which is where that
-responsibility belongs.
+For revocation without a restart, use **OIDC/JWT**: the identity provider then
+owns token lifetime and revocation.
+
 ## JWT Authentication
 
 ### Naming the provider is enough
 
-Rustberg validates JWTs against your identity provider's published signing keys,
-and finds them by reading the issuer's discovery document. Two values are
-required:
+Rustberg finds the signing keys through the issuer's discovery document. Two
+values are required:
 
 ```toml
 [server.auth]
@@ -207,30 +192,25 @@ issuer    = "https://auth.example.com"
 audiences = ["rustberg-catalog"]
 ```
 
-At the first token that needs a key, Rustberg fetches
-`https://auth.example.com/.well-known/openid-configuration` and takes `jwks_uri`
-from it. The document names the issuer it describes, and Rustberg **checks that
-it matches the one you configured**: taking signing keys from a document naming
-another issuer would make every token that issuer signs valid here. Redirects are
-not followed, for the same reason.
+On the first token that needs a key, Rustberg fetches
+`https://auth.example.com/.well-known/openid-configuration` and reads
+`jwks_uri`. It **checks the document's issuer matches the configured one** and
+does not follow redirects, so another issuer's tokens are never valid here.
 
-Discovery is lazy, so a provider that is unreachable when the pod starts does not
-stop it starting.
+Discovery is lazy: an unreachable provider does not stop the pod starting.
 
 ### More than one audience
 
-A token is accepted when its `aud` matches any entry. That is the ordinary case:
-an identity provider registers one client per application, so Spark, Trino and a
-notebook are three audiences reaching one catalog.
+A token is accepted when its `aud` matches any entry (e.g. Spark, Trino and a
+notebook as three registered clients).
 
-The list must not be empty — that means *check nothing*, which accepts every
-token your issuer has minted, including ones addressed to other services.
-Rustberg refuses to start rather than accept it.
+An empty list is a startup failure: it would accept every token your issuer
+mints, including ones for other services.
 
 ### Setting the JWKS URL explicitly
 
-Skip discovery by naming the endpoint. Useful for a provider with a non-standard
-document layout, or where the discovery document is not reachable:
+Name the endpoint to skip discovery — for a provider whose discovery document is
+non-standard or unreachable:
 
 ```toml
 [server.auth]
@@ -249,22 +229,18 @@ jwks_cache_ttl_seconds = 3600
 
 ### Signature algorithms
 
-The default is **RS256, ES256 and EdDSA**, so a provider that rotates from RSA
-onto elliptic-curve keys keeps working with no configuration change. The
-algorithm is taken from this list, never from the token's own header.
+The default is **RS256, ES256 and EdDSA**, so a provider moving from RSA to
+elliptic-curve keys needs no configuration change. The algorithm comes from this
+list, never from the token's header.
 
-No `HS*` algorithm can be enabled. An HMAC verifies with the same secret it signs
-with, so accepting one against a JWKS would turn the *public* key your provider
-publishes into a shared secret anyone could forge with. Configuring one is a
-startup error.
+No `HS*` algorithm can be enabled; configuring one is a startup error (an HMAC
+would turn your provider's public key into a shared secret).
 
 ### Naming the claims
 
-`tenant_claim` and `roles_claim` name the claims identity is read from, so a
-token that already carries the right information does not have to be reshaped.
-Both accept a **dotted path** into a nested object, and both resolve the longest
-literal key first — which is what makes namespaced claims work, since their names
-contain dots of their own:
+`tenant_claim` and `roles_claim` name the claims identity is read from. Both
+accept a **dotted path** into a nested object and resolve the longest literal key
+first, so namespaced claims whose names contain dots work:
 
 ```toml
 [server.auth.jwt]
@@ -279,41 +255,33 @@ roles_claim = "realm_access.roles"
 tenant_claim = "https://acme.example/claims.tenant"
 ```
 
-A roles claim may be an array of strings or a single string — `"roles": "admin"`
-is one role. Elements that are not strings are dropped, because a role that is a
-number has no name for a Cedar group to match.
+A roles claim may be an array of strings or a single string (`"roles": "admin"`
+is one role). Non-string elements are dropped.
 
-**A token with no roles joins no group.** Nothing is invented: an absent claim
-yields an absent group, so such a principal matches only policies written about
-the principal itself. Deny-by-default reaches here too.
+**A token with no roles joins no group**; it matches only policies written about
+the principal itself.
 
-**A role that cannot be a Cedar group id is dropped too**, and the principal
-keeps the rest. A role becomes `Group::"analysts"` and a policy matches that
-string byte for byte, so a role carrying a zero-width space is a group no policy
-names and no reviewer can distinguish from `analysts`. Roles are held to the same
-rendering rule as a [name](@/docs/security.md#and-from-the-identity-side):
+**A role that cannot be a Cedar group id is dropped**; the principal keeps the
+rest. Group ids match byte for byte, so a role with a zero-width space would be
+indistinguishable from `analysts` to a reviewer. Roles follow the [name](@/docs/security.md#and-from-the-identity-side) rendering rule:
 Unicode general category `C` refused, NFC, no surrounding whitespace, length
-bound. A warning names the offending code point rather than the role, since the
-role's rendering is the thing in question.
+bound. The warning names the offending code point, not the role.
 
-A role in `[[server.auth.api_keys]]` is a **startup failure** instead — an
-operator wrote it, and can fix it.
+A role in `[[server.auth.api_keys]]` that breaks the rule is a **startup
+failure** instead.
 
 ### Key rotation
 
-An unknown `kid` triggers an immediate JWKS refetch, so a provider that rotates
-its signing key is followed within seconds rather than at the end of the cache
-TTL. Refetches provoked this way are rate-limited to one every 30 seconds, so a
-flood of tokens bearing invented key ids cannot become a flood of requests at
-your identity provider.
+An unknown `kid` triggers an immediate JWKS refetch, so provider key rotation is
+followed within seconds. Such refetches are limited to one every 30 seconds, so
+invented key ids cannot flood your identity provider.
 
-Refreshing the JWKS also purges every cached decoding key, so a signing key the
-provider has withdrawn stops being honoured within one cache cycle
-(`jwks_cache_ttl_seconds`, default one hour).
+A JWKS refresh purges every cached decoding key, so a withdrawn signing key stops
+being honoured within one cache cycle (`jwks_cache_ttl_seconds`, default one
+hour).
 
-Keys are selected by `kid` **and** by purpose, so encryption keys (`"use":
-"enc"`) published in the same JWKS are skipped rather than handed to the verifier
-as signing keys.
+Keys are selected by `kid` **and** purpose: encryption keys (`"use": "enc"`) in
+the same JWKS are skipped.
 
 ### Token Requirements
 
@@ -326,34 +294,31 @@ as signing keys.
 | `tenant_id` | ⚠️ | Required for multi-tenant; renameable with `tenant_claim` |
 | `roles` | ⚠️ | Optional; become Cedar groups. Renameable with `roles_claim` |
 
-The `Authorization` scheme is matched case-insensitively, so `bearer` and
-`Bearer` are both accepted.
+The `Authorization` scheme is case-insensitive: `bearer` and `Bearer` both work.
 
 ### A signed token is not a validated one
 
-Two claims are checked for their *content* once the signature verifies. A token
-failing either is rejected as an invalid token.
+After the signature verifies, two claims are checked for content; a token
+failing either is rejected as invalid.
 
-**The tenant** gets the rule a namespace level gets, because it is one: a Cedar
-entity id begins with it — `Table::"acme␟analytics␟web␟events"`. A tenant reading
-`acme␟analytics` builds, for its *own* namespace `web`, the exact id of a table
-in tenant `acme`, so a policy scoped to `Namespace::"acme␟analytics"` would cover
-resources it was never written for.
+**The tenant** follows the namespace-level rule, because it begins every Cedar
+entity id (`Table::"acme␟analytics␟web␟events"`): a tenant `acme␟analytics`
+could otherwise build, for its namespace `web`, the id of a table in tenant
+`acme`.
 
-Refused: the unit separator and everything else in Unicode general category `C`,
+Refused: the unit separator and the rest of Unicode general category `C`,
 non-NFC spellings, `/` and `\`, `.` and `..`, surrounding whitespace, and
-anything past 255 characters. The rest of Unicode is fine — `分析` is a
-legitimate tenant.
+anything past 255 characters. Other Unicode is fine — `分析` is a legitimate
+tenant.
 
 **The subject** becomes `User::"…"` and is never joined into a path, so `/` is
 allowed: `auth0|5f3c`, `alice@example.com` and `https://accounts.example/u/17`
-are all accepted. What is refused is anything that changes how it *renders*,
-because the subject is written into every audit record and log line — a newline
-forges an entry, `U+202E` reverses the rest of one. Category `C`, NFC and the
-length bound; nothing else.
+are accepted. Because it is written into every audit record and log line, only
+what changes its rendering is refused (a newline, `U+202E`): category `C`, NFC
+and the length bound.
 
-The tenant rule also applies to `[[server.auth.api_keys]]`, where it is a
-**startup failure** rather than a rejected credential.
+The tenant rule also applies to `[[server.auth.api_keys]]`, as a **startup
+failure**.
 
 ### Example JWT Payload
 
@@ -383,7 +348,7 @@ audiences = ["rustberg-api"]
 
 #### Keycloak
 
-Realm roles arrive inside `realm_access`, so the roles claim names the path:
+Realm roles sit inside `realm_access`:
 
 ```toml
 [server.auth]
@@ -395,8 +360,8 @@ audiences   = ["rustberg"]
 roles_claim = "realm_access.roles"
 ```
 
-The JWKS path here is `/protocol/openid-connect/certs`, which is Keycloak's own
-and changes with the realm — exactly the value discovery saves you writing.
+Discovery supplies Keycloak's realm-specific JWKS path
+(`/protocol/openid-connect/certs`).
 
 #### Okta
 
@@ -413,15 +378,13 @@ audiences = ["rustberg"]
 
 ## Chain Authentication
 
-Chain authentication tries multiple methods in order:
+Chain authentication tries methods in order:
 
 1. **JWT** - Check `Authorization: Bearer <jwt>` header
 2. **API Key** - Fall back to `Authorization: Bearer <api_key>`
 
-This enables:
-- User authentication via SSO (JWT)
-- Service accounts via API keys
-- Gradual migration between methods
+Use it for SSO users alongside API-key service accounts, or to migrate between
+methods.
 
 ### Configuration
 
@@ -440,7 +403,7 @@ audiences = ["rustberg"]
 
 ## Rate Limiting
 
-Protect against abuse with token bucket rate limiting:
+Token-bucket rate limiting:
 
 ```toml
 [rate_limit]
@@ -449,21 +412,16 @@ requests_per_second = 100
 burst_size = 200
 ```
 
-Rate limiting is per client IP, applied before authentication so that unauthenticated
-floods are cheap to shed.
-
-There are no per-tenant limits: a limit keyed on the
-tenant would have to authenticate the request first, which is the work being
-protected against.
+Limits are per client IP and applied before authentication, so unauthenticated
+floods are cheap to shed. There are no per-tenant limits (they would require
+authenticating first).
 
 ---
 
 ## Trusted proxies
 
-Which address counts as "the client" is **not** a rate-limiting setting. The same
-answer decides three things — the rate-limit bucket, `context.source_ip` in a
-Cedar policy, and the address on an audit record — so it is configured once, in
-`[server]`:
+The client address decides the rate-limit bucket, `context.source_ip` in Cedar,
+and the audit record address. Configure it once, in `[server]`:
 
 ```toml
 [server]
@@ -471,33 +429,20 @@ Cedar policy, and the address on an audit record — so it is configured once, i
 trusted_proxies = ["10.0.0.0/8"]
 ```
 
-**Empty is the default and it means headers are ignored.** The caller's address
-is the TCP peer, full stop. That is the only correct behaviour for a server that
-might be reachable directly.
+**Empty, the default, ignores forwarding headers**: the client is the TCP peer.
 
-With ranges configured, Rustberg builds the forwarding chain as
-`X-Forwarded-For` left to right with the TCP peer appended, and walks it **from
-the right**, skipping hops inside a trusted range. The first address that is not
-a trusted proxy is the client.
+With ranges configured, Rustberg takes `X-Forwarded-For` left to right, appends
+the TCP peer, and walks the chain **from the right**, skipping hops inside a
+trusted range. The first address that is not a trusted proxy is the client.
 
-Reading the *leftmost* entry instead — which is all a "trust proxy headers"
-boolean can mean — is a spoof. `X-Forwarded-For` is appended to at each hop, so a
-client that sends `X-Forwarded-For: 10.0.0.1` arrives as
-`10.0.0.1, <real client>`: it would get to choose its own `context.source_ip`,
-defeating any policy conditioned on the address, and give itself a fresh
-rate-limit bucket on every request.
-
-A hop *count* would also work and is one number shorter. It is wrong the moment a
-request arrives by a second path — a health checker, a mesh sidecar, an internal
-caller going straight to the pod — and it is wrong in the direction that fails
-open.
+The leftmost entry is never trusted: a client sending
+`X-Forwarded-For: 10.0.0.1` arrives as `10.0.0.1, <real client>`, and could
+otherwise pick its own `context.source_ip` and rate-limit bucket.
 
 `X-Real-IP` is honoured only when the peer is itself a trusted proxy and no
 forwarding chain was sent.
 
-A range that does not parse is a **startup failure**. The alternative is
-attributing every request to the load balancer's own address while looking like
-working software.
+A range that does not parse is a **startup failure**.
 
 ---
 
@@ -534,32 +479,25 @@ working software.
 
 ## Audit Logging
 
-All authentication decisions are logged:
+Every authentication, accepted or refused, is an audit record:
 
 ```json
 {
   "timestamp": "2026-01-24T12:00:00Z",
-  "event": "auth_success",
-  "principal": "spark-etl",
-  "tenant_id": "tenant-123",
-  "method": "api_key",
-  "ip": "10.0.0.5",
+  "category": "authentication",
+  "action": "authenticate",
+  "outcome": "success",
+  "operation": "api_key",
+  "principal_id": "spark-etl",
+  "principal_type": "api_key",
+  "tenant_id": "acme",
+  "client_ip": "10.0.0.5",
   "request_id": "abc123"
 }
 ```
 
-### Failed Authentication
-
-```json
-{
-  "timestamp": "2026-01-24T12:00:01Z",
-  "event": "auth_failure",
-  "reason": "invalid_token",
-  "method": "jwt",
-  "ip": "10.0.0.6",
-  "request_id": "def456"
-}
-```
+A refusal has `"outcome": "denied"`, no principal, and the reason in
+`details.reason` (for example `credential expired`).
 
 > Secrets (tokens, keys) are **never** logged.
 
@@ -569,13 +507,12 @@ All authentication decisions are logged:
 
 ### "401 Unauthorized"
 
-**Every** way of failing authentication answers the same `401`, with the same
-type and the same sentence — missing, malformed, unknown, revoked, expired, bad
-signature. That is deliberate: *disabled* and *expired* are reachable only after
-the key's hash matches, so naming either would confirm to whoever sent a stolen
-key that it is a real one.
+**Every** authentication failure — missing, malformed, unknown, revoked,
+expired, bad signature — answers the same `401`, type and sentence. *Disabled*
+and *expired* are reachable only after the hash matches, so naming them would
+confirm a stolen key.
 
-So debug it from the **server side**, where the reason is kept:
+Debug from the **server side**, where the audit trail records the reason:
 
 ```bash
 # The audit trail names the specific reason, per request.
@@ -584,10 +521,9 @@ jq -c 'select(.action == "authenticate" and .outcome == "denied")
   /var/log/rustberg/audit.jsonl
 ```
 
-`request_id` matches the `X-Request-Id` the client got back, so you can join a
-user's report to the exact record.
+`request_id` matches the `X-Request-Id` the client got back.
 
-From the client side, the checklist is unchanged:
+From the client side:
 
 1. Verify the API key/JWT is correct
 2. Check the `Authorization` header format: `Bearer <token>`

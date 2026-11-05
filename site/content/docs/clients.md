@@ -3,10 +3,9 @@ title = "Clients and engines"
 description = "Connecting PyIceberg, Spark, Trino, Flink and DuckDB to Rustberg, with working configuration."
 weight = 12
 +++
-> Use the **`token`** property, not `credential`. `credential` makes the client
-> perform an OAuth2 client-credentials exchange against `/v1/oauth/tokens`, which
-> Rustberg does not implement — the request fails with `401` before any catalog
-> call. An API key is a bearer token: pass it as `token`.
+> Pass the API key as **`token`**, not `credential`. `credential` triggers an
+> OAuth2 client-credentials exchange against `/v1/oauth/tokens`, which Rustberg
+> does not implement: the request fails with `401` before any catalog call.
 
 
 ## Apache Spark
@@ -78,19 +77,15 @@ spark.sql("""
 """)
 ```
 
-Spark performs this as a *staged* create — it asks the catalog to initialise
-metadata without creating the table, writes the data files, then commits both
-together with an `assert-create` requirement. Rustberg implements that flow, so
-the table appears only once its data is there: there is no window in which it
-exists and is empty, and a failed job leaves nothing behind.
+Spark stages the create (metadata only), writes the data files, then commits
+with an `assert-create` requirement:
 
-If the name is taken between the stage and the commit, the commit fails with
-`409` rather than clobbering the existing table — the same conflict any
-concurrent writer would get.
+- The table appears only with its data; a failed job leaves nothing behind.
+- If the name is taken between stage and commit, the commit fails with `409`.
+- The staging note lives in Postgres, so stage and commit may hit different
+  replicas.
 
-This works the same behind multiple replicas: the staging note lives in
-Postgres, not in one process's memory, so the commit may land on a different pod
-than the stage. See [staged creation](@/docs/api.md#staged-creation-create-table-as-select).
+See [staged creation](@/docs/api.md#staged-creation-create-table-as-select).
 
 ### Scala Spark
 
@@ -203,7 +198,7 @@ CREATE CATALOG rustberg WITH (
     'type' = 'iceberg',
     'catalog-type' = 'rest',
     'uri' = 'https://rustberg.example.com',
-    'credential' = 'your-api-key',
+    'token' = 'your-api-key',
     'warehouse' = 's3://my-warehouse/',
     'io-impl' = 'org.apache.iceberg.aws.s3.S3FileIO'
 );
@@ -253,7 +248,7 @@ public class FlinkIcebergExample {
                 'type' = 'iceberg',
                 'catalog-type' = 'rest',
                 'uri' = 'https://rustberg.example.com',
-                'credential' = '%s'
+                'token' = '%s'
             )
         """.formatted(System.getenv("RUSTBERG_API_KEY")));
         
@@ -396,11 +391,13 @@ import duckdb
 # Install and load Iceberg extension
 duckdb.sql("INSTALL iceberg; LOAD iceberg;")
 
-# Attach Rustberg catalog
+# The API key goes in a secret; ATTACH names the server's warehouse.
+duckdb.sql("CREATE SECRET rustberg (TYPE iceberg, TOKEN 'your-api-key')")
 duckdb.sql("""
-    ATTACH 'https://rustberg.example.com' AS rustberg (
-        TYPE ICEBERG,
-        CREDENTIAL 'your-api-key'
+    ATTACH 's3://my-bucket/warehouse' AS rustberg (
+        TYPE iceberg,
+        SECRET rustberg,
+        ENDPOINT 'https://rustberg.example.com'
     )
 """)
 
@@ -492,7 +489,7 @@ session = boto3.Session(
 catalog = load_catalog(
     "rustberg",
     uri="https://rustberg.example.com",
-    credential="your-api-key",
+    token="your-api-key",
     **{
         "s3.access-key-id": session.get_credentials().access_key,
         "s3.secret-access-key": session.get_credentials().secret_key,
@@ -521,7 +518,7 @@ creds = response['Credentials']
 catalog = load_catalog(
     "rustberg",
     uri="https://rustberg.example.com",
-    credential="your-api-key",
+    token="your-api-key",
     **{
         "s3.access-key-id": creds['AccessKeyId'],
         "s3.secret-access-key": creds['SecretAccessKey'],
@@ -621,7 +618,7 @@ from pyiceberg.catalog import load_catalog
 import pandas as pd
 import matplotlib.pyplot as plt
 
-catalog = load_catalog("rustberg", uri="https://localhost:8000")
+catalog = load_catalog("rustberg", uri="http://localhost:8000")
 
 # Cell 2: Explore data
 table = catalog.load_table("analytics.events")

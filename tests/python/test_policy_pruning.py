@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from datetime import datetime
 import urllib.error
 import urllib.request
 
@@ -23,8 +24,9 @@ import pytest
 from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
-from pyiceberg.transforms import IdentityTransform
-from pyiceberg.types import LongType, NestedField, StringType
+from pyiceberg.exceptions import NamespaceAlreadyExistsError
+from pyiceberg.transforms import HourTransform, IdentityTransform
+from pyiceberg.types import LongType, NestedField, StringType, TimestampType
 
 # `@row_filter` carries an Iceberg predicate as JSON. A Cedar annotation is a
 # string, so the quotes are escaped — which is what an operator writes too.
@@ -233,3 +235,57 @@ def test_a_client_filter_is_conjoined_with_the_policy_filter(policy_server: str)
         "region = 'US' AND region = 'EU' selects nothing; a plan that returned the "
         "US partition would have applied only the client's half"
     )
+
+
+@pytest.mark.pyiceberg
+def test_a_pre_epoch_row_is_planned(policy_server: str):
+    """A time transform's epoch boundary prunes the way the writer partitioned.
+
+    The hour of 1969-12-31T23:30 is -1: hours since the epoch, floored. The
+    writer records that in the manifest, and the planner projects the filter
+    with the library's transform; where the two disagree, the one file holding
+    the row is pruned and the caller is told the table has nothing for it.
+    Pruning runs inside a dependency, so this pins it across that dependency's
+    upgrades.
+    """
+    catalog = RestCatalog("policy", uri=policy_server, token=WRITER_KEY)
+    try:
+        catalog.create_namespace("db")
+    except NamespaceAlreadyExistsError:
+        pass
+
+    schema = Schema(
+        NestedField(1, "id", LongType(), required=True),
+        NestedField(2, "ts", TimestampType(), required=True),
+    )
+    spec = PartitionSpec(
+        PartitionField(source_id=2, field_id=1000, transform=HourTransform(), name="ts_hour")
+    )
+    table = catalog.create_table("db.by_hour", schema=schema, partition_spec=spec)
+
+    arrow_schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("ts", pa.timestamp("us"), nullable=False),
+        ]
+    )
+    for row in (
+        {"id": 1, "ts": datetime(1969, 12, 31, 23, 30)},
+        {"id": 2, "ts": datetime(1970, 1, 1, 1, 30)},
+    ):
+        table.append(pa.Table.from_pylist([row], schema=arrow_schema))
+
+    def files_for(instant: str):
+        status, result = plan(
+            policy_server,
+            WRITER_KEY,
+            "by_hour",
+            {"filter": {"type": "eq", "term": "ts", "value": instant}},
+        )
+        assert status == 200, result
+        return [task["data-file"]["partition"] for task in result["file-scan-tasks"]]
+
+    assert files_for("1969-12-31T23:30:00") == [[-1]], (
+        "the file holding the pre-epoch row must be planned"
+    )
+    assert files_for("1970-01-01T01:30:00") == [[1]], "pruning still prunes"

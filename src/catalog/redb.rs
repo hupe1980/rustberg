@@ -39,7 +39,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -47,8 +46,8 @@ use iceberg::io::FileIO;
 use iceberg::spec::{TableMetadata, TableMetadataBuilder, ViewMetadata};
 use iceberg::table::Table;
 use iceberg::{
-    Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result, Runtime, TableCreation,
-    TableIdent, TableRequirement, TableUpdate,
+    Error, ErrorKind, Namespace, NamespaceIdent, Result, Runtime, TableCreation, TableIdent,
+    TableRequirement, TableUpdate,
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -600,19 +599,6 @@ impl RedbCatalog {
         })
         .await
     }
-
-    /// Location for the next metadata file, derived from the current one so the
-    /// version counter advances monotonically across commits.
-    fn next_metadata_location(current: &str, metadata: &TableMetadata) -> MetadataLocation {
-        match MetadataLocation::from_str(current) {
-            Ok(loc) => loc.with_next_version().with_new_metadata(metadata),
-            // A registered table may point at a file that does not follow the
-            // `<version>-<uuid>.metadata.json` convention; start a fresh
-            // sequence rather than failing the commit.
-            Err(_) => MetadataLocation::new_with_metadata(metadata.location(), metadata)
-                .with_next_version(),
-        }
-    }
 }
 
 #[async_trait]
@@ -913,7 +899,7 @@ impl CatalogStore for RedbCatalog {
             .build()?
             .metadata;
 
-        let metadata_location = MetadataLocation::new_with_metadata(&location, &metadata);
+        let metadata_location = super::metadata_file::first_table(&metadata)?;
         metadata.write_to(&self.file_io, &metadata_location).await?;
         let metadata_location = metadata_location.to_string();
 
@@ -980,7 +966,7 @@ impl CatalogStore for RedbCatalog {
             .build()?
             .metadata;
 
-        let metadata_location = MetadataLocation::new_with_metadata(&location, &metadata);
+        let metadata_location = super::metadata_file::first_table(&metadata)?;
         metadata.write_to(&self.file_io, &metadata_location).await?;
         let metadata_location = metadata_location.to_string();
 
@@ -1382,11 +1368,7 @@ impl CatalogStore for RedbCatalog {
 
         // The metadata file is written before the pointer is registered, so a
         // client that reads the location we hand back always finds a file there.
-        // View metadata carries no compression setting, so the table-oriented
-        // `new_with_metadata` has nothing to read; the path convention is all
-        // that is borrowed here.
-        #[allow(deprecated)]
-        let location = MetadataLocation::new_with_table_location(metadata.location()).to_string();
+        let location = super::metadata_file::first_view(metadata.location());
         self.write_view_metadata(&metadata, &location).await?;
 
         let record = ViewRecord {
@@ -1442,15 +1424,8 @@ impl CatalogStore for RedbCatalog {
         // Derived from the current location so the version advances, and named
         // with a fresh UUID so an abandoned write leaves an unreferenced file
         // rather than clobbering the live one.
-        let location = match MetadataLocation::from_str(&current.metadata_location) {
-            Ok(loc) => loc.with_next_version(),
-            Err(_) =>
-            {
-                #[allow(deprecated)]
-                MetadataLocation::new_with_table_location(metadata.location()).with_next_version()
-            }
-        }
-        .to_string();
+        let location =
+            super::metadata_file::next_view(&current.metadata_location, metadata.location());
 
         self.write_view_metadata(&metadata, &location).await?;
 
@@ -1674,7 +1649,7 @@ impl RedbCatalog {
             }
             let new_metadata = builder.build()?.metadata;
 
-            let new_location = Self::next_metadata_location(&base_location, &new_metadata);
+            let new_location = super::metadata_file::next_table(&base_location, &new_metadata)?;
             new_metadata.write_to(&self.file_io, &new_location).await?;
 
             prepared.push((
@@ -2044,25 +2019,6 @@ mod tests {
         assert!(RedbCatalog::namespace_key(&ns(&["db", "schema"])).starts_with(&prefix));
         assert!(!RedbCatalog::namespace_key(&ns(&["db2"])).starts_with(&prefix));
         assert!(!RedbCatalog::namespace_key(&ns(&["db"])).starts_with(&prefix));
-    }
-
-    /// Regression: deriving the next location from the table location instead of
-    /// the current metadata location restarts the counter, so every commit after
-    /// the first writes `00001-<uuid>.metadata.json`.
-    #[test]
-    fn metadata_version_advances_across_commits() {
-        let mut current = format!(
-            "s3://bucket/wh/db/t/metadata/00003-{}.metadata.json",
-            uuid::Uuid::new_v4()
-        );
-        for expected in ["00004", "00005", "00006"] {
-            let next = MetadataLocation::from_str(&current)
-                .unwrap()
-                .with_next_version()
-                .to_string();
-            assert!(next.contains(&format!("/{expected}-")), "got {next}");
-            current = next;
-        }
     }
 
     // ── Paging cursors ────────────────────────────────────────────────────

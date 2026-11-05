@@ -1,0 +1,8 @@
+{# A console screenshot from static/console/ in the reader's theme (`.shot` in main.scss follows the toggle). Taken by `just shots`. #}
+{% component shot(name, alt, caption="") %}
+<figure class="shot">
+  <img class="light" src="{{ get_url(path='console/' ~ name ~ '-light.webp') }}" alt="{{ alt }}" width="1180" height="740" loading="lazy">
+  <img class="dark" src="{{ get_url(path='console/' ~ name ~ '-dark.webp') }}" alt="{{ alt }}" width="1180" height="740" loading="lazy">
+  {% if caption %}<figcaption>{{ caption }}</figcaption>{% endif %}
+</figure>
+{% endcomponent shot %}

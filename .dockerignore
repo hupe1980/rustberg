@@ -1,0 +1,9 @@
+# The image builds from explicit COPYs; this keeps the context small and host artefacts out.
+.git/
+target/
+ui/node_modules/
+ui/dist/
+site/public/
+*.log
+.env*
+.DS_Store

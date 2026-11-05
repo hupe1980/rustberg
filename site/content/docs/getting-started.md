@@ -3,14 +3,21 @@ title = "Getting started"
 description = "Install Rustberg, start a catalog with one command, and connect an engine to it."
 weight = 1
 +++
-One command brings up a working catalog. The rest of this page is what to do
-with it, and what to change before it holds anything you care about.
+One command brings up a working catalog. This page covers using it and what to
+change before production.
 
 ## Install
 
-### Pre-built binary
+### Homebrew
 
-Nothing to install underneath it — no JVM, no database, no runtime.
+```bash
+brew install hupe1980/tap/rustberg
+```
+
+macOS on Apple Silicon and Linux (x86_64, arm64). `brew upgrade rustberg` moves
+to a new release.
+
+### Pre-built binary
 
 Releases carry one archive per platform, each holding a single executable.
 
@@ -23,14 +30,11 @@ curl -L "https://github.com/hupe1980/rustberg/releases/latest/download/rustberg-
 mv "rustberg-$TARGET" rustberg
 ```
 
-Every release also publishes `checksums.txt`.
-
-The Linux builds are statically linked against musl, so there is nothing to
-install underneath — no JVM, no database, no runtime.
-
-Releases cover **Linux and macOS**. Anywhere else, including Windows, run the
-container: it carries the same statically linked binary, and it is what CI
-starts and probes on every change.
+- Every release publishes `checksums.txt` (`sha256sum -c checksums.txt`).
+- Linux builds are statically linked against musl: no JVM, database or runtime
+  to install.
+- Releases cover **Linux and macOS**. Elsewhere, including Windows, run the
+  container (same static binary; CI starts and probes it on every change).
 
 ### Docker
 
@@ -42,21 +46,19 @@ docker run -d -p 8000:8000 --name rustberg ghcr.io/hupe1980/rustberg:latest
 ### Helm Chart (Kubernetes)
 
 ```bash
-# Clone and install
-git clone https://github.com/hupe1980/rustberg
-helm install rustberg rustberg/charts/rustberg
-
-# With S3 backend
+git clone https://github.com/hupe1980/rustberg && cd rustberg
+# Postgres catalog (a Secret `rustberg-catalog` with key `dsn`), S3 warehouse
 helm install rustberg charts/rustberg \
-  --set rustberg.storage.type=s3 \
-  --set rustberg.storage.s3.bucket=my-catalog-bucket
+  --set rustberg.catalog.postgres.existingSecret=rustberg-catalog \
+  --set rustberg.warehouse.location=s3://my-bucket/warehouse
 ```
 
 See [Kubernetes documentation](@/docs/kubernetes.md) for full configuration options.
 
 ### From source
 
-Requires Rust 1.94.1 or newer.
+Requires Rust 1.95 or newer, and Node 24 to build the web [console](@/docs/console.md)
+(`just ui`; without it the build succeeds and the console explains how).
 
 ```bash
 git clone https://github.com/hupe1980/rustberg.git
@@ -73,8 +75,8 @@ cargo build --release --all-features
 ./rustberg --dev --insecure-http
 ```
 
-Authentication is on by default. With nothing configured to authenticate against,
-Rustberg mints one admin key at startup and prints it:
+Authentication is on by default. With no API keys or OIDC configured, Rustberg
+mints one admin key at startup and prints it:
 
 ```text
 WARN rustberg: No API keys or OIDC configured — minted a temporary admin key.
@@ -87,14 +89,13 @@ WARN rustberg: This key is held in memory only. Restarting mints a new one and
 WARN rustberg: invalidates this one.
 ```
 
-> **The key changes on every restart.** It lives in memory only — keys are
-> configuration, not stored state. Configure `[[server.auth.api_keys]]` or OIDC
-> before relying on a deployment. See [authentication](@/docs/authentication.md).
+> **The key changes on every restart** (memory only). Configure
+> `[[server.auth.api_keys]]` or OIDC before relying on a deployment. See
+> [authentication](@/docs/authentication.md).
 
 `--dev` gives an ephemeral catalog in a temp directory and allows plaintext HTTP.
-Production mode — the default — requires an explicit `--catalog-url` and refuses
-wildcard CORS, so real metadata never lands in a directory that disappears on
-reboot and a development shortcut cannot reach production by inertia.
+Production mode (the default) requires an explicit `--catalog-url` and refuses
+wildcard CORS.
 
 ### 2. Check the connection
 
@@ -113,7 +114,7 @@ curl -H "X-API-Key: $API_KEY" http://localhost:8000/v1/config
 }
 ```
 
-Either header works, and both carry the same key:
+Either header carries the key:
 
 | Header | Use |
 |--------|-----|
@@ -149,14 +150,14 @@ See [clients](@/docs/clients.md) for Spark, Trino and DuckDB.
 
 ### Check who you are
 
-If a request is unexpectedly refused, ask what identity the server sees:
+If a request is unexpectedly refused, check the identity the server sees:
 
 ```bash
 curl -H "X-API-Key: $API_KEY" http://localhost:8000/auth/context
 ```
 
-The `roles` it reports are the Cedar groups your policies must name. A policy
-naming `Group::"analysts"` matches nothing if the key carries `analyst`.
+The reported `roles` are the Cedar groups your policies must name:
+`Group::"analysts"` matches nothing if the key carries `analyst`.
 
 ---
 
@@ -180,8 +181,7 @@ mkdir -p /var/lib/rustberg/data
 ```
 
 Without `--catalog-url` (or `storage.catalog_url` in a config file) the server
-refuses to start rather than writing to a temporary directory it will lose. Pass
-`--dev` if an ephemeral catalog is what you want.
+refuses to start. Pass `--dev` for an ephemeral catalog.
 
 ### Kubernetes (Postgres catalog, S3 warehouse)
 
@@ -230,9 +230,8 @@ spec:
 
 ### Environment variables
 
-Every CLI flag has one. The full list is in
-[configuration](@/docs/configuration.md#environment-variables); these are the
-ones a first deployment needs.
+Every CLI flag has one ([full list](@/docs/configuration.md#environment-variables)).
+A first deployment needs these:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -309,11 +308,8 @@ schema = Schema(
     NestedField(2, "name", StringType(), required=False),
 )
 
-table = catalog.create_table(
-    "analytics.users",
-    schema=schema,
-    location="s3://my-data/users",
-)
+# The catalog places it at <warehouse>/analytics/users.
+table = catalog.create_table("analytics.users", schema=schema)
 ```
 
 ### Spark
@@ -360,7 +356,7 @@ SELECT * FROM rustberg.analytics.events LIMIT 10;
 
 ## Troubleshooting
 
-Having issues? See the [Troubleshooting Guide](@/docs/troubleshooting.md) for solutions to common problems.
+See the [Troubleshooting Guide](@/docs/troubleshooting.md).
 
 ---
 

@@ -5,7 +5,7 @@ weight = 2
 +++
 ## System Overview
 
-Rustberg is built as a modular, layered architecture designed for security, performance, and extensibility.
+Rustberg is a modular, layered server.
 
 ```mermaid
 graph TB
@@ -80,7 +80,7 @@ graph TB
 
 ## Request Flow
 
-Every request follows a strict security pipeline before reaching the catalog logic.
+Every request passes the security pipeline before reaching catalog logic.
 
 ```mermaid
 sequenceDiagram
@@ -149,22 +149,16 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Admin
+    participant Operator
     participant Rustberg
     participant Client
 
-    Admin->>Rustberg: POST /admin/api-keys
-    Note over Rustberg: Generate key pair
-    Rustberg->>Rustberg: Hash with SHA-256
-    Rustberg->>Rustberg: Store hash in redb
-    Rustberg-->>Admin: API Key (shown once)
-    
-    Admin->>Client: Distribute API Key
-    
-    Client->>Rustberg: Request + X-Api-Key header
-    Rustberg->>Rustberg: Lookup by key prefix
-    Rustberg->>Rustberg: Verify hash (constant-time)
-    Rustberg-->>Client: Authorized Response
+    Operator->>Operator: rustberg generate-key (secret shown once)
+    Operator->>Rustberg: [[server.auth.api_keys]] entry + secret in env, restart
+    Note over Rustberg: Hash at startup, keep no plaintext
+    Client->>Rustberg: Request + Authorization: Bearer rb_…
+    Rustberg->>Rustberg: Look up by prefix, verify hash (constant-time)
+    Rustberg-->>Client: Response, as ApiKey::"<name>"
 ```
 
 ---
@@ -222,9 +216,8 @@ graph LR
 
 ### Catalog backends
 
-The catalog is a *registry*: one metadata-file pointer per table. It is
-deliberately small, because everything an engine actually reads lives in the
-warehouse and is fetched directly.
+The catalog is a *registry*: one metadata-file pointer per table. Everything an
+engine reads lives in the warehouse and is fetched directly.
 
 ```mermaid
 graph TB
@@ -256,82 +249,43 @@ graph TB
 Both backends implement the same commit protocol:
 
 1. Read the current pointer and metadata; check the request's requirements.
-2. Apply the updates and write a **new** metadata file under a fresh name —
-   never overwriting the old one.
+2. Write a **new** metadata file with the updates under a fresh name; never
+   overwrite the old one.
 3. Swap the pointer, conditional on it still holding the value read in step 1.
 
-Step 3 is the compare-and-swap that makes lost updates impossible: in redb it is
-a serializable write transaction, in Postgres a conditional `UPDATE` inside a
-SQL transaction. A swap that matches nothing means another writer got there
-first, and the commit retries with backoff.
+Step 3 is a compare-and-swap (redb: serializable write transaction; Postgres:
+conditional `UPDATE` in a SQL transaction), so lost updates are impossible. A
+swap that matches nothing means another writer won; the commit retries with
+backoff.
 
 ---
 
 ## High Availability
 
-### Multi-Region Deployment
+### Replicated deployment
 
 ```mermaid
 graph TB
-    subgraph Region1["Region: us-east-1"]
-        LB1[Load Balancer]
-        R1A[Rustberg Pod A]
-        R1B[Rustberg Pod B]
-        S1[(redb<br/>S3 Backend)]
-    end
-    
-    subgraph Region2["Region: eu-west-1"]
-        LB2[Load Balancer]
-        R2A[Rustberg Pod A]
-        R2B[Rustberg Pod B]
-        S2[(redb<br/>S3 Backend)]
-    end
-    
-    subgraph GlobalLB["Global Load Balancer"]
-        GLB[Route53 / Cloud DNS]
-    end
-    
-    subgraph Replication["Cross-Region Replication"]
-        S3Rep[S3 CRR]
-    end
-    
-    GLB --> LB1
-    GLB --> LB2
-    LB1 --> R1A
-    LB1 --> R1B
-    LB2 --> R2A
-    LB2 --> R2B
-    R1A --> S1
-    R1B --> S1
-    R2A --> S2
-    R2B --> S2
-    S1 <-->|Replicate| S3Rep
-    S3Rep <--> S2
-    
-    style GLB fill:#fff9c4,stroke:#f57f17
+    LB[Load Balancer] --> R1[Rustberg pod]
+    LB --> R2[Rustberg pod]
+    LB --> R3[Rustberg pod]
+    R1 --> PG[(Postgres catalog)]
+    R2 --> PG
+    R3 --> PG
+    R1 -.-> WH[(Warehouse: S3 / GCS / ADLS)]
+    R2 -.-> WH
+    R3 -.-> WH
 ```
+
+Pods are stateless and equal; Postgres holds the catalog and policy revisions.
+The embedded redb catalog runs exactly one pod.
 
 ---
 
 ## Performance Characteristics
 
-### Latency Breakdown
-
-| Operation | Typical Latency | Notes |
-|-----------|-----------------|-------|
-| Authentication | 1-5ms | JWT validation, API key lookup |
-| Policy Evaluation | <1ms | Cedar is extremely fast |
-| Metadata Read | 5-20ms | redb cache hit |
-| Metadata Write | 10-50ms | Includes WAL sync |
-| Table Creation | 50-200ms | Includes storage setup |
-
-### Throughput Estimates
-
-| Deployment | Read QPS | Write QPS | Memory |
-|------------|----------|-----------|--------|
-| Single Pod | 10,000 | 1,000 | 512MB |
-| 3-Pod Cluster | 30,000 | 3,000 | 1.5GB |
-| Production HA | 100,000+ | 10,000+ | 8GB+ |
+Measured figures — authorization overhead, `loadTable`, cold start, memory — and
+how they are gated in CI are on [Performance](@/docs/benchmarks.md).
 
 ---
 
@@ -365,7 +319,6 @@ graph LR
     Axum --> Tower
     Tower --> Tokio
     Axum --> Rustls
-    redb --> ObjectStore
     Iceberg --> Arrow
 ```
 
@@ -375,43 +328,39 @@ graph LR
 
 ### Why two catalog backends?
 
-**redb** for the embedded case: an ACID, multi-key, single-file database with no
-C dependencies, so the binary still cross-compiles statically to musl. No
-database to run, and a commit is a local transaction.
-
-**Postgres** for the clustered case: redb takes an exclusive file lock, so it
-cannot back more than one process. Postgres lets replicas share one registry
-without Rustberg needing leader election or a consensus protocol of its own.
+- **redb** (embedded): ACID, multi-key, single-file, no C dependencies, so the
+  binary cross-compiles statically to musl. No database to run; a commit is a
+  local transaction.
+- **Postgres** (clustered): redb's exclusive file lock limits it to one process.
+  Postgres lets replicas share one registry without leader election or a
+  consensus protocol.
 
 ### Why a `CatalogStore` trait instead of `iceberg::Catalog`?
 
-Both registries implement Rustberg's own `CatalogStore`, not `iceberg::Catalog`.
-That is deliberate, and it is not a preference:
+Both registries implement Rustberg's own `CatalogStore`, because
+`iceberg::Catalog` cannot serve a REST catalog:
 
-- **A server cannot commit through `iceberg::Catalog`.** The only commit method is
-  `update_table(TableCommit)`, and `TableCommit` has private fields with a
-  `pub(crate)` build method. Upstream declined to open it — *"users are not
-  supposed to build `TableCommit` directly"* — and directs callers to
-  `Transaction`, which derives requirements from typed actions. A REST server is
-  handed `(requirements, updates)` verbatim and must apply exactly those, so that
-  is the wrong direction.
-- **The trait has no views.** Not one view method.
-- **The trait cannot page.** `list_tables` returns a `Vec` with no cursor, so a
-  backend cannot answer a page even though both registries store tables in a
-  sorted index that can.
+- **No server-side commit.** The only commit method is
+  `update_table(TableCommit)`; `TableCommit` has private fields and a
+  `pub(crate)` builder. Upstream declined to open it (*"users are not supposed to
+  build `TableCommit` directly"*) and points to `Transaction`, which derives
+  requirements from typed actions. A REST server must apply the
+  `(requirements, updates)` it receives verbatim.
+- **No views.** The trait has no view methods.
+- **No paging.** `list_tables` returns a `Vec` with no cursor, although both
+  registries store tables in a sorted index.
 
-These are properties of the trait, so no other implementation — `sql`, `rest`,
-`glue`, `s3tables` — escapes them. The `iceberg` crate is still used for
-everything it does well: `TableMetadata`, `Table`, `ViewMetadata`, `FileIO`,
-`TableRequirement::check`, `drop_table_data`, and `iceberg-storage-opendal` for
-cloud object stores. Only the registry is written here.
+Every implementation (`sql`, `rest`, `glue`, `s3tables`) inherits these.
+Rustberg still uses the `iceberg` crate for
+`TableMetadata`, `Table`, `ViewMetadata`, `FileIO`, `TableRequirement::check`,
+`drop_table_data`, and `iceberg-storage-opendal` for cloud object stores. Only
+the registry is written here.
 
-Lakekeeper, the closest comparable project, reached the same conclusion and
-defines its own catalog trait for the same reasons.
+Lakekeeper, the closest comparable project, defines its own catalog trait for the
+same reasons.
 
-Federated backends will wrap somebody else's `iceberg::Catalog` *client* behind
-`CatalogStore`; such a mount is read-only and reports `views: false`, because the
-upstream trait cannot express a commit or a view.
+A federated `rest` mount is a read-only `CatalogStore` whose view support is
+negotiated from the remote; see [Federation](@/docs/federation.md).
 
 ### Why Cedar?
 
@@ -427,21 +376,22 @@ upstream trait cannot express a commit or a view.
 | Operation | Status | Notes |
 |-----------|--------|-------|
 | Table Commit | ✅ CAS with version numbers | Returns 409 Conflict on concurrent modification |
-| Table Rename | Atomic | One write transaction: the destination is inserted and the source removed together |
-| Multi-table Transaction | Atomic | Every pointer swaps in one write transaction, re-verifying each version inside it |
+| Table Rename | Atomic | One write transaction inserts the destination and removes the source |
+| Multi-table Transaction | Atomic | All pointers swap in one write transaction, each version re-verified inside it |
 
 **Optimistic concurrency control:** every commit swaps the metadata pointer
-conditionally on the value it read. Rustberg retries a lost swap internally with
-jittered backoff; a commit whose *requirements* no longer hold is not retried but
-returned as `409 Conflict`, since re-running it would not help. This works the
-same whether the registry is redb or Postgres — see
-[deployment topology](#concurrency-and-deployment-topology).
+conditionally on the value it read.
 
-**Multi-table atomicity:** `commit_tables_atomic` gives all-or-nothing semantics
-across tables — one redb write transaction, or one SQL transaction with a
-conditional `UPDATE` per table. If any table's pointer moved underneath, the
-whole transaction rolls back and the commit retries, so no client observes a
-half-applied transaction.
+- A lost swap is retried internally with jittered backoff.
+- A commit whose *requirements* no longer hold returns `409 Conflict` without
+  retry.
+- Same behaviour on redb and Postgres — see
+  [deployment topology](#concurrency-and-deployment-topology).
+
+**Multi-table atomicity:** `commit_tables_atomic` is all-or-nothing across tables
+— one redb write transaction, or one SQL transaction with a conditional `UPDATE`
+per table. If any pointer moved, the whole transaction rolls back and retries; no
+client sees a half-applied transaction.
 
 ### Persistence
 
@@ -451,47 +401,39 @@ half-applied transaction.
 | Tables | Catalog registry + metadata files | Yes |
 | Views | Catalog registry + metadata files | Yes |
 | Idempotency receipts | Postgres, when the catalog is Postgres; otherwise in memory | With Postgres |
-| API keys | Configuration, hashed in memory | **No** — they come from config or the environment on every start |
+| API keys | Configuration, hashed in memory | **No** — reloaded from config or the environment on every start |
 
-All *catalog metadata* persists. The rest is deliberate:
+All *catalog metadata* persists.
 
-- **API keys are configuration, not state.** They arrive from a config file or a
-  mounted secret and are hashed at startup, so there is no key store to encrypt,
-  back up, or guard with a "who may mint keys" policy. Rotation is a config change.
-  The trade is that revocation needs a restart; deployments that need runtime
-  revocation use OIDC, where token lifetime belongs to the identity provider.
-- **Idempotency receipts follow the catalog.** On Postgres they live in the same
-  database, so a retry that lands on another replica is replayed rather than
-  executed twice. On redb there is nothing to share: the file takes an exclusive
-  lock, so there is only ever one process.
+- **API keys are configuration, not state**: read from a config file or
+  mounted secret and hashed at startup; no key store to encrypt, back up, or
+  protect. Rotation is a config change; revocation needs a restart. For runtime
+  revocation use OIDC, where the identity provider owns token lifetime.
+- **Idempotency receipts follow the catalog**: on Postgres, a retry on another
+  replica is replayed, not executed twice; redb has only one process.
 
 ### Concurrency and deployment topology
 
-Deployment topology follows from the catalog backend.
+Topology follows from the catalog backend.
 
 #### Postgres: many replicas
 
-Replicas share one registry, so they are ordinary stateless pods — any number,
-rolling updates, autoscaling. There is no leader election because there is no
-leader: correctness comes from the conditional `UPDATE` in step 3 of the commit
-protocol above. Two replicas committing to the same table concurrently both
+Replicas are ordinary stateless pods: any number, rolling updates, autoscaling.
+There is no leader; correctness comes from the conditional `UPDATE` in step 3 of
+the commit protocol. Two replicas committing to one table concurrently both
 succeed, one after retrying.
-
-Idempotency receipts live in the same database, so a retry landing on a
-different pod is replayed from the first response rather than executed twice.
 
 #### redb: exactly one process
 
-redb holds an exclusive lock on the catalog file. A second process does not
-contend or corrupt — it fails to open the database:
+redb locks the catalog file exclusively. A second process fails to open it rather
+than contending or corrupting:
 
 ```text
 Failed to open redb catalog: Database already open. Cannot acquire lock.
 ```
 
-That is a clean failure, and it means `replicas: 1` with `strategy: Recreate`.
-A rolling update would start the new pod before the old one exits, and the new
-pod could not open the file.
+So: `replicas: 1` with `strategy: Recreate`. A rolling update starts the new pod
+before the old one exits, and the new pod cannot open the file.
 
 ```
         ┌─────────────┐            ┌─────────────┐
@@ -504,27 +446,25 @@ pod could not open the file.
           └────────────────────────────────────┘
 ```
 
-If you need more than one replica, that is what the Postgres backend is for.
+For more than one replica, use Postgres.
 
 #### Concurrent commits
 
-Concurrency *inside* the process is handled properly. Commits run in a redb
-serializable-snapshot transaction: the registry entry is read and swapped inside
-one transaction, so a concurrent commit that touched the same table aborts rather
-than silently overwriting.
+Within the process, a redb serializable-snapshot transaction reads and swaps
+the registry entry, so a concurrent commit to the same table aborts instead of
+overwriting:
 
 - Two requests read version 5 and each build new metadata.
 - The first commits; the entry becomes version 6.
-- The second's transaction conflicts and is rejected with `409 Conflict`.
+- The second loses the swap, re-reads version 6 and re-applies its changes. It
+  gets `409 Conflict` only if its requirements no longer hold, or retries run out.
 
-Clients should retry `409` with exponential backoff — the standard Iceberg
-optimistic-commit contract.
+Clients retry `409` with exponential backoff (standard Iceberg contract).
 
 #### Scaling reads
 
-Not on redb. The exclusive lock is on the *file*, not on write access, so a
-second process cannot open it read-only either. Scaling out means the Postgres
-catalog.
+Not on redb: the lock is on the *file*, so a second process cannot open it
+read-only either. Scale out with Postgres.
 
 ## Security Layers
 

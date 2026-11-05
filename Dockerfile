@@ -9,9 +9,21 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
+# Stage 0: The console — flat files the binary embeds (architecture-neutral)
+# -----------------------------------------------------------------------------
+FROM --platform=$BUILDPLATFORM node:24-bookworm-slim AS console
+WORKDIR /ui
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci
+COPY ui/index.html ui/vite.config.ts ui/tsconfig.json ./
+COPY ui/public/ public/
+COPY ui/src/ src/
+RUN npm run build
+
+# -----------------------------------------------------------------------------
 # Stage 1: Build (supports both amd64 and arm64)
 # -----------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM rust:1.94-bookworm AS builder
+FROM --platform=$BUILDPLATFORM rust:1.95-bookworm AS builder
 
 # Build arguments for cross-compilation
 ARG TARGETPLATFORM
@@ -50,41 +62,32 @@ RUN case "$TARGETARCH" in \
 WORKDIR /build
 
 # Copy Cargo files first for dependency caching
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 
 # Create dummy source for dependency caching
 RUN mkdir -p src && \
     echo 'fn main() { println!("dummy"); }' > src/main.rs && \
     echo 'pub fn dummy() {}' > src/lib.rs
 
-# Build dependencies only (this layer is cached).
-#
-# `--all-features`, matching what CI builds and what the release workflow ships.
-# A narrower list here was how this image came to be built with a feature that
-# no longer exists (`slatedb-storage`, from a storage backend removed long ago):
-# the flag silently drifted away from every other build in the repository, and
-# an image built from a subset would in any case ship without Postgres, cloud
-# warehouses, credential vending or request signing — most of what the
-# documentation tells an operator to configure.
-#
-# `|| true` here only, because this layer builds against a dummy `src/` and its
-# whole purpose is to warm the dependency cache. The real build below must fail
-# the image if it fails.
+# Build dependencies only (this layer is cached), with `--all-features` like CI
+# and the release. `|| true` here only: this layer builds a dummy `src/` to warm
+# the cache; the real build below must fail the image if it fails.
 RUN RUST_TARGET=$(cat /tmp/rust-target) && \
     cargo zigbuild --release --target $RUST_TARGET --all-features 2>/dev/null || true
 
 # Remove dummy source
 RUN rm -rf src/
 
-# Copy actual source
+# Copy actual source, and the console the binary embeds
 COPY src/ src/
+COPY --from=console /ui/dist/ ui/dist/
 
 # Touch to force rebuild
 RUN touch src/main.rs src/lib.rs
 
 # Build the actual binary
 RUN RUST_TARGET=$(cat /tmp/rust-target) && \
-    cargo zigbuild --release --target $RUST_TARGET --all-features && \
+    RUSTBERG_REQUIRE_CONSOLE=1 cargo zigbuild --release --target $RUST_TARGET --all-features && \
     cp /build/target/$RUST_TARGET/release/rustberg /build/rustberg && \
     strip /build/rustberg 2>/dev/null || true
 
@@ -99,10 +102,7 @@ RUN ls -lh /build/rustberg && file /build/rustberg
 # -----------------------------------------------------------------------------
 # Stage 2: Minimal Runtime (distroless for maximum security)
 # -----------------------------------------------------------------------------
-# Google's distroless: minimal attack surface
-# - No shell, no package manager, no unnecessary binaries
-# - Only libc and ca-certificates
-# - Significantly fewer CVEs than debian-slim or alpine
+# Distroless: no shell or package manager; only libc and ca-certificates.
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 # OCI Labels
@@ -118,13 +118,9 @@ COPY --from=builder /build/rustberg /usr/local/bin/rustberg
 
 # Environment defaults.
 #
-# `RUSTBERG_CATALOG_URL` is set because production mode — the default — refuses
-# to start without an explicit catalog location, and an image whose only
-# documented `docker run` exits immediately is not a quick start. The path is a
-# declared volume, so a container started without `-v` still runs and simply
-# loses its catalog when it is removed, which is the same bargain every other
-# stateful image makes. Mount something over it for anything that has to
-# survive, or point the variable at `postgres://…` for a replicated deployment.
+# Production mode needs an explicit catalog, so `RUSTBERG_CATALOG_URL` points
+# at a declared volume: mount over it to keep the catalog, or point it at
+# `postgres://…` for a replicated deployment.
 ENV RUSTBERG_HOST=0.0.0.0
 ENV RUSTBERG_PORT=8000
 ENV RUSTBERG_INSECURE_HTTP=false

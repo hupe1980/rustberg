@@ -578,3 +578,177 @@ async fn the_stored_version_is_the_version_decisions_report() {
          audit record would name a revision the store cannot resolve"
     );
 }
+
+// ── One revision, by sequence ───────────────────────────────────────────────
+
+/// The history lists revisions without their text; this is how any one of them is read back — what a
+/// reviewer compares before restoring it.
+#[tokio::test]
+async fn a_revision_is_readable_by_sequence() {
+    let (app, admin, reader) = app_with_policies().await;
+
+    let changed = format!("{ADMIN_POLICIES}\n// a second revision\n");
+    let (status, body) = send(
+        &app,
+        Method::PUT,
+        "/management/v1/policies",
+        &admin,
+        Some(json!({ "source": changed, "note": "second" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for (sequence, expect_marker) in [(1, false), (2, true)] {
+        let (status, body) = send(
+            &app,
+            Method::GET,
+            &format!("/management/v1/policies/revisions/{sequence}"),
+            &reader,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "revision {sequence}: {body}");
+        let revision = parse(&body);
+        assert_eq!(revision["sequence"], sequence, "{body}");
+        assert_eq!(
+            revision["source"]
+                .as_str()
+                .unwrap()
+                .contains("a second revision"),
+            expect_marker,
+            "revision {sequence} carries its own text: {body}"
+        );
+        assert_eq!(revision["latest_sequence"], 2, "{body}");
+    }
+}
+
+/// Reading a revision is reading the policy set, and is authorized as that.
+#[tokio::test]
+async fn a_revision_is_not_readable_without_read_on_the_policy_set() {
+    let (outsider_key, outsider) = key("outsider", "nobody");
+    let (app, _keys) = App::builder()
+        .with_warehouse_location("memory://test")
+        .with_default_tenant_id("acme")
+        .with_policies(ADMIN_POLICIES)
+        .with_api_keys(vec![outsider_key])
+        .build_with_api_keys()
+        .await
+        .expect("build app");
+
+    let (status, body) = send(
+        &app,
+        Method::GET,
+        "/management/v1/policies/revisions/1",
+        &outsider,
+        None,
+    )
+    .await;
+    assert!(
+        status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND,
+        "a caller with no Read on the policy set must not read a revision: {status} {body}"
+    );
+    // Refused by authorization, not by a missing route: that answers with an empty body.
+    assert!(
+        parse(&body)["error"]["message"].is_string(),
+        "the refusal is the server's own: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_revision_is_not_found() {
+    let (app, admin, _) = app_with_policies().await;
+    let (status, body) = send(
+        &app,
+        Method::GET,
+        "/management/v1/policies/revisions/99",
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(body.contains("history"), "point at how to find one: {body}");
+}
+
+/// A revision written with a key names that key — by the name it is configured under, which is still its name
+/// after a restart, so history keeps saying who wrote what.
+#[tokio::test]
+async fn a_revision_names_the_key_that_wrote_it() {
+    let (app, admin, _) = app_with_policies().await;
+    let (status, body) = send(
+        &app,
+        Method::PUT,
+        "/management/v1/policies",
+        &admin,
+        Some(json!({ "source": ADMIN_POLICIES, "note": "unchanged rules, new revision" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["author"], "admin");
+}
+
+/// An invalid policy file on first start is refused and stores nothing, so correcting the file is enough to
+/// start. Seeding it first would make the bad rules revision 1 of a store that is authoritative from then on.
+#[tokio::test]
+async fn an_invalid_policy_file_is_refused_before_it_is_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = rustberg::location::url_from_path(dir.path());
+    let start = |policies: &'static str| {
+        let catalog = catalog.clone();
+        async move {
+            let (admin_key, _) = key("admin", "admin");
+            App::builder()
+                .with_catalog_url(catalog)
+                .with_warehouse_location("memory://test")
+                .with_default_tenant_id("acme")
+                .with_policies(policies)
+                .with_api_keys(vec![admin_key])
+                .build_with_api_keys()
+                .await
+                .map(|_| ())
+        }
+    };
+
+    let refused = start(
+        r#"permit(principal is Rustberg::Group, action == Rustberg::Action::"Read", resource);"#,
+    )
+    .await;
+    let message = refused
+        .expect_err("an invalid policy file must not start the server")
+        .to_string();
+    assert!(message.contains("policy0"), "{message}");
+    assert!(
+        !message.contains("schema has changed"),
+        "blames a schema change that never happened: {message}"
+    );
+
+    start(ADMIN_POLICIES)
+        .await
+        .expect("the corrected file starts the server");
+}
+
+/// A permit whose action can never apply is refused at the API as it is at startup, naming the policy, and
+/// the rules in force do not change.
+#[tokio::test]
+async fn a_policy_whose_action_cannot_apply_is_refused_by_the_api() {
+    let (app, admin, _) = app_with_policies().await;
+    let never = format!(
+        "{ADMIN_POLICIES}\npermit(principal is Rustberg::Group, action == Rustberg::Action::\"Read\", resource);"
+    );
+    let (status, body) = send(
+        &app,
+        Method::PUT,
+        "/management/v1/policies",
+        &admin,
+        Some(json!({ "source": never })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("policy2"), "{body}");
+
+    let (_, current) = send(&app, Method::GET, "/management/v1/policies", &admin, None).await;
+    assert_eq!(
+        parse(&current)["sequence"],
+        1,
+        "a refused set became a revision"
+    );
+}

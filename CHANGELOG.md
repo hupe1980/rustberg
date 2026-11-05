@@ -6,6 +6,63 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the major version is `0`, a minor bump may carry breaking changes.
 
+## [0.4.0] - 2026-11-05
+
+iceberg-rust 0.11, a built-in web console, and API keys a policy can name.
+
+### Changed
+
+- **API keys are principals named after their configured `name`**:
+  `Rustberg::ApiKey::"svc-etl"`. Rules written as `Rustberg::User::"…"` for a
+  key never matched and must use `ApiKey`; rules on groups are unaffected.
+  Embedders: a `Principal` of type `ApiKey` evaluates as `Rustberg::ApiKey`, and
+  actions apply to `[User, ApiKey]`.
+- **iceberg-rust 0.11.** Public signatures naming `iceberg` types now name 0.11
+  types.
+- **Minimum Rust is 1.95.**
+- **Cedar 4.14.** A permit whose action can never apply to its principal or
+  resource type is still refused at load, though Cedar now reports it as a
+  warning.
+- **Metadata files follow a moved table**: after a `location` change, the next
+  metadata file is written under the new location's `metadata/`, as Java does.
+
+### Added
+
+- **Homebrew**: `brew install hupe1980/tap/rustberg` on macOS (Apple Silicon)
+  and Linux.
+- **Web console at `/ui/`**, embedded in the binary: browse the catalog as the
+  signed-in identity, see what is restricted for you, edit policy with a reviewed
+  diff, restore revisions with undo, copy client configuration. Turn it off with
+  `[server.ui] enabled = false`, or build without the `ui` feature.
+- **Key rotation without downtime**: entries sharing a `name` are one principal
+  with several secrets; they must agree on `tenant` and `roles`.
+- **`principal_type`** in every audit record, beside `principal_id`.
+- **`GET /management/v1/policies/revisions/{sequence}`**: one earlier revision,
+  with its source.
+- **`variant` columns**, including masks over them.
+- **`first-row-id`** on every data file a v3 plan returns.
+
+### Fixed
+
+- **An invalid `policy_file` no longer bricks a new catalog.** On first start
+  it was stored before it was validated, so the server refused every later
+  start, even with the file corrected. It is now refused and nothing is stored.
+- **API keys had a random per-start identity**, so no rule could name one and
+  their audit trail broke at every restart and across replicas.
+- From iceberg-rust 0.11, through the planner: `bucket` pruning of pre-1970
+  nanosecond timestamps; data columns named `pos` or `file_path`;
+  `case-sensitive: false` reaching filter binding; plans over manifests whose
+  partition spec lost a source column.
+
+### Security
+
+- **`write.metadata.path` never moves the catalog's own writes**: they always go
+  to `<location>/metadata/`, since iceberg-rust 0.11 would follow the property
+  anywhere the catalog's storage role reaches.
+- **Dependency advisories cleared**: rustls 0.23.46, rustls-webpki 0.103.16,
+  webpki-roots 1.0.11, tokio 1.54.1, zstd 0.13.4. thrift and pin-utils are
+  ignored in `deny.toml` with their reasons.
+
 ## [0.3.0] - 2026-09-18
 
 Correctness release, from an audit of the enforcement paths. Three defects, all

@@ -37,14 +37,14 @@
 [[pin]]
 name = "iceberg/rest-catalog-open-api.yaml"
 url = "https://raw.githubusercontent.com/apache/iceberg/main/open-api/rest-catalog-open-api.yaml"
-sha256 = "be7273e50a7e37651bd3bd3a9401e749634912814a7f30b21580642eea0019f2"
+sha256 = "7dc224264eed59656c28122fe7e5c872d5a9e8e4f5fc4321e8a333b307997d6f"
 retrieved = "2026-09-18"
 governs = "The wire protocol. Every endpoint, request and response shape, and every capability /v1/config advertises."
 
 [[pin]]
 name = "iceberg/table-spec.md"
 url = "https://raw.githubusercontent.com/apache/iceberg/main/format/spec.md"
-sha256 = "af9123ae77d68e76e99df9d6ab47d7771fad2bf5518e86b73712d69a76f4c1b1"
+sha256 = "e94c6a2efbbd8cb49eae4c688a16f5b6468441a0d0e9ce52f8310ed16e63f030"
 retrieved = "2026-09-18"
 governs = "Format versions 1/2/3, row lineage, partition specs and transforms, and the JSON single-value serialization a scan plan encodes partition values with."
 

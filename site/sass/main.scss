@@ -82,6 +82,20 @@
 }
 :root[data-theme="dark"] { @include syntax.syntax-dark; }
 
+// Console screenshots come in both themes; the reader's wins, by the same three selectors.
+@mixin shot-dark { .shot .light { display: none; } .shot .dark { display: block; } }
+.shot { margin: 1.5rem 0; }
+.shot img {
+  display: block; width: 100%; height: auto;
+  border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg);
+}
+.shot .dark { display: none; }
+.shot figcaption { margin-top: .6rem; font-size: .875rem; color: var(--text-muted); text-align: center; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { @include shot-dark; }
+}
+:root[data-theme="dark"] { @include shot-dark; }
+
 // The highlighter puts the code background on the token classes, which would
 // override the surrounding block. The page owns that colour.
 pre.giallo { background: var(--bg-code); }

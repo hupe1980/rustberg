@@ -8,11 +8,8 @@
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 
-# Explicit rather than left at their defaults, because both default to a
-# *warning* and a warning does not fail `cargo deny check`. This file is the one
-# advisory gate — the daily scheduled scan and the per-PR run are the same tool
-# reading the same list — so anything it merely warns about is something nobody
-# will see.
+# Explicit, because both default to a warning, which does not fail
+# `cargo deny check` — and this file is the advisory gate CI runs.
 yanked = "deny"
 unmaintained = "all"
 
@@ -20,14 +17,6 @@ unmaintained = "all"
 # updating. Each names the crate, the path in, and why it is tolerable here —
 # an ignore with no reason is one nobody can re-evaluate later.
 ignore = [
-    # quick-xml, via opendal's S3 and ADLS services. Both are denial-of-service
-    # bounds on parsing untrusted XML. Rustberg does not hand it any: the only
-    # XML it parses is a `DeleteObjects` body, read by a scanner of its own
-    # (`catalog::v1::sign`) that exists partly to avoid this dependency. What
-    # opendal parses is object-store responses from the store the operator
-    # configured.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
     # rsa, via reqsign's Azure storage signer. A timing side channel in RSA
     # decryption; reqsign uses it to sign requests with a key the operator
     # configured, not to decrypt attacker-supplied ciphertext. Removed with
@@ -36,6 +25,16 @@ ignore = [
     # paste, a proc-macro crate, via `parquet` inside `iceberg`. Unmaintained
     # rather than vulnerable, and it runs at compile time only.
     "RUSTSEC-2024-0436",
+    # thrift 0.17, via `parquet` inside `iceberg`, which pins it. Unbounded
+    # allocation in the binary protocol, which is what a Parquet footer is
+    # encoded in. Rustberg never opens a Parquet file: it reads table metadata
+    # (JSON) and manifests (Avro), and data files are only ever named, signed or
+    # deleted.
+    "RUSTSEC-2026-0435",
+    # pin-utils, via the AWS SDK's `aws-smithy-http`. Unmaintained (repository
+    # archived 2026-10-01) rather than vulnerable: a handful of pinning macros
+    # with no input surface.
+    "RUSTSEC-2026-0441",
     # rustls-pemfile (unmaintained) and tokio-tar (a tar-extraction flaw), both
     # via `testcontainers`. Dev-dependencies: they reach the test suite pulling
     # container images and never the server.

@@ -40,7 +40,6 @@
 //! transaction where redb has a write transaction.
 
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -48,8 +47,8 @@ use iceberg::io::FileIO;
 use iceberg::spec::{TableMetadata, TableMetadataBuilder, ViewMetadata};
 use iceberg::table::Table;
 use iceberg::{
-    Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result, Runtime, TableCreation,
-    TableIdent, TableRequirement, TableUpdate,
+    Error, ErrorKind, Namespace, NamespaceIdent, Result, Runtime, TableCreation, TableIdent,
+    TableRequirement, TableUpdate,
 };
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
@@ -529,19 +528,6 @@ impl PostgresCatalog {
         )
     }
 
-    /// Location for the next metadata file, derived from the current one so the
-    /// version counter advances monotonically across commits.
-    fn next_metadata_location(current: &str, metadata: &TableMetadata) -> MetadataLocation {
-        match MetadataLocation::from_str(current) {
-            Ok(loc) => loc.with_next_version().with_new_metadata(metadata),
-            // A registered table may point at a file that does not follow the
-            // `<version>-<uuid>.metadata.json` convention; start a fresh
-            // sequence rather than failing the commit.
-            Err(_) => MetadataLocation::new_with_metadata(metadata.location(), metadata)
-                .with_next_version(),
-        }
-    }
-
     async fn read_metadata(&self, location: &str) -> Result<TableMetadata> {
         TableMetadata::read_from(&self.file_io, location).await
     }
@@ -650,7 +636,7 @@ impl PostgresCatalog {
         }
         let new_metadata = builder.build()?.metadata;
 
-        let new_location = Self::next_metadata_location(&current_location, &new_metadata);
+        let new_location = super::metadata_file::next_table(&current_location, &new_metadata)?;
         new_metadata.write_to(&self.file_io, &new_location).await?;
 
         Ok(StagedCommit {
@@ -967,7 +953,7 @@ impl CatalogStore for PostgresCatalog {
             .build()?
             .metadata;
 
-        let metadata_location = MetadataLocation::new_with_metadata(&location, &metadata);
+        let metadata_location = super::metadata_file::first_table(&metadata)?;
         metadata.write_to(&self.file_io, &metadata_location).await?;
         let metadata_location = metadata_location.to_string();
 
@@ -1045,7 +1031,7 @@ impl CatalogStore for PostgresCatalog {
             .build()?
             .metadata;
 
-        let metadata_location = MetadataLocation::new_with_metadata(&location, &metadata);
+        let metadata_location = super::metadata_file::first_table(&metadata)?;
         metadata.write_to(&self.file_io, &metadata_location).await?;
         let metadata_location = metadata_location.to_string();
 

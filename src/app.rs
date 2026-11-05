@@ -371,6 +371,9 @@ impl AppState {
 pub struct App {
     app_state: AppState,
     cors_config: CorsConfig,
+    /// Whether `/ui` is served. Only meaningful with the `ui` feature.
+    #[cfg_attr(not(feature = "ui"), allow(dead_code))]
+    console: bool,
 }
 
 impl App {
@@ -462,7 +465,10 @@ impl App {
             HeaderName::from_static("x-frame-options"),
             HeaderValue::from_static("DENY"),
         );
-        let content_security_policy = SetResponseHeaderLayer::overriding(
+        // A default rather than an override, for the console's sake: its files must run their own
+        // script, so they set their own policy. Every API response sets none, so it still gets this
+        // one — `api_responses_keep_default_src_none` holds that.
+        let content_security_policy = SetResponseHeaderLayer::if_not_present(
             HeaderName::from_static("content-security-policy"),
             HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
         );
@@ -503,6 +509,15 @@ impl App {
             .merge(health_routes)
             .merge(metrics_routes)
             .merge(auth_routes::create_public_routes());
+
+        // Public for the reason a login page is: it has to load before anyone has signed in, and it
+        // grants nothing — every request the console makes carries the caller's own credential.
+        #[cfg(feature = "ui")]
+        let public = if self.console {
+            public.merge(crate::ui::routes())
+        } else {
+            public
+        };
 
         Router::new()
             .merge(public)
@@ -659,6 +674,8 @@ fn build_authorizer(policies: Option<&str>) -> Result<CedarAuthorizer, crate::er
 /// Builder for constructing an App with custom configuration.
 #[derive(Default)]
 pub struct AppBuilder {
+    /// Whether to serve the console at `/ui`; `None` is on.
+    console: Option<bool>,
     catalog: Option<Arc<dyn CatalogStore>>,
     warehouse_location: Option<String>,
     location_scope: crate::location::LocationScope,
@@ -893,6 +910,12 @@ impl AppBuilder {
     /// typecheck is a startup failure rather than a rule that never matches.
     pub fn with_policies<S: Into<String>>(mut self, policies: S) -> Self {
         self.policies = Some(policies.into());
+        self
+    }
+
+    /// Serves the console at `/ui` (the default), or not. Has no effect without the `ui` feature.
+    pub fn with_console(mut self, enabled: bool) -> Self {
+        self.console = Some(enabled);
         self
     }
 
@@ -1189,6 +1212,13 @@ impl AppBuilder {
                 } else {
                     "defaults"
                 };
+                // Validated before it is stored: once stored it is revision 1 of an authoritative store, and
+                // a correction to the file would no longer be read.
+                CedarAuthorizer::new(seed).map_err(|e| {
+                    crate::error::AppError::Internal(format!(
+                        "The policy {source} is not valid: {e}. Nothing was stored; correct it and start again."
+                    ))
+                })?;
                 let revision = store
                     .append(seed, "system:bootstrap", Some("Seeded at startup"))
                     .await?;
@@ -1509,6 +1539,7 @@ impl AppBuilder {
         Ok(App {
             app_state,
             cors_config: self.cors_config.unwrap_or_default(),
+            console: self.console.unwrap_or(true),
         })
     }
 }

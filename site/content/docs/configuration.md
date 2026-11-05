@@ -5,12 +5,12 @@ weight = 10
 +++
 ## Configuration Sources
 
-Rustberg loads configuration from multiple sources (in priority order):
+Priority, highest first:
 
-1. **CLI arguments** (highest priority)
+1. **CLI arguments**
 2. **Environment variables**
 3. **TOML config file**
-4. **Default values** (lowest priority)
+4. **Default values**
 
 ---
 
@@ -61,47 +61,37 @@ shutdown_delay_seconds = 0
 
 #### `trusted_proxies`
 
-One setting, three consumers: the rate-limit bucket, `context.source_ip` in a
-Cedar policy, and the address on an audit record. They must agree, and an address
-a caller can choose is an authorization bypass in the second of them — so it is
-not a rate-limiting option.
+Determines the client address for three consumers: the rate-limit bucket,
+`context.source_ip` in Cedar policies, and audit records. It is a security
+setting, not a rate-limiting option: a spoofable address is an authorization
+bypass.
 
-With ranges configured, the forwarding chain is `X-Forwarded-For` left to right
-with the TCP peer appended, and it is walked **from the right**, skipping hops
-inside a trusted range. The first address that is not infrastructure is the
-client. `X-Real-IP` is honoured only when the peer is itself trusted and no chain
-was sent.
-
-Reading the leftmost entry — all a "trust proxy headers" boolean can mean — is a
-spoof: `X-Forwarded-For` is appended to at each hop, so a client that sends one
-of its own arrives as `<chosen>, <real client>`.
-
-A range that does not parse is a **startup failure**, not a silently dropped
-entry. The alternative attributes every request to the load balancer's own
-address while looking like working software.
+- Default (empty): `X-Forwarded-For` is ignored; the client is the TCP peer.
+- With ranges: the chain is `X-Forwarded-For` plus the TCP peer, walked **from
+  the right**, skipping hops inside a trusted range. The first untrusted address
+  is the client.
+- `X-Real-IP` is honoured only when the peer is trusted and no chain was sent.
+- The leftmost entry is never trusted: a client can prepend its own.
+- A range that does not parse is a **startup failure**.
 
 #### `shutdown_delay_seconds`
 
-How long to keep accepting requests after `SIGTERM`, before draining what is in
-flight. Zero is right wherever nothing routes to this process but whoever started
-it — a laptop, Docker Compose, a systemd unit.
+Seconds to keep accepting requests after `SIGTERM`, before draining in-flight
+requests.
 
-Behind a load balancer it is not. Removing an instance from rotation and
-signalling it happen at the same time, and the removal takes time to reach
-whatever is still routing; requests arriving in that window are refused. In
-Kubernetes that is connection errors on every rolling update.
+- `0` (default): fine when nothing but the starter routes to the process
+  (laptop, Docker Compose, systemd).
+- Behind a load balancer, set a few seconds: removal from rotation and the
+  signal happen together, and requests arriving before the removal propagates
+  are refused (in Kubernetes: connection errors on every rolling update).
+- A sleeping `preStop` hook cannot work — the image is distroless, with no shell.
+- Applies to `SIGTERM` only, never `Ctrl+C`.
+- Also settable as `--shutdown-delay` or `RUSTBERG_SHUTDOWN_DELAY` (the Helm
+  chart uses this).
+- After the delay, in-flight requests get 30 seconds on either transport.
 
-A `preStop` hook that sleeps **cannot work here** — the image is distroless, so
-there is no shell. The wait is in-process instead, applies to `SIGTERM` only
-(never `Ctrl+C`), and is also settable as `--shutdown-delay` or
-`RUSTBERG_SHUTDOWN_DELAY`, which is how the Helm chart sets it. Once it is over,
-in-flight requests get 30 seconds on either transport.
-
-Request timeout (30 s), maximum body size (10 MB) and gzip compression are fixed
-rather than configurable. They are limits that protect the server from its
-clients, and an operator who can raise them can also disable the protection by
-accident; when a real deployment needs a different value, that is the point to
-make it a setting.
+Fixed, not configurable: request timeout (30 s), maximum body size (10 MB),
+gzip compression. They protect the server from its clients.
 
 ### Storage Section
 
@@ -124,33 +114,31 @@ location_scope = "table"
 
 #### Where a client may put a table's files
 
-`location_scope` decides how far inside the warehouse a client-supplied location
-may point — the `location` on `createTable` and `createView`, the file
-`registerTable` names, and `set-location` on a commit.
+`location_scope` bounds client-supplied locations: `location` on `createTable`
+and `createView`, the file `registerTable` names, and `set-location` on a commit.
 
 | | Bound | For |
 |---|---|---|
-| `"table"` | `<warehouse>/<namespace>/<name>` | The default. The layout this catalog assigns anyway |
+| `"table"` | `<warehouse>/<namespace>/<name>` | Default. The layout the catalog assigns anyway |
 | `"warehouse"` | the whole warehouse | Adopting a lake whose files are not where a name would put them |
 
-The default is a **security boundary**: a grant is written over the namespace
-tree and storage access is scoped to a path, and those are one hierarchy only
-while a resource's files stay where its name puts them. Under `"warehouse"`, a
-caller permitted to write one table can point it at any prefix in the warehouse
-and be handed a correctly-scoped credential for it. Choose it only where
-something outside Rustberg enforces the isolation, or where every principal that
-can write is trusted with the whole warehouse. See
+The default is a **security boundary**: grants follow the namespace tree and
+storage access is scoped to a path, so the two match only while files stay where
+the name puts them. Under `"warehouse"`, a caller allowed to write one table can
+point it at any warehouse prefix and receive a correctly-scoped credential for
+it. Use it only where something outside Rustberg enforces isolation, or every
+writer is trusted with the whole warehouse. See
 [security](@/docs/security.md#the-storage-boundary-is-the-policy-boundary).
 
-Either way a resource lays itself out freely *under* its own prefix, so
+Either way, a resource may lay out files freely *under* its own prefix:
 `s3://bucket/warehouse/db/events/data/2024/` is fine for table `db.events`.
 
 #### Reaching the warehouse
 
-`[storage.properties]` configures the object store the catalog reads and writes
-metadata through, by Iceberg property name. A `file://` warehouse needs nothing
-here; an object-store warehouse works without it only when the backend finds
-ambient credentials, and an S3-compatible endpoint cannot be reached at all.
+`[storage.properties]` configures the object store the catalog uses for
+metadata, by Iceberg property name. A `file://` warehouse needs nothing. An
+object-store warehouse works without it only with ambient credentials; an
+S3-compatible endpoint cannot be reached without it.
 
 ```toml
 [storage.properties]
@@ -159,13 +147,12 @@ ambient credentials, and an S3-compatible endpoint cannot be reached at all.
 "s3.secret-access-key" = "env:RUSTBERG_S3_SECRET_ACCESS_KEY"
 ```
 
-A value written as `env:NAME` is read from that environment variable at startup,
-so the file holds no secret and can be committed. A variable that is unset or
-blank is a **startup failure**, not a silently absent property — the same rule
-every other secret in the configuration follows.
+`env:NAME` reads the value from that environment variable at startup, so the
+file holds no secret. An unset or blank variable is a **startup failure**, as for
+every other secret in the configuration.
 
-MinIO, Ceph, Cloudflare R2 and anything else speaking the S3 API need the
-endpoint and path-style addressing:
+MinIO, Ceph, Cloudflare R2 and other S3-compatible stores need the endpoint and
+path-style addressing:
 
 ```toml
 [storage.properties]
@@ -174,18 +161,17 @@ endpoint and path-style addressing:
 "s3.region"            = "us-east-1"
 ```
 
-This is one set of properties for the whole process. Keys are scheme-prefixed,
-so a deployment spanning S3 *and* GCS composes fine; two accounts on the **same**
-cloud with different endpoints do not, and need a process each.
+One set of properties per process. Keys are scheme-prefixed, so S3 *and* GCS
+compose; two accounts on the **same** cloud with different endpoints need a
+process each.
 
-Credentials may also come from the ambient environment
-(`AWS_REGION`, `GOOGLE_APPLICATION_CREDENTIALS`, `AZURE_STORAGE_ACCOUNT`, …)
-when nothing is set here.
+When nothing is set, credentials may come from the ambient environment
+(`AWS_REGION`, `GOOGLE_APPLICATION_CREDENTIALS`, `AZURE_STORAGE_ACCOUNT`, …).
 
 ### Authentication
 
-Authentication lives under `[server.auth]`. Both mechanisms may be enabled at
-once; JWT is tried first, then API keys.
+Under `[server.auth]`. Both mechanisms may be enabled; JWT is tried first, then
+API keys.
 
 ```toml
 [server.auth]
@@ -204,21 +190,18 @@ jwt_enabled = false
 policy_file = "/etc/rustberg/policies/catalog.cedar"
 ```
 
-**`policy_file` seeds an empty policy store and is then no longer
-authoritative.** Policy is stored as a versioned log and changed through
+**`policy_file` only seeds an empty policy store.** After that, policy is a
+versioned log changed through
 [`PUT /management/v1/policies`](@/docs/authorization.md#administering-policy-at-runtime),
-which takes effect without a restart. If the file won on every start, every
-change made through the API would vanish the moment a pod restarted.
+effective without a restart; the file does not overwrite it on start.
 
-When the file and the store diverge, startup logs a warning naming the stored
-version. A server whose effective policy set contains no policies refuses to
-start: it would accept nobody, including anyone trying to repair it.
+- File and store diverge: startup logs a warning naming the stored version.
+- Effective policy set is empty: the server refuses to start.
 
 #### API keys
 
-Keys are configuration, not stored state — there is no key database to encrypt
-or back up. The secret is read from an environment variable, so this file holds
-no usable credential:
+Keys are configuration, not stored state — there is no key database. The secret
+is read from an environment variable, so the file holds no usable credential:
 
 ```toml
 [[server.auth.api_keys]]
@@ -228,8 +211,8 @@ roles   = ["writer"]       # become Cedar groups
 key_env = "RUSTBERG_KEY_SPARK"
 ```
 
-A referenced variable that is unset or empty is a startup failure. Rotation is a
-config change plus a restart; if you need revocation without a restart, use JWT.
+An unset or empty variable is a startup failure. Rotation is a config change plus
+a restart; for revocation without a restart, use JWT.
 
 #### JWT / OIDC
 
@@ -261,10 +244,9 @@ oauth2_server_uri = "https://auth.example.com/oauth2/token"
 
 ### CORS
 
-**The default is to allow no origin, and most deployments should leave it there.**
-CORS is enforced by browsers; Spark, Trino, PyIceberg and DuckDB are not browsers
-and are unaffected by this setting. Configure it only if a browser application
-calls the catalog directly.
+**Default: no origin allowed — leave it unless a browser application calls the
+catalog directly.** Spark, Trino, PyIceberg and DuckDB are not browsers and are
+unaffected.
 
 ```toml
 [server.cors]
@@ -273,13 +255,11 @@ allowed_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
 allowed_headers = ["*"]
 ```
 
-An origin that fails to parse is dropped with a warning rather than widening the
-policy — a typo in one entry does not turn a restrictive configuration into an
-open one.
+An origin that fails to parse is dropped with a warning; it never widens the
+policy.
 
-> `allowed_origins = ["*"]` is **refused in production mode**. Either list your
-> origins or pass `--dev`. It is not the default: omitting the section entirely
-> allows no cross-origin request, which is the safe answer and the usual one.
+> `allowed_origins = ["*"]` is **refused in production mode**: list your origins
+> or pass `--dev`. Omitting the section allows no cross-origin request.
 
 ### Rate limiting
 
@@ -295,20 +275,18 @@ max_auth_failures = 5
 lockout_duration_seconds = 300
 ```
 
-Which address counts as "the client IP" is set by
-[`[server] trusted_proxies`](#trusted-proxies), not here.
+The client IP is determined by
+[`[server] trusted_proxies`](#trusted-proxies).
 
-A **failure** is a credential that was presented and rejected — a wrong API key,
-a JWT with a bad signature, an expired or malformed one. Verifying a signature is
-the most expensive thing an unauthenticated caller can ask this server to do,
-which is what the lockout bounds.
+What counts toward the lockout:
 
-Two things deliberately do not count. A request carrying **no** credential is an
-unconfigured client, and counting it would let a stray health checker lock out
-everyone behind its address. And a failure that is *this server's* — an
-unreachable identity provider above all — is not the caller's to pay for;
-turning an outage into a lockout answers it by refusing every client that
-noticed.
+- **Counts:** a credential presented and rejected — wrong API key, JWT with a bad
+  signature, expired or malformed. Signature verification is the costliest thing
+  an unauthenticated caller can request.
+- **Does not count:** a request with **no** credential (so a stray health checker
+  cannot lock out its address).
+- **Does not count:** a server-side failure, such as an unreachable identity
+  provider.
 
 ### TLS
 
@@ -322,10 +300,10 @@ key_path = "/etc/rustberg/tls/key.pem"
 insecure_http = false
 ```
 
-Omitting both paths with `enabled = true` generates a self-signed certificate —
-useful for development only. Supplying one path without the other is a startup
-error rather than a silent fallback. Rustberg is rustls-only; there is no
-OpenSSL in the dependency tree, and `cargo deny` keeps it that way.
+- Both paths omitted with `enabled = true`: a self-signed certificate is
+  generated (development only).
+- Only one path supplied: startup error.
+- rustls only; no OpenSSL in the dependency tree (enforced by `cargo deny`).
 
 ### Audit
 
@@ -338,18 +316,17 @@ sink = "stdout"      # stdout | file | none
 fail_closed = true
 ```
 
-Every authorization decision is recorded as one JSON object per line. See
+Every authorization decision is one JSON object per line. See
 [security](@/docs/security.md#audit).
 
 ### Credentials
 
-Storage credential vending. Omit the section entirely — the default — and
-nothing is vended; engines use their own storage credentials, which is the
-common deployment and not a lesser one.
+Storage credential vending. Omitted (the default): nothing is vended and engines
+use their own storage credentials — a common, fully supported deployment.
 
 ```toml,ignore
 [credentials]
-provider = "aws"        # none (default) | aws | gcs
+provider = "aws"        # none (default) | aws | gcs | azure
 
 # Locations this server may ever mint a credential for.
 # Left unset, this is exactly `storage.warehouse_location`.
@@ -389,8 +366,7 @@ duration_seconds  = 3600
 ```
 
 The Entra service principal needs **Storage Blob Data Contributor** on the
-account (or Reader, for a read-only deployment). A vended SAS can only narrow
-those rights, never widen them.
+account (Reader for read-only). A vended SAS can only narrow those rights.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -402,31 +378,28 @@ those rights, never widen them.
 | `aws.duration_seconds` | `3600` | Lifetime of a vended credential |
 | `gcs.service_account_key_path` | — | Service-account JSON used as the exchange input |
 | `azure.account` | — | Storage account name, without the domain |
-| `azure.tenant_id` | — | Entra tenant the service principal lives in |
+| `azure.tenant_id` | — | Entra tenant of the service principal |
 | `azure.client_id` | — | Service principal's application ID |
 | `azure.client_secret_env` | — | Variable holding the principal's secret |
 | `azure.duration_seconds` | `3600` | Lifetime of a vended SAS |
 
-**`allowed_prefixes` defaults to the warehouse, and that is the right default.**
-The catalog already refuses to record a table outside the warehouse, so a wider
-prefix could only ever authorize a location it will not serve. Set it only to
-*narrow* vending below the warehouse.
+**`allowed_prefixes`:** set it only to *narrow* vending below the warehouse. The
+catalog refuses tables outside the warehouse, so a wider prefix authorizes
+nothing it serves.
 
-Misconfiguration is a **startup failure**, never a server that comes up vending
-nothing while the config says otherwise: a provider with no matching section, a
-named environment variable that is unset or empty, or a provider whose Cargo
-feature (`aws-credentials`, `gcp-credentials`, `azure-credentials`) was not
-compiled in. Release binaries are built with all features.
+**Startup failures:** a provider with no matching section; a named environment
+variable that is unset or empty; a provider whose Cargo feature
+(`aws-credentials`, `gcp-credentials`, `azure-credentials`) is not compiled in.
+Release binaries include all features.
 
-See [security](@/docs/security.md#credential-vending) for what the vended
-credential is actually scoped to.
+See [security](@/docs/security.md#credential-vending) for the vended
+credential's scope.
 
 ### Remote signing
 
-The other delegation form: the engine holds no credential at all, and every
-object request is authorized and signed here. Independent of `provider` — a
-deployment may offer signing, vending, both, or neither, and the client picks
-with `X-Iceberg-Access-Delegation`.
+The engine holds no credential; every object request is authorized and signed
+here. Independent of `provider`: a deployment may offer signing, vending, both,
+or neither, and the client chooses with `X-Iceberg-Access-Delegation`.
 
 ```toml,ignore
 [credentials.signing]
@@ -453,16 +426,15 @@ url_style = "auto"
 | `url_style` | `auto` | `auto`, `path`, or `virtual-host` |
 | `endpoint_host` | none | Host of a custom S3 endpoint |
 
-Signing uses the same credential chain and the same `allowed_prefixes` as
-vending, so there is no second set of secrets. Getting `url_style` wrong fails
-**closed**: the bucket is read from the wrong place, containment does not match
-the table, and the request is refused rather than mis-signed.
+- Uses the same credential chain and `allowed_prefixes` as vending; no second set
+  of secrets.
+- A wrong `url_style` fails **closed**: the bucket is misread, containment does
+  not match, and the request is refused rather than mis-signed.
+- Enabling it without the `remote-signing` Cargo feature is a startup failure.
+  Release binaries include all features.
 
-Enabling this without the `remote-signing` Cargo feature is a startup failure.
-Release binaries are built with all features.
-
-See [the API reference](@/docs/api.md#remote-signing) for what is signed and what
-is refused.
+See [the API reference](@/docs/api.md#remote-signing) for what is signed and
+refused.
 
 ### Federation
 
@@ -471,7 +443,7 @@ is refused.
 
 
 Mount other catalogs under this endpoint. Each mount claims a **top-level
-namespace**; everything beneath it is served by that backend.
+namespace** and serves everything beneath it.
 
 ```toml,ignore
 [mount.prod]
@@ -493,10 +465,9 @@ prod.analytics.events   →  mount "prod"  →  namespace analytics.events
 scratch.tmp             →  unmounted     →  storage.catalog_url
 ```
 
-The mount name is **stripped** on the way down and restored on the way up: a
-mounted catalog has its own namespaces and has never heard of the name it is
-mounted under. Mounting is additive — names no mount claims still reach the main
-catalog, so adding a mount does not disturb what was already there.
+The mount name is **stripped** on the way down and restored on the way up. Names
+no mount claims still reach the main catalog, so adding a mount does not disturb
+existing names.
 
 | Setting | Required | Meaning |
 |---|---|---|
@@ -504,7 +475,7 @@ catalog, so adding a mount does not disturb what was already there.
 | `catalog_url` | **yes** | Backend location — see below |
 | `warehouse_location` | for `native` | Where this mount's tables live |
 | `owner` | **yes** | Tenant that owns everything in the mount |
-| `read_only` | no (`false`) | Refuse every mutation (`native` only). Reads are untouched, [scan planning](@/docs/api.md#scan-planning) included — its manifests are in a warehouse this server declared, which is what a `rest` mount does not have |
+| `read_only` | no (`false`) | Refuse every mutation (`native` only). Reads, including [scan planning](@/docs/api.md#scan-planning), are unaffected; a `rest` mount has no declared warehouse for scan planning |
 | `token_env` | no | Variable holding a bearer token (`rest` only) |
 
 #### Backends
@@ -514,7 +485,7 @@ catalog, so adding a mount does not disturb what was already there.
 | `native` | `file:///path`, `memory://`, or a Postgres DSN | Full, or read-only with `read_only = true` |
 | `rest` | Base URI of an Iceberg REST catalog | **Read-only**, views negotiated from the remote |
 
-A `rest` mount serves somebody else's Iceberg REST catalog:
+A `rest` mount serves another Iceberg REST catalog:
 
 ```toml,ignore
 [mount.partner]
@@ -524,60 +495,42 @@ owner       = "acme"
 token_env   = "RUSTBERG_PARTNER_TOKEN"
 ```
 
-It is **read-only**: reads are what federation is for — one endpoint, one
-identity, over catalogs that already exist — while a write that lands in a
-catalog Rustberg does not own is a different promise from one it does. Writes go
-to the catalog that owns them.
-
-Its capabilities are **negotiated**, not assumed: Rustberg reads the remote's own
-`GET /v1/config` at startup, and a remote serving no view endpoints produces a
-mount that reports no views, rather than one that offers them and fails on use.
-
-A `rest` mount that cannot be reached at startup is a **startup failure**. A
-subtree that silently looks empty is indistinguishable from one you may not see.
-
-`token_env` names an environment variable rather than holding the token, so this
-file carries no credential. A variable that is named but unset or blank is a
-startup failure — not an anonymous connection that fails later with the remote's
-`401`.
+- **Read-only.** Writes go to the catalog that owns them.
+- **Capabilities are negotiated** from the remote's `GET /v1/config` at startup;
+  a remote without view endpoints yields a mount that reports no views.
+- **Unreachable at startup:** startup failure.
+- `token_env` names a variable; the file carries no credential. Named but unset
+  or blank: startup failure.
 
 **Credential vending covers every mount.** With `allowed_prefixes` unset, a
-provider may vend for the server's warehouse *and* each mount's — so a table in
-a mount gets credentials like any other. A `rest` mount contributes nothing:
-Rustberg does not own a remote catalog's storage.
+provider may vend for the server's warehouse *and* each mount's. A `rest` mount
+contributes nothing; Rustberg does not own its storage.
 
 **Each mount governs its own warehouse.** A client-supplied table or view
-location is confined to the warehouse of the mount it is being created in — not
-to the server's — and a table or view created *without* an explicit location
-defaults into that mount's warehouse too. Checking against a single warehouse would reject every
-legitimate table in every mount that stores its data elsewhere, which is all of
-them; and a mount does not govern anywhere *else*, so the confused-deputy
-boundary is intact in both directions.
+location is confined to the warehouse of the mount it is created in, and a
+resource created without a location defaults into that warehouse. The
+confused-deputy boundary holds in both directions.
 
-**`owner` is authoritative for the whole mount**, not a default. A mount is a
-separate catalog whose namespace properties Rustberg does not control, so
-reading ownership from inside it would let whoever can write there decide who
-owns it here. Set it to the same tenant as the rest of the catalog unless you
-mean the mount to belong to a different one — a rename between two tenants is
-refused regardless of mounts.
+**`owner` is authoritative for the whole mount**, not a default; ownership is
+never read from the mounted catalog's namespace properties. Set it to the rest of
+the catalog's tenant unless the mount belongs to another one. A rename between
+two tenants is refused regardless of mounts.
 
-A mount that cannot be opened is a **startup failure**. A namespace subtree that
-silently does not exist is worse than a server that refuses to come up.
+A mount that cannot be opened is a **startup failure**.
 
 #### What is advertised
 
-`GET /v1/config` publishes the **intersection** of what every mount supports.
-One read-only mount removes every mutating endpoint from the advertised list:
+`GET /v1/config` publishes the **intersection** of what every mount supports. One
+read-only mount removes every mutating endpoint from the list:
 
 ```console
 $ curl -s localhost:8000/v1/config | jq '.endpoints | length'
 7
 ```
 
-Those operations still work on the mounts that support them — the refusal is
-per-request, not per-server. What the intersection governs is only what the
-catalog *promises*, because `endpoints` is one list and a client feature-detects
-from it once.
+Those operations still work on mounts that support them; refusal is per-request.
+The intersection governs only what the catalog advertises, because clients
+feature-detect once from one `endpoints` list.
 
 #### What cannot cross a mount
 
@@ -588,15 +541,12 @@ from it once.
 | Rename a table or view | **Refused** (`501`) |
 | Multi-table transaction | **Refused** (`501`) |
 
-Neither can be made atomic between two independent catalogs. Rustberg could
-sequence them and usually get away with it; it would also, sometimes, leave a
-table dropped from one catalog and never created in the other.
+Neither can be made atomic between two independent catalogs.
 
 ### Logging
 
-Application logs go to **stderr**. That is what keeps stdout a clean stream of
-audit records, so `rustberg | jq` works and a log shipper reading the audit
-trail never has to filter human-readable lines out of it.
+Application logs go to **stderr**, keeping stdout a clean stream of audit
+records (`rustberg | jq` works).
 
 ```toml
 [logging]
@@ -616,12 +566,10 @@ with_span_events = true
 
 ## Environment variables
 
-Environment variables set the same things the CLI flags do — clap reads both, so
-each variable is the flag's `env`. They are **not** a general override for the
-TOML file: anything with no flag has no variable, and is set in the file.
+Each variable is a CLI flag's `env` (clap reads both). They are **not** a general
+TOML override: a setting with no flag has no variable and is set in the file.
 
-Precedence is CLI flag, then environment variable, then config file, then the
-default.
+Precedence: CLI flag, environment variable, config file, default.
 
 | Variable | Equivalent flag | Description |
 |----------|-----------------|-------------|
@@ -638,7 +586,7 @@ default.
 | `RUSTBERG_NO_AUTH` | `--no-auth` | Disable authentication — development only |
 | `RUST_LOG` | `--log-level` | Log verbosity. Default `info` |
 
-Cloud SDK variables are read by the SDKs themselves, not by Rustberg:
+Cloud SDK variables, read by the SDKs rather than Rustberg:
 
 | Variable | Used for |
 |----------|----------|
@@ -646,9 +594,9 @@ Cloud SDK variables are read by the SDKs themselves, not by Rustberg:
 | `GOOGLE_APPLICATION_CREDENTIALS` | GCS |
 | `AZURE_STORAGE_ACCOUNT` | The server's own Azure access. Client credential vending is configured under `[credentials.azure]` |
 
-Secrets named by a `*_env` setting — API keys, mount tokens, the Azure client
-secret — are read from whatever variable that setting names. They are
-deliberately not fixed names, so one process can hold several.
+Secrets named by a `*_env` setting (API keys, mount tokens, the Azure client
+secret) are read from whatever variable that setting names, so one process can
+hold several.
 
 ---
 
@@ -686,15 +634,13 @@ OPTIONS:
 ```
 
 There is no `backup`, `restore` or `status` subcommand. Backup belongs to the
-backend — a stopped-server file copy for redb, `pg_dump` for Postgres — and
-[catalog and warehouse](@/docs/storage.md#backup-and-restore) says how. Status is
-`/health` and `/ready`, which report on a server that is actually running rather
-than guessing from what is on disk.
+backend (stopped-server file copy for redb, `pg_dump` for Postgres; see
+[catalog and warehouse](@/docs/storage.md#backup-and-restore)). Status is
+`/health` and `/ready` on the running server.
 
-`healthcheck` exists for one reason: the container image is distroless, so it has
-no shell and no `curl`, and a `HEALTHCHECK` has to be the binary that is already
-there. It reads `/ready` on `127.0.0.1` at this server's own port and exits
-non-zero when the answer is not `200`:
+`healthcheck` is for the distroless image's `HEALTHCHECK` (no shell, no `curl`).
+It reads `/ready` on `127.0.0.1` at the server's port and exits non-zero unless
+the answer is `200`:
 
 ```bash
 rustberg healthcheck                                  # http://127.0.0.1:8000/ready
@@ -702,12 +648,11 @@ rustberg --port 9000 healthcheck                      # a different port
 rustberg healthcheck --url https://catalog/ready      # anywhere else
 ```
 
-Kubernetes does not need it — an `httpGet` probe is made by the kubelet, from
-outside the container — and the Helm chart uses `httpGet` accordingly.
+Kubernetes does not need it: the Helm chart uses kubelet `httpGet` probes.
 
 ### Warehouse Location
 
-The `--warehouse` option specifies where table data files are stored. Supported formats:
+`--warehouse` sets where table data files are stored:
 
 | Format | Example | Description |
 |--------|---------|-------------|
@@ -717,7 +662,7 @@ The `--warehouse` option specifies where table data files are stored. Supported 
 | GCS | `gs://bucket/prefix` | Google Cloud Storage |
 | Azure | `abfss://fs@account.dfs.core.windows.net/prefix` | Azure Data Lake Storage |
 
-> For local filesystem paths, Rustberg automatically creates the directory if it doesn't exist and converts relative paths to absolute paths.
+> Local directories are created if missing; relative paths are made absolute.
 
 **Examples:**
 
@@ -759,7 +704,7 @@ level = "debug"
 json_format = false
 ```
 
-Run it with `--dev --no-auth`; production mode refuses wildcard CORS and
+Run with `--dev --no-auth`; production mode refuses wildcard CORS and
 `--no-auth`.
 
 ### Single-node production
@@ -835,15 +780,12 @@ level = "info"
 json_format = true
 ```
 
-Note `catalog_url` is a **path on a volume**, not a bucket, even in Kubernetes.
-The catalog is a local file; the warehouse is what lives in S3. See
-[storage](@/docs/storage.md#deployment-shape).
+`catalog_url` is a **path on a volume**, not a bucket, even in Kubernetes; only
+the warehouse lives in S3. See [storage](@/docs/storage.md#deployment-shape).
 
 ---
 
 ## Generate Config
-
-Generate a sample configuration file:
 
 ```bash
 ./rustberg generate-config > rustberg.toml

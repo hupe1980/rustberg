@@ -41,6 +41,37 @@ jobs:
         env:
           RUSTDOCFLAGS: -Dwarnings
 
+  # The console: the only job with Node. Type-check, unit, contrast and accessibility tests, the
+  # build, then the server's console tests against the embedded bundle. Every other job builds
+  # without it and serves the page that explains how to build it.
+  ui:
+    name: Console
+    runs-on: ubuntu-latest
+    needs: [quick-checks]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Check, test, build
+        working-directory: ui
+        run: |
+          npm ci
+          npx svelte-check --tsconfig ./tsconfig.json --fail-on-warnings
+          npm test
+          npm run build
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ubuntu-cargo
+          save-if: false
+      - name: Console tests with the bundle embedded
+        env:
+          RUSTBERG_REQUIRE_CONSOLE: "1"
+        run: cargo test --all-features --test console_tests
+
   # Build once, test/reuse everywhere
   build:
     name: Build
@@ -87,6 +118,7 @@ jobs:
           - gcp-credentials
           - azure-credentials
           - remote-signing
+          - ui
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -316,12 +348,8 @@ jobs:
           tags: rustberg:test
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      # `--version` and `--help` prove the binary links. They do not prove the
-      # image *starts*, which is a different question and the one that was
-      # wrong: production mode refuses to run without an explicit catalog
-      # location, so the image's own documented `docker run` exited immediately
-      # while this job stayed green. The smoke test now starts a container the
-      # way the README tells a reader to and waits for it to report ready.
+      # Start the image the way the README does and wait for it to report
+      # healthy — proving it starts, not just that the binary links.
       - name: Test Docker image
         run: |
           set -euo pipefail
@@ -377,17 +405,9 @@ jobs:
           version: 'v3.14.0'
       - name: Lint Helm chart
         run: helm lint charts/rustberg
-      # Rendered per backend, with values that make a *valid* deployment of each.
-      # The chart refuses to render one that would not work — postgres with no
-      # database, redb with more than one replica or without a volume — so
-      # templating the bare defaults asserts nothing except that the guard fires.
-      #
-      # No `kubectl --dry-run` here. There is no cluster on a runner, and client
-      # dry-run still reaches for the API server's OpenAPI schema; the step that
-      # used to do it hid the failure behind `|| true`, which is a gate that
-      # checks nothing. `helm template` parses what it renders, so a template
-      # producing malformed YAML fails on its own, and the objects each backend
-      # is supposed to produce are asserted below.
+      # Rendered per backend with valid values (the chart refuses invalid ones),
+      # then the expected objects are asserted. `helm template` parses what it
+      # renders; `kubectl --dry-run` would need a cluster this runner lacks.
       - name: Template each backend
         run: |
           set -euo pipefail
@@ -459,20 +479,9 @@ jobs:
           echo "=== Binary Size ==="
           ls -lh target/release/rustberg
           du -h target/release/rustberg
-      # Only *definite* leaks are errors.
-      #
-      # `--leak-check=full` alone reports "possibly lost" and "still reachable"
-      # as errors too, and neither is a leak here. Both are what a Rust binary
-      # looks like at exit: process-lifetime statics, thread-local storage, and
-      # the one-time initialisation the C crypto libraries under rustls do in
-      # `call_init` before `main` runs. Every block in the report that failed
-      # this step was one of those, against `definitely lost: 0 bytes` — a gate
-      # that fires on every possible build tells you nothing about any of them.
-      #
-      # What this does check is narrow and worth saying: one short-lived
-      # invocation, so it catches a leak on the startup path and nothing about a
-      # server under load. Valgrind is 20-50x slower, and a gate that takes the
-      # whole build with it gets turned off.
+      # Only *definite* leaks fail: "possibly lost" and "still reachable" are what
+      # a Rust binary's statics and TLS look like at exit. One short run, so this
+      # covers the startup path only.
       - name: Check for memory leaks
         run: |
           valgrind --leak-check=full \

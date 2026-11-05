@@ -294,6 +294,20 @@ pub enum PrincipalType {
     System,
 }
 
+impl PrincipalType {
+    /// The name `/auth/context` and every audit record use for this kind.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Service => "service",
+            Self::ApiKey => "api_key",
+            Self::System => "system",
+            Self::Anonymous => "anonymous",
+        }
+    }
+}
+
 /// How the caller was authenticated.
 ///
 /// One variant per mechanism that exists. `Basic` and `MutualTls` were here

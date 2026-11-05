@@ -1,6 +1,6 @@
 [package]
 name = "rustberg"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "A policy-first Apache Iceberg REST catalog: Cedar authorization on every request, scoped storage access, and an audit trail — in a single binary or as a library"
@@ -10,18 +10,60 @@ categories = ["database", "web-programming"]
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/hupe1980/rustberg"
 homepage = "https://hupe1980.github.io/rustberg/"
-# The floor the dependency tree imposes, not an aspiration: the AWS SDK crates
-# declare 1.94.1 and `iceberg` 0.10.1 declares 1.94, so the higher of the two
-# governs. `just msrv` checks it against a real toolchain, because a version
-# floor nothing verifies drifts to whatever the newest dependency demands.
-rust-version = "1.94.1"
+# The floor the dependency tree imposes (`iceberg` 0.11 declares 1.95);
+# `just msrv` checks it against a real toolchain.
+rust-version = "1.95.0"
+# Explicit, because the embedded console (`ui/dist`) is build output git
+# ignores, and `cargo install` must still get it.
+include = [
+    "/src/**/*.rs",
+    "/tests/**/*.rs",
+    "/tests/python/**/*.py",
+    "/tests/python/**/*.md",
+    "/build.rs",
+    "/ui/dist/*",
+    "/ui/src/**",
+    "/ui/public/*",
+    "/ui/index.html",
+    "/ui/package.json",
+    "/ui/package-lock.json",
+    "/ui/tsconfig.json",
+    "/ui/vite.config.ts",
+    "/site/config.toml",
+    "/site/content/**",
+    "/site/sass/**",
+    # Top-level files only: the console screenshots are not needed to build.
+    "/site/static/*.*",
+    "/site/templates/**",
+    "/charts/**",
+    "/examples/**",
+    "/.github/spec-drift.sh",
+    "/.github/spec-pins.toml",
+    "/.github/workflows/*.yml",
+    "/.gitignore",
+    "/CHANGELOG.md",
+    "/Cargo.lock",
+    "/Dockerfile",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+    "/README.md",
+    "/config.example.toml",
+    "/deny.toml",
+    "/docker-compose.yml",
+    "/justfile",
+    "/pyproject.toml",
+]
 
 [features]
 # Optional dependencies are referenced as `dep:name`. Without the prefix Cargo
 # implicitly exposes each optional dependency as a public feature of the same
 # name, so `--features aws-config` would be a supported knob we never intended
 # and could not later rename. `dep:` keeps the feature surface exactly this list.
-default = ["cli", "tls", "storage-all"]
+default = ["cli", "tls", "storage-all", "ui"]
+
+# The console at /ui: a built web app embedded in the binary (`just ui` builds it).
+# In the default set; `[server.ui] enabled = false` switches it off at run time.
+ui = []
 
 # Command-line interface.
 cli = ["dep:clap"]
@@ -60,10 +102,8 @@ azure-credentials = ["dep:hmac"]
 # here. Stronger than vending and more expensive: one round trip per object
 # instead of one credential per table.
 #
-# `aws-sigv4` is AWS's own signing crate rather than a reimplementation. The
-# canonical request has a dozen ways to be subtly wrong and exactly one symptom
-# — `SignatureDoesNotMatch`, naming no field — so this is the wrong place to
-# save a dependency that is already in the tree under `aws-credentials`.
+# `aws-sigv4` is AWS's own signer, already in the tree: a hand-rolled
+# canonical request fails only as an unexplained `SignatureDoesNotMatch`.
 remote-signing = [
     "dep:aws-sigv4",
     "dep:aws-credential-types",
@@ -101,14 +141,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
 
-# Iceberg
-#
-# 0.10 split storage backends out of the core crate: `iceberg` itself only
-# ships the local-filesystem and in-memory backends, and cloud object stores
-# come from `iceberg-storage-opendal`. That split is what lets this build stay
-# rustls-only — the old bundled `reqsign` pulled in native-tls/OpenSSL.
-iceberg = "0.10"
-iceberg-storage-opendal = { version = "0.10", default-features = false, features = [
+# Iceberg. Cloud object stores come from `iceberg-storage-opendal`; the core
+# crate has only the local and in-memory backends, which keeps the build
+# rustls-only.
+iceberg = "0.11"
+iceberg-storage-opendal = { version = "0.11", default-features = false, features = [
     "opendal-memory",
     "opendal-fs",
 ] }
@@ -125,7 +162,7 @@ subtle = "2.6"   # Constant-time comparison for API key hashes
 zeroize = { version = "1.8", features = ["derive"] }
 
 # Authorization
-cedar-policy = "4.12"
+cedar-policy = "4.14"
 
 # Caching
 moka = { version = "0.12", features = ["future", "sync"] }
@@ -154,13 +191,8 @@ parking_lot = "0.12"
 # HTTP client: JWKS fetching, the `rest` federated mount, and the OAuth2 token
 # exchanges credential vending performs.
 #
-# `form` is what `RequestBuilder::form` needs, and it is declared here rather
-# than inherited: the Entra token request in `credentials/azure.rs` is a
-# `application/x-www-form-urlencoded` POST, and without this feature
-# `--features azure-credentials` alone does not compile. It built under
-# `--all-features` only because another dependency's feature unification
-# switched it on — which is exactly the class of accident the feature matrix in
-# CI exists to catch, and did not, because the matrix was never built.
+# `form` is declared, not inherited: the Entra token request is a form POST,
+# and `--features azure-credentials` alone must compile (`just features`).
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form"] }
 
 # Observability
@@ -213,15 +245,10 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
-axum-test = "17"
 tokio = { version = "1", features = ["test-util", "macros"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 http = "1.1"
 http-body-util = "0.1"
-serial_test = "3.2"
 testcontainers = "0.23"
-tower = { version = "0.5", features = ["util"] }
-futures = "0.3"
 
 [profile.release]
 lto = true

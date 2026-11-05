@@ -41,13 +41,14 @@ use async_trait::async_trait;
 use cedar_policy::{
     Authorizer as CedarEngine, Context, Decision, Entities, Entity, EntityId, EntityTypeName,
     EntityUid, PolicyId, PolicySet, Request, RestrictedExpression, Schema, ValidationMode,
-    Validator,
+    ValidationWarning, Validator,
 };
 
 use super::authz::{
     Action, Authorizer, AuthzContext, AuthzDecision, AuthzOutcome, Obligations, ResourceType,
 };
 use super::error::{AuthError, Result};
+use super::principal::PrincipalType;
 
 /// Separator joining path segments inside an entity id.
 ///
@@ -76,7 +77,10 @@ use crate::names::PART_SEPARATOR as SEP;
 const SCHEMA: &str = r#"
 namespace Rustberg {
   entity Group;
+  // A token's subject, and an API key by its configured name: two kinds, so a
+  // token can never be the key that shares its name.
   entity User in [Group] { tenant: String };
+  entity ApiKey in [Group] { tenant: String };
 
   entity Tenant { tenant: String };
   entity Namespace in [Namespace, Tenant] { tenant: String };
@@ -89,7 +93,7 @@ namespace Rustberg {
 
   action Read, List, Create, Update, Delete, Manage
     appliesTo {
-      principal: User,
+      principal: [User, ApiKey],
       resource: [Tenant, Namespace, Table, View, PolicySet],
       context: { utc_hour: Long, source_ip?: ipaddr }
     };
@@ -176,8 +180,17 @@ impl CedarAuthorizer {
             .map_err(|e| AuthError::Configuration(format!("Invalid Cedar policy: {e}")))?;
 
         let result = Validator::new(schema.clone()).validate(&policies, ValidationMode::Strict);
-        if !result.validation_passed() {
-            let errors: Vec<String> = result.validation_errors().map(|e| e.to_string()).collect();
+        // Cedar reports an action that can never apply as a warning; it is refused like an error, because
+        // the permit it sits in would load and silently grant nothing.
+        let errors: Vec<String> = result
+            .validation_errors()
+            .map(|e| e.to_string())
+            .chain(result.validation_warnings().filter_map(|w| match w {
+                ValidationWarning::InvalidActionApplication(_) => Some(w.to_string()),
+                _ => None,
+            }))
+            .collect();
+        if !errors.is_empty() {
             return Err(AuthError::Configuration(format!(
                 "Cedar policy validation failed: {}",
                 errors.join("; ")
@@ -427,7 +440,11 @@ impl CedarAuthorizer {
 
     /// Builds the principal entity and the groups it belongs to.
     fn principal_entities(ctx: &AuthzContext) -> Result<(EntityUid, Vec<Entity>)> {
-        let uid = Self::uid("User", ctx.principal.id())?;
+        let kind = match ctx.principal.principal_type() {
+            PrincipalType::ApiKey => "ApiKey",
+            _ => "User",
+        };
+        let uid = Self::uid(kind, ctx.principal.id())?;
 
         let mut entities = Vec::new();
         let mut groups = HashSet::new();
@@ -832,6 +849,44 @@ mod tests {
             b = b.with_role(*r);
         }
         b.build()
+    }
+
+    /// A rule whose action can never apply to its principal or resource never matches, so loading it would
+    /// leave a permit that silently grants nothing. It is refused, naming the policy — whatever severity the
+    /// Cedar validator gives that finding.
+    #[test]
+    fn a_policy_whose_action_cannot_apply_is_refused() {
+        let Err(err) = CedarAuthorizer::new(
+            r#"permit(principal is Rustberg::Group, action == Rustberg::Action::"Read", resource);"#,
+        ) else {
+            panic!("a policy that can never apply must not load");
+        };
+        let message = err.to_string();
+        assert!(message.contains("policy0"), "{message}");
+    }
+
+    /// A key and a token subject of one name are two principals: a rule naming the key admits no token, so an
+    /// identity provider can never issue a token that inherits a key's grants — and the other way round.
+    #[test]
+    fn a_rule_naming_a_key_does_not_admit_a_user_of_that_name() {
+        let authz = CedarAuthorizer::new(
+            r#"permit(principal == Rustberg::ApiKey::"svc-etl", action == Rustberg::Action::"Read", resource);"#,
+        )
+        .unwrap();
+        let as_kind = |kind| {
+            let who = PrincipalBuilder::new("svc-etl", "svc-etl", kind, "acme", AuthMethod::ApiKey)
+                .build();
+            let ctx = AuthzContext::new(who, Resource::table("acme", ["ns"], "t"), Action::Read);
+            authz.evaluate(&ctx).unwrap().decision.is_allowed()
+        };
+        assert!(
+            as_kind(PrincipalType::ApiKey),
+            "the key the rule names is refused"
+        );
+        assert!(
+            !as_kind(PrincipalType::User),
+            "a token subject inherited a key's grant"
+        );
     }
 
     fn table_ctx(tenant: &str, ns: &[&str], name: &str, action: Action) -> AuthzContext {

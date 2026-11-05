@@ -218,7 +218,7 @@ fn map_key_field_ids(schema: &Schema) -> HashSet<i32> {
                 walk(&map.key_field, out);
                 walk(&map.value_field, out);
             }
-            Type::Primitive(_) => {}
+            Type::Primitive(_) | Type::Variant(_) => {}
         }
     }
 

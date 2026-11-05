@@ -259,7 +259,7 @@ pub(super) fn record_decision(
         &context.resource.path(),
         outcome.is_allowed(),
     )
-    .with_principal_id(context.principal.id())
+    .with_principal(&context.principal)
     .with_tenant_id(context.principal.tenant_id())
     .with_optional_client_ip(context.request.source_ip)
     .with_optional_request_id(context.request.request_id.as_deref())

@@ -1,0 +1,25 @@
+{
+  "name": "rustberg-console",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "Rustberg's console: built to flat files the binary embeds at compile time. Nothing is fetched from another origin.",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run",
+    "shots": "node scripts/shots.mjs"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "7.3.0",
+    "axe-core": "4.13.0",
+    "happy-dom": "21.0.1",
+    "puppeteer-core": "24.10.0",
+    "svelte": "5.57.1",
+    "svelte-check": "4.7.6",
+    "typescript": "5.9.3",
+    "vite": "8.3.0",
+    "vitest": "5.0.4"
+  }
+}

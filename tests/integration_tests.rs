@@ -243,7 +243,6 @@ async fn test_auth_context_returns_principal_info() {
         .with_role("reader")
         .build();
 
-    let expected_id = api_key.id.to_string();
     store.store(api_key).await.expect("Failed to store key");
 
     let (status, body) = make_request(
@@ -259,8 +258,8 @@ async fn test_auth_context_returns_principal_info() {
 
     let response: serde_json::Value = serde_json::from_str(&body).expect("Invalid JSON");
 
-    // Verify principal info (id is the key's UUID, not the name)
-    assert_eq!(response["principal"]["id"], expected_id);
+    // A key is the principal it is named after: the id a policy names and the audit trail records.
+    assert_eq!(response["principal"]["id"], "context-test-key");
     assert_eq!(response["principal"]["name"], "context-test-key");
     assert_eq!(response["principal"]["tenant_id"], "tenant-context");
     assert_eq!(response["principal"]["principal_type"], "api_key");

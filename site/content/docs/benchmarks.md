@@ -1,74 +1,59 @@
 +++
 title = "Performance"
 description = "What Rustberg's performance actually is, how it is measured, and which claims are gated in CI."
-weight = 14
+weight = 15
 +++
 ## What this page is
 
-Every number here is either reproducible with the shipped binary, or explicitly
-labelled as an unmeasured target. Nothing is extrapolated from an instance type.
+Every number is either reproducible with the shipped binary or labelled as an
+unmeasured target. Nothing is extrapolated from an instance type.
 
 ---
 
 ## Measured
 
-### The `benchmark` subcommand
+### The `bench` subcommand
 
 ```bash
 rustberg bench --iterations 1000
 ```
 
-It covers the parts of a request that are Rustberg's own work rather than the
-storage backend's. On an Apple M-series laptop, release build:
+It measures Rustberg's own work, not the storage backend's. Verifying an API
+key on each request is one SHA-256 of the presented key and a constant-time
+compare.
 
-| | Average |
-|---|---|
-| API key generation (CSPRNG + SHA-256) | ~4 µs |
-| **API key verification** (per request) | **~0.55 µs** |
-| TOML config parse (startup only) | ~8 µs |
-
-Key verification is the number that matters, because it happens on every
-API-key-authenticated request.
-
-> A password KDF here would cost ~20–40 ms per request instead. Its work factor
-> defends a low-entropy secret; a Rustberg API key is 32 bytes from the OS
-> CSPRNG, so there is no search space to slow down — the cost would fall entirely
-> on the server, including the dummy verification run for requests carrying no
-> valid key. See [authentication](@/docs/authentication.md#why-not-a-password-kdf).
+> A password KDF would cost ~20–40 ms per request. API keys are 32 bytes from the
+> OS CSPRNG, so a work factor protects nothing. See
+> [authentication](@/docs/authentication.md#why-not-a-password-kdf).
 
 ### Request latency
 
 `rustberg bench --iterations 200`, release build with `--all-features`, redb
-catalog on local disk — **Rustberg 0.3.0, Apple M4 Pro (14 core), macOS 26.6.2,
-rustc 1.98.1, 2026-09-18**. One developer machine on one day, so read them as an
-order of magnitude. The targets are design goals; the measurements are asserted
-on every pull request against looser ceilings — see [Gated in CI](#gated-in-ci).
+catalog on local disk: **Rustberg 0.4.0, Apple M4 Pro (14 core), macOS 26.6.2,
+rustc 1.99.1, 2026-11-05**. One machine, one day: read as an order of magnitude.
+Targets are design goals; measurements are asserted on every pull request
+against looser ceilings ([Gated in CI](#gated-in-ci)).
 
 | | p50 | p99 | Target |
 |---|---|---|---|
-| **Authorization** (one Cedar decision) | 22.6 µs | **23.4 µs** | < 1 ms |
-| **`loadTable`** (full HTTP stack) | 326 µs | **373 µs** | < 5 ms |
-| Policy compile + validate (startup) | 591 µs | 944 µs | — |
-| Cold start (build → first answer) | 29.1 ms | **30.9 ms** | < 100 ms |
+| **Authorization** (one Cedar decision) | 23.5 µs | **32.9 µs** | < 1 ms |
+| **`loadTable`** (full HTTP stack) | 315 µs | **420 µs** | < 5 ms |
+| Policy compile + validate (startup) | 694 µs | 875 µs | — |
+| Cold start (build → first answer) | 31.0 ms | **37.1 ms** | < 100 ms |
 
-Run it yourself with `rustberg bench`; the harness lives in the library, so it
-and CI measure the same code path.
+Authorization runs on every request, so a regression there costs everything.
 
-Authorization is the number with the most leverage: it runs on every request, so
-a regression there is paid by everything.
-
-A `304` is cheaper than a `200` because it is answered from the catalog's
-metadata *pointer* and never fetches the metadata document. On a local disk with
-a warm page cache that saving is small; against object storage the document is a
-network round trip, and skipping it is the point of
-[conditional loading](@/docs/api.md#conditional-loading).
+A `304` is answered from the metadata *pointer* without fetching the metadata
+document. On a warm local disk the saving is small; against object storage it
+skips a network round trip
+([conditional loading](@/docs/api.md#conditional-loading)).
 
 ### Startup and footprint
 
 | | Value |
 |---|---|
 | Cold start (exec → accepting connections) | ~30 ms |
-| Idle RSS | **15.4 MB** idle on macOS (`ps` against a `--dev` server); gated at < 50 MB on Linux in CI |
+| Idle RSS | **15.7 MB** idle on macOS (`ps` against a `--dev` server); gated at < 50 MB on Linux in CI |
 | Binary (`--all-features`, stripped) | ~24 MB |
 
 Reproduce with:
@@ -78,10 +63,9 @@ time rustberg --dev --no-auth --insecure-http --catalog-url file:///tmp/rb --por
 ps -o rss= -p "$(pgrep -n rustberg)"
 ```
 
-> The binary carries every optional feature — Postgres, all three object stores,
-> AWS and GCP credential vending, TLS — because that is what release builds ship.
-> A build with `--no-default-features` is considerably smaller, and a deployment
-> that needs only one storage backend can cut most of the difference.
+> Release builds carry every optional feature: Postgres, all three object stores,
+> AWS and GCP credential vending, TLS. A `--no-default-features` build with one
+> storage backend is considerably smaller.
 
 ### Reproducing the latency table
 
@@ -89,15 +73,12 @@ ps -o rss= -p "$(pgrep -n rustberg)"
 cargo test --release --all-features --test performance_tests -- --ignored --nocapture
 ```
 
-The harness lives in `observability::perf` rather than in the test, so
-`rustberg bench` and the CI gate measure the same thing — two implementations
-would drift, and the one an operator runs would stop matching the one that fails
-the build.
+The harness lives in `observability::perf`, so `rustberg bench` and the CI gate
+measure the same code path.
 
 ### Gated in CI
 
-These are pass/fail on every pull request, which is a stronger claim than a
-number on a page:
+Pass/fail on every pull request:
 
 - PyIceberg, DuckDB and Trino conformance suites against the built binary
 - Concurrent-commit tests asserting zero lost updates, on both catalog backends,
@@ -108,41 +89,36 @@ number on a page:
 - The declared MSRV, against that toolchain
 - `cargo deny` over advisories, licences, bans and sources
 
-The ceilings that fail the build are deliberately much looser than the targets.
-CI runners are shared and noisy, and a gate that flakes gets disabled — at which
-point it protects nothing. These catch order-of-magnitude regressions, which is
-what work added to a hot path actually looks like.
+CI ceilings are deliberately much looser than the targets, because runners are
+noisy. They catch order-of-magnitude regressions.
 
 ---
 
 ## Not measured
 
-These have no benchmark asserting them, and are listed separately so the
-distinction stays visible:
+No benchmark asserts these:
 
 | | Why not |
 |---|---|
-| **Commit p99** | Dominated by the object store writing the metadata file, not by the catalog. A number here would mostly measure your S3. |
-| **`loadTable` when federated** | The target is < 1.2× the mounted catalog's own latency, which needs a remote catalog of known latency to compare against. A unit-test harness cannot supply one. |
-| **Throughput under concurrency** | Depends on your hardware, your catalog backend and your object store far more than on Rustberg. Measure it where it will run — see [load testing](#load-testing). |
+| **Commit p99** | Dominated by the object store writing the metadata file; it would mostly measure your S3. |
+| **`loadTable` when federated** | Target < 1.2× the mounted catalog's own latency; needs a remote catalog of known latency, which a unit-test harness cannot supply. |
+| **Throughput under concurrency** | Depends on your hardware, catalog backend and object store more than on Rustberg. See [load testing](#load-testing). |
 
 ---
 
 ## What determines your latency
 
-For a catalog request, the time goes to three places:
+A catalog request spends its time in:
 
 1. **Object storage.** `loadTable` reads a metadata JSON file; a commit writes
-   one. On S3 that is a single-digit-to-tens-of-milliseconds round trip, and it
-   dominates everything Rustberg does by one to two orders of magnitude. Deploy
-   in the same region as the bucket.
-2. **The catalog registry.** With redb, a local B-tree read — microseconds. With
-   Postgres, a network round trip to the database.
+   one. On S3 that round trip is single-digit to tens of milliseconds, one to two
+   orders of magnitude above Rustberg's work. Deploy in the bucket's region.
+2. **The catalog registry.** redb: a local B-tree read, microseconds. Postgres: a
+   network round trip.
 3. **Rustberg itself.** Authentication (~0.5 µs), Cedar evaluation, JSON
    serialisation.
 
-The practical consequence is that catalog tuning is mostly *storage* tuning.
-Moving Rustberg closer to the bucket helps far more than anything on this page.
+Catalog tuning is mostly *storage* tuning.
 
 ### Backend choice
 
@@ -152,15 +128,14 @@ Moving Rustberg closer to the bucket helps far more than anything on this page.
 | Replicas | exactly 1 | many |
 | Operational surface | one file | a database to run |
 
-redb is faster per operation; Postgres is what lets you run more than one
-replica. See [storage](@/docs/storage.md).
+redb is faster per operation; Postgres allows more than one replica. See
+[storage](@/docs/storage.md).
 
 ---
 
 ## Load testing
 
-The honest way to get numbers for your deployment. With
-[k6](https://k6.io):
+Measure your own deployment, e.g. with [k6](https://k6.io):
 
 ```javascript
 // load-test.js
@@ -191,8 +166,8 @@ export default function () {
 BASE_URL=https://rustberg.example.com API_KEY=$KEY k6 run load-test.js
 ```
 
-Point it at a warehouse on the storage you actually use. A run against a local
-filesystem warehouse measures your disk, not your production latency.
+Use a warehouse on your production storage; a local filesystem warehouse
+measures your disk.
 
 ---
 

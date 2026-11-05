@@ -935,3 +935,21 @@ async fn a_request_without_a_chain_records_no_chain() {
         "an absent chain leaves the field off the record entirely"
     );
 }
+
+/// Every record names the key by its configured name and says it was a key, so "everything `admin` did" is one
+/// query across restarts and replicas, and a key is never confused with a token subject of the same name.
+#[tokio::test]
+async fn a_record_names_a_key_and_its_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let auditor = Arc::new(Auditor::new(Box::new(FileSink::open(&path).unwrap()), true));
+    let (app, secret) = app_with(auditor).await;
+    let _ = send(&app, Method::GET, "/v1/namespaces", &secret, None).await;
+
+    let decision = records_at(&path)
+        .into_iter()
+        .find(|r| r["category"] == "authorization")
+        .expect("a decision was recorded");
+    assert_eq!(decision["principal_id"], "admin", "record: {decision}");
+    assert_eq!(decision["principal_type"], "api_key", "record: {decision}");
+}

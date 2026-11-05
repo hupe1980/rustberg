@@ -22,5 +22,9 @@ pub fn create_routes(app_state: AppState) -> Router {
         )
         .route("/v1/policies/history", get(policies::policy_history))
         .route("/v1/policies/rollback", post(policies::rollback_policies))
+        .route(
+            "/v1/policies/revisions/{sequence}",
+            get(policies::get_revision),
+        )
         .with_state(app_state)
 }

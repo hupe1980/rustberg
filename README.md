@@ -14,7 +14,7 @@ crate.
 [API reference](https://hupe1980.github.io/rustberg/docs/api/) ·
 [Security](https://hupe1980.github.io/rustberg/docs/security/)
 
-<img src="https://img.shields.io/badge/tests-1139%20%2B%2071%20client-brightgreen" alt="1139 Rust tests, 71 client conformance tests">
+<img src="https://img.shields.io/badge/tests-1168%20%2B%2085%20console%20%2B%2072%20client-brightgreen" alt="1168 Rust tests, 85 console tests, 72 client conformance tests">
 <img src="https://img.shields.io/badge/unsafe-forbidden-brightgreen" alt="unsafe forbidden">
 <img src="https://img.shields.io/badge/binary-~24%20MB-blue" alt="~24 MB binary">
 <img src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue" alt="Apache-2.0 OR MIT">
@@ -46,13 +46,12 @@ can be mounted behind the same endpoint and the same policy — read-only.
         │  routing → storage →      │
         │  audit                    │
         └───────────────────────────┘
-           │         │          │
-     ┌─────┘         │          └──────────┐
-     ▼               ▼                     ▼
-  its own        mounted, read-only    AWS Glue
-  registry       (Polaris · Lakekeeper  Hive · S3 Tables
-  redb ·          · Unity · Nessie)       (not built)
-  Postgres
+              │               │
+        ┌─────┘               └──────┐
+        ▼                            ▼
+     its own                 mounted, read-only
+     registry                (Polaris · Lakekeeper
+     redb · Postgres          · Unity · Nessie)
 ```
 
 Storing table pointers is solved. Governing who may read, who may write and who
@@ -62,15 +61,12 @@ that decision correct, fast and auditable.
 ## 🚀 Quick start
 
 ```bash
-curl -L https://github.com/hupe1980/rustberg/releases/latest/download/rustberg-linux-x86_64.tar.gz \
-  | tar -xz
-
-./rustberg-linux-x86_64 --dev --insecure-http
+brew install hupe1980/tap/rustberg      # macOS (Apple Silicon) and Linux
+rustberg --dev --insecure-http
 ```
 
-Authentication is on by default. With nothing configured, Rustberg mints one
-admin key and prints it, rather than starting in a state that accepts nobody or
-one that accepts everybody:
+Authentication is on by default. With nothing configured, Rustberg mints an
+admin key and prints it:
 
 ```text
 WARN No API keys or OIDC configured — minted a temporary admin key.
@@ -79,8 +75,19 @@ WARN     curl -H 'X-API-Key: rb_sOYl…' http://localhost:8000/v1/config
 ```
 
 The key lives in memory only, so a restart mints a new one — configure
-`[[server.auth.api_keys]]` or OIDC for anything lasting. Then point a client at
-it:
+`[[server.auth.api_keys]]` or OIDC for anything lasting.
+
+Open **<http://localhost:8000/ui/>** and paste the key: the built-in
+[console](https://hupe1980.github.io/rustberg/docs/console/) shows the catalog
+exactly as that credential sees it — which tables are restricted for you, and
+how — and lets an administrator edit, review and restore the policy set.
+
+<picture>
+  <source srcset="site/static/console/table-restricted-dark.webp" media="(prefers-color-scheme: dark)">
+  <img src="site/static/console/table-restricted-light.webp" alt="The console showing the orders table as an analyst sees it: restricted to region EU, with the email column masked." width="820">
+</picture>
+
+Then point a client at it:
 
 ```python
 from pyiceberg.catalog.rest import RestCatalog
@@ -89,28 +96,25 @@ catalog = RestCatalog("rustberg", uri="http://localhost:8000", token="rb_...")
 catalog.create_namespace("analytics")
 ```
 
-Without `--dev`, Rustberg runs in production mode: it requires an explicit
-`--catalog-url` and refuses wildcard CORS, so an ephemeral catalog never quietly
-ends up holding real metadata.
+Without `--dev` Rustberg runs in production mode: it needs an explicit
+`--catalog-url` and refuses wildcard CORS.
 
 <details>
 <summary><strong>🐳 Docker, Helm, and building from source</strong></summary>
 
 ```bash
-# Docker — take the key from the startup log. `-v` because the image's catalog
-# lives in a declared volume; without one it works and is discarded with the
-# container.
+# Docker — the key is in the startup log; the volume keeps the catalog.
 docker run -d -p 8000:8000 --name rustberg \
   -v rustberg-data:/var/lib/rustberg \
   -e RUSTBERG_INSECURE_HTTP=true ghcr.io/hupe1980/rustberg:latest
 docker logs rustberg 2>&1 | grep X-API-Key
 
-# Helm
+# Helm, from a clone: Postgres catalog (DSN in a Secret), S3 warehouse
 helm install rustberg charts/rustberg \
-  --set rustberg.storage.type=s3 \
-  --set rustberg.storage.s3.bucket=my-catalog-bucket
+  --set rustberg.catalog.postgres.existingSecret=rustberg-catalog \
+  --set rustberg.warehouse.location=s3://my-bucket/warehouse
 
-# From source — Rust 1.94.1 or newer
+# From source — Rust 1.95 or newer, and Node 24 for the console (`just ui`)
 cargo build --release --all-features
 ```
 
@@ -118,61 +122,25 @@ cargo build --release --all-features
 
 ## 🛡️ Why it exists
 
-**Policy is the product.** Every other subsystem exists to make the policy
-decision correct, fast and auditable.
-
-- **Cedar, not a permission table.** Resources form a hierarchy, so one policy
-  covers a whole namespace subtree — including tables that do not exist yet.
-  Policies are validated at load, so a typo is a startup failure rather than a
-  `permit` that silently never matches. Deny by default, including on evaluation
-  error.
-- **Listings filter, they do not deny.** A caller sees exactly the subset it may
-  read and never learns the rest exists. A resource you cannot see is `404`, not
-  `403`, so the status code is never an oracle.
-- **Storage access only narrows, in two strengths.** Vend a short-lived
-  credential scoped to one table prefix — STS session policies, GCS credential
-  access boundaries, Azure user-delegation SAS, each a real downscoping exchange.
-  Or hand the engine *nothing* and sign every object request, so a revoked grant
-  takes effect on the next read rather than at the next expiry. A signature is
-  confined by *every* location the request touches — a `DeleteObjects` body, a
-  list prefix in the query string, a copy source in a header — and to an
-  allowlist of operations, because `PUT …/f.parquet?acl` is inside the table and
-  publishes it to the internet.
-- **The storage boundary is the policy boundary.** A grant is written over the
-  namespace tree; storage access is scoped to a path. Those are one hierarchy
-  only while a table's files stay where its name puts them — so a
-  client-supplied location is confined to `<warehouse>/<namespace>/<name>`, on
-  `createTable`, `registerTable` and `set-location` alike. Otherwise a caller
-  permitted to write *one* table can point it at a prefix its policy never
-  mentioned and be handed a correctly-scoped credential for it.
-- **Identity by naming your provider.** OIDC issuer and audiences; signing keys
-  discovered from the issuer's own metadata, whose `issuer` is checked before it
-  is believed. RS256, ES256 and EdDSA, chosen by configuration rather than by the
-  token, and no `HS*` against a JWKS. API keys stay configuration, not stored
-  state.
-- **Scan planning that knows the policy.** `planTableScan` conjoins a permit's
-  `@row_filter` with the client's own, so a restricted caller is told about fewer
-  files. A filter this catalog cannot bind is *widened*, never dropped — pruning
-  against a predicate nobody wrote returns too few files. A *policy* filter
-  inverts that and is refused instead, at the moment the policy set loads, since
-  a widened restriction is no restriction.
-- **The audit trail is a deliverable.** Authentication, decisions, credential
-  vending, request signing and rate limiting go to one sink. Every decision names
-  the policy that made it and the version of the policy set it came from; every
-  grant of storage access says whether the credential could *write* and which
-  objects a signature covered. When the sink fails, a permitted mutation fails
-  with it — including a policy change, which is recorded before it is installed
-  so that failing is honest.
-- **Deletion protection.** `rustberg.protected = "true"` on a table, view or
-  namespace refuses a drop or purge with `409` until it is cleared. A guard
-  against the `DROP TABLE` typed at the wrong catalog, not against an adversary —
-  for that, write a `forbid`.
-- **Federation under one identity.** Mount several catalogs — your own, or
-  somebody else's Iceberg REST catalog — routed by top-level namespace. The mount
-  is invisible on the wire, so a cross-catalog join is ordinary SQL.
-- **A binary, or a crate.** `app.as_principal(p)` gives the same operations
-  in-process, through the same authorization guard, with no router. The
-  equivalence is tested as equivalence.
+- **Cedar policy on every request.** Resources form a tree, so one rule covers a
+  namespace subtree, including tables not yet created. Policies are validated at
+  load; deny by default, including on evaluation error.
+- **Row filters and column masks, enforced.** A restricted table gets no broad
+  credential: it is planned server-side and handed pre-signed URLs for exactly
+  the files its filter selects. The spec's `read-restrictions` are published too.
+- **Listings filter, they do not deny.** What you cannot see is `404`, never `403`.
+- **Storage access only narrows.** Vended credentials scoped to one table (STS,
+  GCS access boundaries, Azure user-delegation SAS), or remote signing, where the
+  engine holds no credential at all.
+- **Locations follow names.** A table's files stay under
+  `<warehouse>/<namespace>/<name>`, so the storage boundary is the policy boundary.
+- **Identity from your provider.** OIDC with discovered keys (RS256, ES256,
+  EdDSA); API keys are configuration, named in policy as `ApiKey::"<name>"`.
+- **An audit trail that names the rule.** Every decision records the policy and
+  policy-set version behind it; if the sink fails, mutations fail with it.
+- **A console that shows what you may see**, built in at `/ui`.
+- **Federation, a binary or a crate.** Mount other catalogs under one endpoint,
+  or embed the same operations in-process behind the same guard.
 
 ```cedar
 // Analysts read anything under one namespace subtree, and nothing else.
@@ -184,7 +152,7 @@ permit(
 
 // A pipeline writes to one namespace, outside business hours only.
 permit(
-  principal == Rustberg::User::"svc-etl",
+  principal == Rustberg::ApiKey::"svc-etl",
   action    in [Rustberg::Action::"Create", Rustberg::Action::"Update"],
   resource  in Rustberg::Namespace::"acme\u{1F}analytics\u{1F}web"
 ) when { context.utc_hour < 6 || context.utc_hour > 20 };
@@ -234,54 +202,19 @@ on every change.
 
 ## 🚧 What it does not do
 
-Rustberg declines what it has not built, with a status code — never a silent
-partial success.
+Each is declined with a status code, never a silent partial success.
 
-- **A table under a row filter or column mask is refused a credential and a
-  signature** rather than handed prefix-wide access, and is delegated through its
-  scan plan instead. Row filtering is enforced at **file** granularity: an
-  unplanned file has no URL and no credential behind it. Rows *inside* a delivered
-  file are the reader's to filter, so a filter is enforcement end to end only
-  where the column is partitioned with an **identity** transform — `days(ts)` and
-  `bucket(16, id)` put permitted and forbidden rows in the same file — and
-  Rustberg warns at table load when it is not.
-- **A restriction that cannot be applied is never silently dropped.** Masks
-  resolve to Iceberg **field ids**, so a mask on a struct covers the fields
-  beneath it and renaming a masked column cannot quietly unmask it — the table's
-  schema *history* tells a rename (which refuses, loudly) from a column this table
-  never had (which is skipped, so a tenant-wide mask does not break every table it
-  does not fit).
-- **`read-restrictions` is published, and changes nothing about what is
-  withheld.** A restricted `loadTable` carries the spec's row filter and column
-  projections, addressed by field id, so a conforming engine applies them — and
-  still receives no credential and no signer block. It is the only mechanism that
-  reaches an engine reading with its own storage credentials, and it is
-  cooperative: a hostile engine ignores it. A filter a table cannot carry is
-  published as `false` rather than omitted, because omitting it would tell a
-  conforming reader the table is unrestricted.
-- **A restricted table's plan is scoped by pre-signed URLs.** `loadTable` sets
-  `scan-planning-mode: server`, so a conforming client plans through the catalog
-  and never reads the excluded files' manifests; the plan returns one pre-signed
-  URL per file the filter selected, and no credential or signer block either way.
-  S3 only, and the URL is a bearer token for its TTL (`presign_ttl_seconds`,
-  15 minutes by default).
-- **Asynchronous and incremental scan planning** are not implemented. Every plan
-  is answered inline, and an incremental scan is declined with `501` rather than
-  answered as a full one.
-- **Table maintenance — compaction, orphan-file cleanup, manifest rewriting —
-  is not built, and will not be.** It is data rewriting, which would put a
-  catalog in the data path. Apache Polaris settled the same question the same
-  way and delegates to an external maintenance system; Lakekeeper emits events
-  for one to react to. The metadata half already works here: `expireSnapshots`
-  and statistics removal arrive as ordinary table updates, and
-  `?purgeRequested=true` deletes the files a dropped table referenced — with a
-  compare-and-swap commit, a policy decision and an audit record each time.
-- **Glue, Hive Metastore and S3 Tables** mounts are not built. `native` (redb,
-  Postgres) and `rest` are.
-- **SQL UDFs** (`…/namespaces/{ns}/functions`) are not built.
-- Rustberg **does not issue tokens**. `POST /v1/oauth/tokens` is deprecated in
-  the spec, and token issuance belongs to your identity provider —
-  `oauth2-server-uri` in the config response points at it.
+- **Rows inside a delivered file are the reader's to filter.** Row filtering is
+  enforced per file, so it is end-to-end only where the column is
+  identity-partitioned; Rustberg warns at table load when it is not. A pre-signed
+  URL is a bearer token until it expires (15 minutes by default), and only S3 is
+  pre-signed.
+- **Asynchronous and incremental scan planning**: plans are answered inline; an
+  incremental scan is `501`.
+- **Table maintenance** (compaction, orphan cleanup): a data-path job for an
+  external system. Snapshot expiry and purge-on-drop work.
+- **Glue, Hive Metastore and S3 Tables mounts**; **SQL UDFs**.
+- **Token issuance**: that belongs to your identity provider.
 
 → [Known limitations](https://hupe1980.github.io/rustberg/docs/api/#known-limitations)
 
@@ -292,9 +225,9 @@ that fail the build.
 
 | | Target | Measured (p99) |
 |---|---|---|
-| Authorization overhead | < 1 ms for point operations | **23 µs** |
-| `loadTable` | < 5 ms native | **373 µs** |
-| Cold start to serving | < 100 ms | **31 ms** |
+| Authorization overhead | < 1 ms for point operations | **33 µs** |
+| `loadTable` | < 5 ms native | **420 µs** |
+| Cold start to serving | < 100 ms | **37 ms** |
 | Idle footprint | < 50 MB RSS | **15 MB** |
 
 → [Performance](https://hupe1980.github.io/rustberg/docs/benchmarks/)
@@ -305,6 +238,8 @@ that fail the build.
 just test          # cargo test --all-features
 just lint          # clippy -D warnings, rustfmt
 just site          # serve the documentation site (requires zola)
+just ui            # build the console (Node 24); just ui-dev for live reload
+just shots         # retake the console screenshots
 ```
 
 `just --list` shows the rest.

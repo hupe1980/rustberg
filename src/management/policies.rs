@@ -256,6 +256,42 @@ pub async fn rollback_policies(
     Ok(AxumJson(PolicyResponse::new(revision, sequence)))
 }
 
+/// `GET /management/v1/policies/revisions/{sequence}`
+///
+/// One revision with its text. The history lists revisions without their text, so this is how any
+/// one of them is read back — what a reviewer compares before restoring it. Reading a revision is
+/// reading the policy set, and is authorized as that.
+pub async fn get_revision(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    RequestFacts(request): RequestFacts,
+    axum::extract::Path(sequence): axum::extract::Path<u64>,
+) -> Result<AxumJson<PolicyResponse>> {
+    let admin = admin(&state)?;
+
+    guard::authorize_new(
+        &state,
+        &principal,
+        &request,
+        Resource::policy_set(principal.tenant_id()),
+        Action::Read,
+    )
+    .await?;
+
+    let revision = admin.store.get(sequence).await?.ok_or_else(|| {
+        AppError::NoSuchReference(format!(
+            "No policy revision {sequence}. Use GET /management/v1/policies/history to see \
+             which revisions exist."
+        ))
+    })?;
+    let latest = admin
+        .store
+        .current()
+        .await?
+        .map_or(revision.sequence, |current| current.sequence);
+    Ok(AxumJson(PolicyResponse::new(revision, latest)))
+}
+
 /// `GET /management/v1/policies/history`
 pub async fn policy_history(
     State(state): State<AppState>,
@@ -358,7 +394,7 @@ async fn apply(
     //    it, and they simply differ.
     let event =
         crate::auth::AuditEvent::decision("Manage", "policy_set", principal.tenant_id(), true)
-            .with_principal_id(principal.id())
+            .with_principal(principal)
             .with_tenant_id(principal.tenant_id())
             // Carried like every other record. This is the one an investigation
             // arrives at last — "who installed the rules that permitted that" —

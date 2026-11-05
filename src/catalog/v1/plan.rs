@@ -513,13 +513,13 @@ async fn build_plan(
     // the scan task, so the manifests are re-read only when one of them applies.
     let delete_paths: HashSet<&str> = tasks
         .iter()
-        .flat_map(|task| task.deletes.iter().map(|d| d.file_path.as_str()))
+        .flat_map(|task| task.deletes().iter().map(|d| d.file_path.as_str()))
         .collect();
 
     let wanted: HashSet<&str> = if stats_fields.is_some() {
         tasks
             .iter()
-            .map(|task| task.data_file_path.as_str())
+            .map(|task| task.data_file_path())
             .chain(delete_paths.iter().copied())
             .collect()
     } else {
@@ -563,7 +563,7 @@ async fn build_plan(
 
     let mut file_scan_tasks = Vec::with_capacity(tasks.len());
     for task in &tasks {
-        let data_file = match files.get(task.data_file_path.as_str()) {
+        let data_file = match files.get(task.data_file_path()) {
             Some((file, spec_id)) => content_file_json(
                 file,
                 *spec_id,
@@ -577,9 +577,9 @@ async fn build_plan(
         let mut entry = Map::new();
         entry.insert("data-file".to_string(), data_file);
 
-        if !task.deletes.is_empty() {
+        if !task.deletes().is_empty() {
             let references: Vec<Value> = task
-                .deletes
+                .deletes()
                 .iter()
                 .filter_map(|d| delete_index.get(&d.file_path))
                 .map(|index| json!(index))
@@ -627,8 +627,9 @@ async fn read_manifest_files(
 
     let mut found = HashMap::new();
     for manifest_file in manifest_list.entries() {
-        let manifest = manifest_file
-            .load_manifest(table.file_io())
+        let manifest = table
+            .manifest_reader()
+            .read(manifest_file)
             .await
             .map_err(AppError::from)?;
 
@@ -751,7 +752,7 @@ pub(crate) fn descendant_ids(schema: &Schema, id: i32) -> Vec<i32> {
                 out.push(map.value_field.id);
                 walk(&map.value_field, out);
             }
-            Type::Primitive(_) => {}
+            Type::Primitive(_) | Type::Variant(_) => {}
         }
     }
 
@@ -783,7 +784,7 @@ pub(crate) fn parent_ids(schema: &Schema) -> HashMap<i32, i32> {
                 child(&map.key_field, out);
                 child(&map.value_field, out);
             }
-            Type::Primitive(_) => {}
+            Type::Primitive(_) | Type::Variant(_) => {}
         }
     }
 
@@ -1120,28 +1121,28 @@ fn data_file_json_from_task(
     let mut out = Map::new();
 
     out.insert("content".to_string(), json!("data"));
-    out.insert("file-path".to_string(), json!(task.data_file_path));
+    out.insert("file-path".to_string(), json!(task.data_file_path()));
     out.insert(
         "file-format".to_string(),
-        json!(task.data_file_format.to_string().to_lowercase()),
+        json!(task.data_file_format().to_string().to_lowercase()),
     );
-    let spec_id = task
-        .partition_spec
-        .as_ref()
-        .map_or(0, |spec| spec.spec_id());
+    let spec_id = task.partition_spec().map_or(0, |spec| spec.spec_id());
     out.insert("spec-id".to_string(), json!(spec_id));
     out.insert(
         "partition".to_string(),
-        Value::Array(match task.partition.as_ref() {
+        Value::Array(match task.partition() {
             Some(partition) => partition_json(partition, partition_types.get(&spec_id))?,
             None => Vec::new(),
         }),
     );
     out.insert(
         "file-size-in-bytes".to_string(),
-        json!(task.file_size_in_bytes),
+        json!(task.file_size_in_bytes()),
     );
-    out.insert("record-count".to_string(), json!(task.record_count));
+    out.insert("record-count".to_string(), json!(task.record_count()));
+    if let Some(first_row_id) = task.first_row_id() {
+        out.insert("first-row-id".to_string(), json!(first_row_id));
+    }
 
     Ok(Value::Object(out))
 }
@@ -1305,6 +1306,41 @@ fn to_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use iceberg::spec::{Literal, NestedField, PrimitiveLiteral, PrimitiveType, Schema};
+
+    /// A v3 file's first row id is how a reader derives `_row_id`, and a
+    /// restricted caller can only read through a plan. The default path builds
+    /// the file from the scan task, the stats path from the manifest entry, and
+    /// both must describe the same file the same way.
+    #[test]
+    fn the_default_path_carries_the_first_row_id() {
+        fn task(first_row_id: Option<i64>) -> iceberg::scan::FileScanTask {
+            let schema = Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap();
+            iceberg::scan::FileScanTask::builder()
+                .with_file_size_in_bytes(10)
+                .with_start(0)
+                .with_length(10)
+                .with_record_count(Some(5))
+                .with_first_row_id(first_row_id)
+                .with_data_file_path("memory://wh/db/t/data/a.parquet".to_string())
+                .with_data_file_format(iceberg::spec::DataFileFormat::Parquet)
+                .with_schema(schema.into())
+                .with_project_field_ids(vec![1])
+                .with_case_sensitive(true)
+                .build()
+                .unwrap()
+        }
+
+        let with = data_file_json_from_task(&task(Some(1000)), &HashMap::new()).unwrap();
+        assert_eq!(with["first-row-id"], json!(1000), "{with}");
+
+        let without = data_file_json_from_task(&task(None), &HashMap::new()).unwrap();
+        assert!(without.get("first-row-id").is_none(), "{without}");
+    }
 
     /// A table partitioned on a date, a timestamp and a decimal — the three
     /// types whose JSON form is not the shape of the literal that carries them.
