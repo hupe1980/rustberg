@@ -2,19 +2,19 @@
 
 # Rustberg
 
-**A policy-first Apache Iceberg REST catalog.**
+**The Iceberg catalog that enforces row and column restrictions — and says how strongly.**
 
-Two first-party registries — one embedded file, or Postgres for HA — with Cedar
-policy on every request, storage access scoped to what that policy allows, and
-an audit trail that names the rule. A single Rust binary, and an embeddable
-crate.
+A restricted reader gets no storage credential, a plan naming only the files its
+filter selects, pre-signed, and a header saying whether the restriction holds
+against any engine or only a cooperating one. Every grant is recorded with the
+rule that decided it. Cedar policy on every request; one Rust binary.
 
 [Documentation](https://hupe1980.github.io/rustberg) ·
 [Getting started](https://hupe1980.github.io/rustberg/docs/getting-started/) ·
 [API reference](https://hupe1980.github.io/rustberg/docs/api/) ·
 [Security](https://hupe1980.github.io/rustberg/docs/security/)
 
-<img src="https://img.shields.io/badge/tests-1168%20%2B%2085%20console%20%2B%2072%20client-brightgreen" alt="1168 Rust tests, 85 console tests, 72 client conformance tests">
+<img src="https://img.shields.io/badge/tests-1207%20%2B%2095%20console%20%2B%2072%20client-brightgreen" alt="1207 Rust tests, 95 console tests, 72 client conformance tests">
 <img src="https://img.shields.io/badge/unsafe-forbidden-brightgreen" alt="unsafe forbidden">
 <img src="https://img.shields.io/badge/binary-~24%20MB-blue" alt="~24 MB binary">
 <img src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue" alt="Apache-2.0 OR MIT">
@@ -22,6 +22,31 @@ crate.
 </div>
 
 ---
+
+## 👀 See it in five minutes
+
+```bash
+docker compose --profile demo run --build --rm demo
+```
+
+```text
+3 · bob, an analyst, loads the same table
+  ✓ bob gets no storage credential and no signer
+  ✓ the response carries his row filter (region = 'EU')
+  ✓ Rustberg-Enforcement: cooperative;masked
+4 · bob plans a scan
+  ✓ it names 1 file(s), all region=EU
+  ✓ each one a pre-signed URL
+5 · bob asks the catalog to sign a read of a US file
+  ✓ refused (403)
+6 · the audit trail says what happened, and which rule did it
+  ✓ bob's read was decided by policy1 — the analyst rule
+```
+
+Every line is an assertion, and CI runs it. Then open the
+[console](https://hupe1980.github.io/rustberg/docs/console/): see what is
+restricted for you and how strongly, **View as** anyone, and review a policy edit
+by **who gains and who loses** before you save it.
 
 ## 🧊 What it is
 
@@ -186,17 +211,17 @@ The warehouse is independent of either: local filesystem, S3, GCS or ADLS.
 
 ## 🔌 Engine support
 
-| Engine | Read | Write | Notes |
+| Engine | Read | Write | A table restricted for you |
 |---|---|---|---|
-| PyIceberg | ✅ | ✅ | |
-| Apache Spark | ✅ | ✅ | including atomic `CREATE TABLE AS SELECT` |
-| Trino | ✅ | ✅ | |
-| DuckDB | ✅ | — | read-only client |
+| PyIceberg | ✅ | ✅ | reads only the planned files; masks not applied (0.12) |
+| Apache Spark | ✅ | ✅ | `read-restrictions` not applied |
+| Trino | ✅ | ✅ | no server-side planning: unreadable without its own storage role, unfiltered with one |
+| DuckDB | ✅ | — | refused (2.0) — it cannot apply a mask |
 
 Table format versions **1, 2 and 3** are served; new tables default to v2.
 
-Conformance suites for PyIceberg, DuckDB and Trino run against the built binary
-on every change.
+Apache's REST Compatibility Kit (1.12.0) runs against both backends on every
+change, with two named exclusions; PyIceberg, DuckDB and Trino suites run too.
 
 → [Client configuration](https://hupe1980.github.io/rustberg/docs/clients/)
 

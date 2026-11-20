@@ -6,6 +6,70 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the major version is `0`, a minor bump may carry breaking changes.
 
+## [0.5.0] - 2026-11-20
+
+Enforcement you can see: how strongly each restriction holds, what any principal
+would get, and what a policy change does to whom.
+
+### Added
+
+- **`Rustberg-Enforcement` header** on `loadTable` and `planTableScan`: `none`,
+  `architectural`, or `cooperative;columns="…";masked` (RFC 9651). Graded against
+  the partition specs the table's live files were written under; a mask is always
+  cooperative.
+- **What-if:** `GET /management/v1/namespaces/{ns}/tables/{table}/explain` — what a
+  principal in your tenant would be granted, with the grade and the partition
+  change that would make it architectural.
+- **Consequence review:** `POST /management/v1/policies/impact` lists who gains or
+  loses which action on which table and on the policy set. Bounded; says what it
+  checked.
+- **Access by table:** `GET /management/v1/namespaces/{ns}/tables/{table}/access`.
+- **Console:** the grade in *What you can see*, **View as**, *Who can read this*, a
+  review that leads with consequences, and a copyable **Reference** on refusals.
+- **Audit:** one `sign_request` record per restricted plan, with file count and
+  grade; `schema_version` on every record; `client_request_id`.
+- **The five-minute proof:** `docker compose --profile demo run --build --rm demo`,
+  every printed claim asserted, run in CI.
+- **CI:** Apache's REST Compatibility Kit on both backends (`just rck`), with two
+  named exclusions.
+
+### Changed
+
+- **Breaking:** the server always mints `X-Request-Id`; a client's id is recorded
+  as `client_request_id`.
+- **Breaking (wire):** `residual-filter` is sent only when policy restricts the
+  caller's rows, as the Iceberg expressions spec recommends.
+- **Breaking:** the compose `storage` profile runs RustFS (MinIO's images are gone
+  from Docker Hub); `examples/minio.toml` is now `examples/s3-local.toml`.
+- `credentials.signing.endpoint_host` accepts `http://host:port`.
+- Cedar 4.15.
+
+### Fixed
+
+- A warehouse with a trailing slash put tables at `…//db/t`.
+- A bare-path warehouse was advertised as a path and refused under its `file://`
+  spelling.
+- Pre-signed URLs were always `https`, so unusable against an HTTP S3 endpoint.
+- Found by Apache's REST Compatibility Kit:
+  - View errors were typed and worded as table errors ("Table does not exist" for
+    a view); a name taken by the other kind now says so.
+  - A failed commit requirement was retried ten times before it was reported;
+    it is reported at once, in the reference wording.
+  - Creating in a missing namespace was reported as a missing table. Creating
+    in a namespace the caller cannot see answers the same way.
+  - A staged create left the staged document in the metadata log.
+  - Snapshots and view versions were listed in no stable order.
+  - A table or view whose metadata file was gone could not be dropped.
+  - Invalid metadata is `400 IllegalArgumentException`, as in the reference.
+- Three error messages carried indentation from reflowed source.
+
+### Security
+
+- Policy text is parsed with a depth limit; a deeply nested policy aborted the
+  process with a stack overflow.
+- RUSTSEC-2026-0543 (`chrono`, unmaintained, via `arrow`) is ignored with its
+  reason.
+
 ## [0.4.1] - 2026-11-05
 
 ### Fixed

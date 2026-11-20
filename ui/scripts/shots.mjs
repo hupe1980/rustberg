@@ -3,7 +3,7 @@
 // on a free loopback port with two API keys and a seeded catalog, drives a locally installed Chrome
 // (puppeteer-core never downloads one), and writes WebP files to site/static/console/.
 
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { spawn, execFileSync } from "node:child_process";
 import { join } from "node:path";
@@ -40,22 +40,8 @@ const freePort = (preferred) =>
     });
   });
 
-const policy = `// Administrators: everything in their own tenant, including policy.
-permit(
-  principal in Rustberg::Group::"admin",
-  action,
-  resource
-) when { resource.tenant == principal.tenant };
-
-// Analysts read EU orders only, and never see a customer's email.
-@row_filter("{\\"type\\":\\"eq\\",\\"term\\":\\"region\\",\\"value\\":\\"EU\\"}")
-@column_mask("email")
-permit(
-  principal in Rustberg::Group::"analyst",
-  action in [Rustberg::Action::"Read", Rustberg::Action::"List"],
-  resource
-) when { resource.tenant == principal.tenant };
-`;
+// The five-minute proof's own policy, so the screenshots and the demo tell one story.
+const policy = readFileSync(join(repo, "examples/demo/policies.cedar"), "utf8");
 const marketing = `
 // Marketing may list everything.
 permit(
@@ -208,6 +194,20 @@ try {
     const alice = await as("alice");
     await open(alice, "#/catalog/table/sales/orders");
     await shot(alice, "table-unrestricted");
+    // View as bob: the what-if answers, with alice's own credential.
+    await alice.evaluate(() => document.querySelector('button[aria-label^="View as"]')?.click());
+    await pause(300);
+    await alice.type("[role=dialog] input", "bob");
+    await alice.evaluate(() => {
+      const roles = [...document.querySelectorAll("[role=dialog] input")].find((i) => i.placeholder?.startsWith("analyst"));
+      roles.value = "analyst";
+      roles.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await click(alice, "Preview");
+    await pause(400);
+    await shot(alice, "view-as");
+    await alice.evaluate(() => document.querySelector('button[aria-label^="End preview"]')?.click());
+    await pause(200);
     await open(alice, "#/policies/versions");
     await click(alice, "1");
     await shot(alice, "versions");

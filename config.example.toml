@@ -79,7 +79,7 @@ catalog_url = "file:///var/lib/rustberg/data"
 # "s3.region"            = "eu-central-1"
 # "s3.access-key-id"     = "env:RUSTBERG_S3_ACCESS_KEY_ID"
 # "s3.secret-access-key" = "env:RUSTBERG_S3_SECRET_ACCESS_KEY"
-# "s3.endpoint"          = "http://localhost:9000"   # MinIO, Ceph, R2
+# "s3.endpoint"          = "http://localhost:9000"   # RustFS, MinIO, Ceph, R2
 # "s3.path-style-access" = "true"
 # "gcs.project-id"       = "my-project"
 # "gcs.credentials-json" = "env:RUSTBERG_GCS_CREDENTIALS"
@@ -148,7 +148,7 @@ provider = "none"         # none | aws | gcs | azure
 # enabled   = true
 # region    = "us-east-1"     # when a client sends none
 # url_style = "auto"          # auto | path | virtual-host; a wrong guess is refused
-# endpoint_host = "minio:9000"
+# endpoint_host = "http://s3:9000"   # http:// for an endpoint without TLS
 # presign_ttl_seconds = 900   # pre-signed URLs in restricted scan plans; keep it short
 
 # ── Federation ───────────────────────────────────────────────────────────────

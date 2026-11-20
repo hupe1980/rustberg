@@ -245,6 +245,9 @@ pub struct RequestContext {
     /// Not readable from a policy: it is chosen per request and means nothing to
     /// an authorization decision.
     pub request_id: Option<String>,
+    /// The `x-request-id` the client sent, kept beside the server's own and
+    /// never in place of it.
+    pub client_request_id: Option<String>,
     /// Views this load arrived through, outermost first, from `referenced-by`.
     ///
     /// Empty when the client sent none, or sent one this server would not
@@ -265,6 +268,7 @@ impl RequestContext {
         Self {
             source_ip: Some(source_ip),
             request_id: None,
+            client_request_id: None,
             referenced_by: Vec::new(),
         }
     }

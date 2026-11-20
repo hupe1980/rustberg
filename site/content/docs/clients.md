@@ -8,6 +8,30 @@ weight = 12
 > does not implement: the request fails with `401` before any catalog call.
 
 
+## Compatibility
+
+Apache's **REST Compatibility Kit** — the reference tests from
+`apache/iceberg`, run against any server — runs against Rustberg on both backends
+in CI, at the release `.github/rck.properties` pins (1.12.0). Run it locally with
+`just rck`.
+
+| Flag | Value | Why |
+|---|---|---|
+| `requires-namespace-create` | `true` | A table is created in a namespace that exists |
+| `supports-serverside-retry` | `true` | Mutations honour `Idempotency-Key` |
+| `overrides-requested-location` | `false` | A requested location inside the scope is honoured; outside it is refused |
+| `supports-names-with-dot` | `true` | The namespace separator on the wire is the unit separator |
+| `supports-variant` | `true` | `variant` columns are served |
+
+The kit chooses table locations under `/tmp`, so its server runs with
+`location_scope = "warehouse"` and `/tmp` as the warehouse. Two tests are
+excluded, by name:
+
+- `testLoadTableWithMissingMetadataFile` — a conditional load is answered `304`
+  from the registry pointer, without opening the deleted file.
+- `createViewWithCustomMetadataLocation` — the catalog never lets
+  `write.metadata.path` move its own writes.
+
 ## Apache Spark
 
 ### PySpark with PyIceberg Catalog
@@ -382,6 +406,11 @@ with table.update_schema() as update:
 ---
 
 ## DuckDB
+
+**DuckDB refuses a table restricted for you.** From DuckDB 2.0 the `iceberg`
+extension fails any read whose load response carries `read-restrictions` rather
+than read it unfiltered — the right answer from a reader that cannot apply a
+filter or mask. Unrestricted callers are unaffected.
 
 ### Direct Connection
 

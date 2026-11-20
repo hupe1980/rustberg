@@ -538,11 +538,10 @@ impl RedbCatalog {
     }
 
     fn table_location(&self, table: &TableIdent) -> String {
-        format!(
-            "{}/{}/{}",
-            self.warehouse_location,
-            table.namespace.as_ref().join("/"),
-            table.name
+        crate::location::table_location(
+            &self.warehouse_location,
+            table.namespace().as_ref(),
+            table.name(),
         )
     }
 
@@ -796,7 +795,7 @@ impl CatalogStore for RedbCatalog {
                 {
                     return Err(Error::new(
                         ErrorKind::PreconditionFailed,
-                        format!("Namespace not empty: {display}"),
+                        format!("Namespace {display} is not empty: it still contains tables"),
                     ));
                 }
 
@@ -812,7 +811,7 @@ impl CatalogStore for RedbCatalog {
                 {
                     return Err(Error::new(
                         ErrorKind::PreconditionFailed,
-                        format!("Namespace still has views: {display}"),
+                        format!("Namespace {display} is not empty: it still contains views"),
                     ));
                 }
 
@@ -842,7 +841,9 @@ impl CatalogStore for RedbCatalog {
                 {
                     return Err(Error::new(
                         ErrorKind::PreconditionFailed,
-                        format!("Namespace has child namespaces: {display}"),
+                        format!(
+                            "Namespace {display} is not empty: it still contains child namespaces"
+                        ),
                     ));
                 }
 
@@ -1205,7 +1206,9 @@ impl CatalogStore for RedbCatalog {
         for attempt in 0..COMMIT_MAX_RETRIES {
             match self.try_commit_tables_atomic(&table_changes).await {
                 Ok(tables) => return Ok(tables),
-                Err(e) if e.kind() == ErrorKind::CatalogCommitConflicts => {
+                // Only a lost race on the pointer swap: a failed requirement
+                // was checked against committed state and cannot pass on retry.
+                Err(e) if e.kind() == ErrorKind::CatalogCommitConflicts && e.retryable() => {
                     let backoff = Self::commit_backoff(attempt);
                     tracing::debug!(
                         attempt = attempt + 1,
@@ -1615,12 +1618,7 @@ impl RedbCatalog {
                 None
             };
             for requirement in requirements {
-                requirement.check(current).map_err(|e| {
-                    Error::new(
-                        e.kind(),
-                        format!("Requirement failed for table {ident}: {}", e.message()),
-                    )
-                })?;
+                super::store::check_requirement(requirement, current)?;
             }
 
             // The staged metadata is the base, and the client's updates are
@@ -1643,7 +1641,10 @@ impl RedbCatalog {
             self.declared_bound(ident.namespace.as_ref(), &ident.name)
                 .ensure_commit(base.location(), updates)?;
 
-            let mut builder = base.clone().into_builder(Some(base_location.clone()));
+            // A create has no previous metadata file: the staged document was
+            // never the table's, so it does not belong in the metadata log.
+            let previous = expected.as_ref().map(|_| base_location.clone());
+            let mut builder = base.clone().into_builder(previous);
             for update in updates {
                 builder = update.clone().apply(builder)?;
             }
@@ -1731,7 +1732,8 @@ impl RedbCatalog {
                                     return Err(Error::new(
                                         ErrorKind::CatalogCommitConflicts,
                                         format!("Table dropped during commit: {display}"),
-                                    ));
+                                    )
+                                    .with_retryable(true));
                                 };
 
                                 if current.version != expected.version
@@ -1744,7 +1746,7 @@ impl RedbCatalog {
                                          found {}",
                                         expected.version, current.version
                                     ),
-                                    ));
+                                    ).with_retryable(true));
                                 }
                             }
                             // Creating: the assertion is that nothing is there. Two
@@ -1773,7 +1775,7 @@ impl RedbCatalog {
                                         "Table {display} was created by another writer while this \
                                          staged commit was in flight"
                                     ),
-                                    ));
+                                    ).with_retryable(true));
                                 }
                             }
                         }

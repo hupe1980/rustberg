@@ -188,8 +188,9 @@ class TestScanPlanning:
         assert len(tasks) == 1, "the US partition cannot match and must be pruned"
         assert tasks[0]["data-file"]["partition"] == ["EU"]
 
-        # The residual comes back unchanged, so the client filters what remains.
-        assert tasks[0]["residual-filter"]["term"] == "region"
+        # No residual for an unrestricted caller: it would only echo the filter
+        # the client sent, and the expressions spec asks a service to omit it.
+        assert "residual-filter" not in tasks[0], tasks[0]
 
     def test_partition_values_are_serialised_by_their_type(
         self, rustberg_server: str, temp_namespace: str, typed_partition_table

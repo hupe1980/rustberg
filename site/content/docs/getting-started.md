@@ -1,10 +1,52 @@
 +++
 title = "Getting started"
-description = "Install Rustberg, start a catalog with one command, and connect an engine to it."
+description = "Watch Rustberg enforce a restriction in five minutes, then install it, start a catalog with one command, and connect an engine."
 weight = 1
 +++
-One command brings up a working catalog. This page covers using it and what to
-change before production.
+Start by watching what Rustberg is for. Then install it, start a catalog with one
+command, and connect an engine.
+
+## See it enforce, in five minutes
+
+From a checkout, with Docker and nothing else:
+
+```bash
+git clone https://github.com/hupe1980/rustberg && cd rustberg
+docker compose --profile demo run --build --rm demo
+```
+
+Two people read one table. **alice** administers it; **bob** is an analyst whose
+policy limits him to EU orders and masks `email`. The narrator asserts every
+line it prints — a claim that stops being true fails the run, and CI runs the
+same script:
+
+```text
+3 · bob, an analyst, loads the same table
+  ✓ bob gets no storage credential and no signer
+  ✓ the response carries his row filter (region = 'EU')
+  ✓ and his column mask (email)
+  ✓ he must plan through the catalog
+  ✓ Rustberg-Enforcement: cooperative;masked
+4 · bob plans a scan
+  ✓ it names 1 file(s), all region=EU
+  ✓ each one a pre-signed URL
+  ✓ the file holds email unmasked
+5 · bob asks the catalog to sign a read of a US file
+  ✓ refused (403)
+6 · the audit trail says what happened, and which rule did it
+  ✓ files=1, enforcement=cooperative
+  ✓ bob's read was decided by policy1 — the analyst rule
+```
+
+It is honest about what it shows. The **row filter** is architectural: `region` is
+an identity partition, so bob is handed no file holding a US row, and nothing he
+holds can reach one. The **mask** is cooperative: the file he downloads holds
+`email`, and only an engine applying `read-restrictions` masks it — which is what
+the header says. When it finishes it prints both API keys: open
+`http://localhost:8000/ui/`, sign in as each, and try **View as…** and a policy
+edit's **Review**. The catalog keeps running after the narration; stop it with
+`docker compose --profile demo down -v`. The demo's files are in
+`examples/demo/`.
 
 ## Install
 

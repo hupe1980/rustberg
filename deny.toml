@@ -31,10 +31,12 @@ ignore = [
     # (JSON) and manifests (Avro), and data files are only ever named, signed or
     # deleted.
     "RUSTSEC-2026-0435",
-    # pin-utils, via the AWS SDK's `aws-smithy-http`. Unmaintained (repository
-    # archived 2026-10-01) rather than vulnerable: a handful of pinning macros
-    # with no input surface.
-    "RUSTSEC-2026-0441",
+    # chrono, via `arrow` and `parquet` inside `iceberg`, which this crate cannot
+    # drop on its own. Unmaintained (2026-11) rather than vulnerable. Rustberg's
+    # own uses are clocks and formatting, plus parsing a partition value's
+    # date-time literal, which is bounded and typed. Re-read when iceberg-rust
+    # and arrow move to `jiff` or `time`.
+    "RUSTSEC-2026-0543",
     # rustls-pemfile (unmaintained) and tokio-tar (a tar-extraction flaw), both
     # via `testcontainers`. Dev-dependencies: they reach the test suite pulling
     # container images and never the server.

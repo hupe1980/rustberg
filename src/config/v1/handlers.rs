@@ -205,7 +205,7 @@ pub async fn get_config(
     // Echoing the requested value back as an override would report acceptance
     // while every table was in fact created somewhere else.
     if let Some(requested) = query.warehouse.as_deref()
-        && requested != state.default_warehouse.advertised()
+        && crate::location::canonical_warehouse(requested) != state.default_warehouse.advertised()
     {
         return Err(crate::error::AppError::BadRequest(format!(
             "Unknown warehouse '{requested}'. This server serves exactly one warehouse, \

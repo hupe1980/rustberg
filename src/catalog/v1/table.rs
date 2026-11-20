@@ -300,7 +300,8 @@ fn record_vend(
             .with_principal(authorized.principal())
             .with_tenant_id(authorized.principal().tenant_id())
             .with_optional_client_ip(authorized.request().source_ip)
-            .with_optional_request_id(authorized.request().request_id.as_deref());
+            .with_optional_request_id(authorized.request().request_id.as_deref())
+            .with_optional_client_request_id(authorized.request().client_request_id.as_deref());
     if let Some(reason) = error {
         event = event.with_detail("reason", reason);
     }
@@ -517,6 +518,7 @@ pub struct LoadTableResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_location: Option<String>,
     /// Table metadata.
+    #[serde(serialize_with = "super::ordered_metadata")]
     pub metadata: TableMetadata,
     /// Table configuration.
     pub config: HashMap<String, String>,
@@ -742,6 +744,7 @@ pub struct CommitTableResponse {
     /// Metadata file location after the commit.
     pub metadata_location: String,
     /// Updated table metadata.
+    #[serde(serialize_with = "super::ordered_metadata")]
     pub metadata: TableMetadata,
 }
 
@@ -1005,16 +1008,18 @@ pub async fn create_table(
     // commits the whole thing atomically, which is how Spark performs CREATE
     // TABLE AS SELECT. A staged table is invisible until that commit lands and
     // reserves nothing in the meantime.
-    let table = if staged {
+    let created_ident = TableIdent::new(namespace.clone(), table_name.clone());
+    let created = if staged {
         state
             .catalog
             .stage_create_table(&namespace, table_creation)
-            .await?
+            .await
     } else {
-        state
-            .catalog
-            .create_table(&namespace, table_creation)
-            .await?
+        state.catalog.create_table(&namespace, table_creation).await
+    };
+    let table = match created {
+        Ok(table) => table,
+        Err(e) => return Err(name_conflict(&state, &created_ident, e.into()).await),
     };
 
     // A caller that just created a table is writing to it, so the credential
@@ -1189,13 +1194,17 @@ pub async fn load_table(
         &authorized.obligations,
     );
 
-    // A row filter over a non-partition column cannot be enforced by
-    // withholding files, and looks identical in the policy file to one that
-    // can. Reported here, where the filter and the partition spec are both in
-    // hand, and at most once per table per policy set.
+    // How strongly this caller's restrictions hold, graded against the files
+    // the current snapshot actually serves. The same value goes on the response
+    // and into the operator's log, so the two cannot disagree.
+    let grade = super::enforcement::grade(
+        &table,
+        table.metadata().current_snapshot(),
+        &authorized.obligations,
+    )
+    .await;
     crate::auth::filter_alignment::warn_if_cooperative(
-        &authorized.obligations.row_filters,
-        table.metadata(),
+        &grade,
         &table_ident.to_string(),
         state.authorizer.policy_set_version().as_deref(),
     );
@@ -1241,6 +1250,7 @@ pub async fn load_table(
     if let Some(ref tag) = etag {
         insert_etag(&mut response, tag);
     }
+    super::enforcement::insert_header(&mut response, &grade);
     Ok(response)
 }
 
@@ -1425,14 +1435,25 @@ pub async fn drop_table(
 
     // Read after authorizing, so an unauthorized caller learns nothing about
     // whether the table exists or how it is configured.
-    let properties = state
-        .catalog
-        .load_table(&table_ident)
-        .await?
-        .metadata()
-        .properties()
-        .clone();
-    ownership::reject_if_protected(&properties, &format!("Table '{table_ident}'"))?;
+    //
+    // The protection flag lives in the table's metadata. A table whose metadata
+    // cannot be read has nothing left to protect, so a plain drop removes the
+    // pointer anyway; a purge still needs the metadata to find the files.
+    match state.catalog.load_table(&table_ident).await {
+        Ok(table) => ownership::reject_if_protected(
+            table.metadata().properties(),
+            &format!("Table '{table_ident}'"),
+        )?,
+        Err(e) => match AppError::from(e) {
+            missing @ AppError::NoSuchTable(_) => return Err(missing),
+            unreadable if query.purge_requested => return Err(unreadable),
+            unreadable => tracing::warn!(
+                table = %table_ident,
+                error = %unreadable,
+                "Table metadata is unreadable; dropping the pointer without a protection check"
+            ),
+        },
+    }
 
     // Record metric
     state.metrics.catalog_delete_table.inc();
@@ -1513,7 +1534,21 @@ pub async fn rename_table(
     let src_ident = TableIdent::new(src_namespace, payload.source.name);
     let dst_ident = TableIdent::new(dst_namespace, payload.destination.name);
 
-    state.catalog.rename_table(&src_ident, &dst_ident).await?;
+    if let Err(e) = state.catalog.rename_table(&src_ident, &dst_ident).await {
+        return Err(match AppError::from(e) {
+            AppError::TableAlreadyExists(_) | AppError::ViewAlreadyExists(_) => {
+                let taken = if state.catalog.view_exists(&dst_ident).await.unwrap_or(false) {
+                    "View"
+                } else {
+                    "Table"
+                };
+                AppError::AlreadyExists(format!(
+                    "Cannot rename {src_ident} to {dst_ident}. {taken} already exists"
+                ))
+            }
+            other => other,
+        });
+    }
 
     Ok(StatusCode::OK)
 }
@@ -1623,7 +1658,11 @@ pub async fn commit_table(
         // `From<iceberg::Error>` maps on ErrorKind, so a commit conflict becomes
         // 409 and a missing table becomes 404. Mapping by hand here collapsed
         // everything that was not a conflict into a 500.
-        .await?;
+        .await;
+    let updated_table = match updated_table {
+        Ok(table) => table,
+        Err(e) => return Err(name_conflict(&state, &table_ident, e.into()).await),
+    };
 
     let metadata_location = updated_table
         .metadata_location()
@@ -1746,7 +1785,11 @@ pub async fn register_table(
     let table = state
         .catalog
         .register_table(&table_ident, payload.metadata_location.clone())
-        .await?;
+        .await;
+    let table = match table {
+        Ok(table) => table,
+        Err(e) => return Err(name_conflict(&state, &table_ident, e.into()).await),
+    };
 
     let storage_credentials = vend_table_credentials(
         &state,
@@ -2026,6 +2069,25 @@ fn build_sort_order(write_order: &Option<WriteOrder>) -> Result<Option<SortOrder
 // ============================================================================
 // Unit Tests
 // ============================================================================
+
+/// A table's name conflict, named for what holds the name.
+///
+/// A table and a view share one namespace of names, and the backends report
+/// either collision as `TableAlreadyExists`. A client is told which: "View with
+/// same name already exists" when a view holds it, the table's full name
+/// otherwise.
+async fn name_conflict(state: &AppState, table: &TableIdent, error: AppError) -> AppError {
+    match error {
+        AppError::TableAlreadyExists(_) | AppError::ViewAlreadyExists(_) => {
+            if state.catalog.view_exists(table).await.unwrap_or(false) {
+                AppError::AlreadyExists(format!("View with same name already exists: {table}"))
+            } else {
+                AppError::TableAlreadyExists(table.to_string())
+            }
+        }
+        other => other,
+    }
+}
 
 #[cfg(test)]
 mod tests {

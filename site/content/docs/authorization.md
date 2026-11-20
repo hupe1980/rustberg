@@ -524,31 +524,80 @@ can only deliver the file with a residual predicate. Enforcement is then
 `bucket(16, id)` a sixteenth of all ids, `truncate(4, region)` both `EU` and
 `EUROPE`. Pruning helps; enforcement does not follow.
 
-Rustberg warns which case you have:
+### How strongly it holds: the enforcement grade
+
+Every `loadTable` and `planTableScan` says which case you have, in a response
+header, as an [RFC 9651](https://www.rfc-editor.org/rfc/rfc9651) structured
+field:
 
 ```text
-WARN Row filter references columns this table does not partition on by identity,
-     so it cannot be enforced by withholding files — a transformed partition puts
-     permitted and forbidden rows in the same file. A scan plan applies the filter
-     and returns it as the residual, so a cooperating engine honours it, but an
-     engine using its own storage credentials reads the table unfiltered.
-     table=analytics.events columns=["email"] policy_set_version=9f2c41ab7d0e5163
+Rustberg-Enforcement: none
+Rustberg-Enforcement: architectural
+Rustberg-Enforcement: cooperative;columns="email";masked
 ```
 
-Columns are read exactly from the JSON predicate. The warning is emitted at most
-once per table per policy set; editing the policies reports again.
+| Grade | Means |
+|---|---|
+| `none` | No restriction applies to you on this table. |
+| `architectural` | Holds against any engine: no file you are handed holds a row outside your filter. |
+| `cooperative` | Holds only in an engine that applies it. `columns` names filter columns that do not separate files; `masked` says a column mask applies — the file always holds the raw column. |
 
-| Filter | Table partitioned on | Enforceable by withholding files? |
+**Graded against the files, not the spec.** A filter column is aligned only if
+every partition spec the table's *live* files were written under partitions it
+by identity. Files written before a partition evolution still hold every value,
+so repartitioning alone does not change the grade — rewriting the old files
+does. Once no live file uses the old spec, the grade turns `architectural`.
+
+The same answer reaches three other places: the audit record of every
+restricted plan, the console's *What you can see*, and the server log, which
+warns once per table per policy set when a filter column is unaligned.
+
+| Filter | Live files partitioned on | Grade |
 |---|---|---|
-| `tenant_id == "acme"` | `identity(tenant_id)` | **Yes** — architectural |
-| `region == "EU"` | `identity(region)`, field named `reg` | **Yes** — the *source column* is compared, not the field's name |
-| `ts == "2024-01-01T05:00"` | `days(ts)` | No — warned; the day's other rows are in the same file |
-| `id == 42` | `bucket(16, id)` | No — warned; a sixteenth of all ids share the file |
-| anything | nothing, or another column | No — warned |
+| `tenant_id == "acme"` | `identity(tenant_id)` | `architectural` |
+| `region == "EU"` | `identity(region)`, field named `reg` | `architectural` — the *source column* is compared, not the field's name |
+| `region == "EU"` | `identity(region)` now, nothing before an evolution | `cooperative;columns="region"` until the older files are rewritten |
+| `ts == "2024-01-01T05:00"` | `days(ts)` | `cooperative` — the day's other rows are in the same file |
+| `id == 42` | `bucket(16, id)` | `cooperative` — a sixteenth of all ids share the file |
+| anything, with a `@column_mask` | anything | `cooperative;…;masked` |
 
 The rule is conservative: a range filter whose bounds fall on a transform's
 boundaries (`ts >= '2024-01-01' AND ts < '2024-01-02'` against `days(ts)`) *is*
-enforceable but is warned about anyway.
+enforceable but is graded cooperative anyway.
+
+### Ask before you ship: what would they get?
+
+An administrator — anybody who may read the policy set *and* the table — can ask
+the running server what any principal would be granted, before that principal
+ever asks:
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_KEY" \
+  "http://localhost:8000/management/v1/namespaces/sales/tables/orders/explain?principal=bob&roles=analyst"
+```
+
+```json
+{
+  "principal": { "id": "bob", "kind": "user", "tenant": "acme", "roles": ["analyst"] },
+  "decision": "allow",
+  "matched-policies": ["policy3"],
+  "read-restrictions": { "required-row-filter": { "…": "exactly what loadTable would publish" } },
+  "enforcement": {
+    "grade": "cooperative",
+    "columns": ["region"],
+    "masked": true,
+    "header": "cooperative;columns=\"region\";masked",
+    "remedy": "ALTER TABLE sales.orders ADD PARTITION FIELD region — then rewrite the files written before it. …"
+  },
+  "context": "Evaluated at the current UTC hour with no source address."
+}
+```
+
+It is computed by the same authorizer and the same grade a real request gets,
+so it cannot disagree with what Bob is told. `kind=api_key` asks about an API
+key by its configured name. The principal is always in your own tenant, and a
+table you may not read answers exactly as loading it would. The console's
+**View as** is this endpoint with a form in front of it.
 
 ---
 
@@ -590,11 +639,13 @@ is a new revision and old ones are never edited, so an audit record's
 | `GET /management/v1/policies/history` | Who changed it, when, and why |
 | `GET /management/v1/policies/revisions/{sequence}` | One earlier revision, with its source |
 | `POST /management/v1/policies/rollback` | Re-apply an earlier revision |
+| `POST /management/v1/policies/impact` | What a candidate would change, for whom — before you save it |
+| `GET /management/v1/namespaces/{ns}/tables/{table}/access` | Who can read one table, and in what form |
 
 These live under `/management/v1`, not `/v1`, because administration is not part
 of the Iceberg API that `GET /v1/config` describes. The
-[console](@/docs/console.md) drives the same endpoints, with a diff to review
-before every save.
+[console](@/docs/console.md) drives the same endpoints: its review leads with the
+consequences, and the diff follows.
 
 ### Changing the rules
 
@@ -613,6 +664,45 @@ The submitted text **replaces** the policy set; nothing is merged.
 It takes effect immediately on the receiving replica and within a few seconds on
 the others, which poll the store and swap atomically. A request already being
 evaluated finishes against the set it started with.
+
+### Before you save: who gains, who loses
+
+A diff shows what you typed, not whom it affects: `action == List` →
+`action in [List, Read]` is one line and may hand a group every table in a
+tenant. Ask first:
+
+```bash
+curl -X POST https://rustberg.example.com/management/v1/policies/impact \
+  -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
+  -d "$(jq -n --rawfile s policies.cedar '{source: $s}')"
+```
+
+```json
+{
+  "checked": { "principals": ["…"], "tables": 42, "truncated": false },
+  "changes": [
+    { "principal": { "kind": "group", "roles": ["marketing"] },
+      "resource": "sales.orders", "action": "Read", "change": "gains",
+      "after": { "grade": "cooperative", "header": "cooperative;masked" } },
+    { "principal": { "kind": "group", "roles": ["marketing"] },
+      "resource": "policy set", "action": "Read", "change": "gains" }
+  ],
+  "note": "Exact for the principals and tables listed; not a proof for anyone else."
+}
+```
+
+- Both sides come from the real authorizers — the one in force and the one `PUT`
+  would install. `change` is `gains`, `loses` or `restriction`.
+- Compared: `Read`, `Update`, `Delete` on every table you may read; `Read`,
+  `Manage` on the policy set.
+- Checked principals come from the rules, old and new: each one named exactly,
+  one member per named group, and one member of no group. Bounded at 50 000
+  evaluations; a cut answer says `truncated`.
+- In CI, fail a merge on any `gains` row you did not expect.
+
+`GET /management/v1/namespaces/{ns}/tables/{table}/access` answers the same
+question by table: who can read it — `everything`, `filtered`, `masked`,
+`filtered-and-masked` or `nothing` — with the grade.
 
 ### Two guardrails
 

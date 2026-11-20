@@ -1,0 +1,9 @@
+# The catalog the REST Compatibility Kit runs against. The kit chooses its own
+# table and view locations under /tmp, so the warehouse is /tmp and a requested
+# location may be anywhere inside it — the scope an operator opts into with
+# `location_scope = "warehouse"`. The default, per-table scope refuses those
+# locations, which is deliberate and is not what the kit measures.
+[storage]
+catalog_url        = "file:///tmp/rustberg-rck-catalog"
+warehouse_location = "file:///tmp"
+location_scope     = "warehouse"

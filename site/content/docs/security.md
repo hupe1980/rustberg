@@ -561,7 +561,7 @@ kinds:
 | `authenticate` | `authentication` | a credential was presented and accepted, or rejected | no |
 | `decision` | `authorization` | a policy decision, permit and deny alike | for a **permitted** mutation |
 | `vend_credentials` | `storage_access` | what was vended, and whether it could **write** | when a write credential was **granted** |
-| `sign_request` | `storage_access` | what was signed, and **which objects** | when a write signature was **minted** |
+| `sign_request` | `storage_access` | what was signed, and **which objects** — or, for a restricted scan plan, how many files were pre-signed and **how strongly the restriction held** | when a write signature was **minted** |
 | `rate_limit` | `system` | which bucket ran out, `ip` or `tenant` | no |
 
 Only grants are refused when unrecordable; a refusal never fails for that reason.
@@ -576,6 +576,7 @@ One JSON object per line:
 
 ```json
 {
+  "schema_version": 1,
   "event_id": "01a021b4-e829-7583-817d-81e02b832dc9",
   "timestamp": "2026-08-21T00:24:59.177+00:00",
   "timestamp_ms": 1787271899177,
@@ -596,6 +597,10 @@ One JSON object per line:
 }
 ```
 
+`schema_version` names the record format. It changes when a field is renamed,
+removed or changes meaning — never when one is added — so a consumer that sees a
+version it does not know can stop instead of misreading.
+
 `principal_type` says what `principal_id` names — `api_key` (a key, by its
 configured name) or `user` (a token's subject) — because the two may share a
 name and are still different principals.
@@ -612,13 +617,39 @@ provider refused.
   decided, which differs from `read`).
 - On a signature: `read` or `write`.
 
-`request_id` matches the `X-Request-Id` echoed to the client. It is assigned
-before anything can be refused, so `401` and `429` records join too.
+`request_id` matches the `X-Request-Id` returned to the client, and it is
+**always minted by the server**. It is the key a record is found by — the console
+shows it as the *Reference* on every refusal — so a caller must not be able to
+choose it. It is assigned before anything can be refused, so `401` and `429`
+records join too.
 
-An inbound id is carried through only if it is at most 128 characters, in a
-conservative token alphabet, and sent once; otherwise it is **replaced** with a
-minted one. Every request has exactly one id, and the echo and the record always
-match.
+An `X-Request-Id` the client sent is kept as `client_request_id` when it is at
+most 128 characters, in a conservative token alphabet, and sent once — so a trace
+that started in an engine still joins the trail — and dropped otherwise. It never
+replaces the server's id.
+
+#### What a restricted plan handed over
+
+A restricted caller receives no credential; its scan plan names only the files
+its filter selects, each as a pre-signed URL. That is the grant that enforces
+the restriction, and one record says so:
+
+```json
+{
+  "schema_version": 1,
+  "category": "storage_access",
+  "action": "sign_request",
+  "operation": "read",
+  "principal_id": "bob",
+  "resource_id": "acme/sales/orders",
+  "enforcement": "cooperative",
+  "details": { "source": "scan_plan", "files": "12", "unaligned_columns": "region", "masked": "true" }
+}
+```
+
+`enforcement` is the [grade](@/docs/authorization.md#how-strongly-it-holds-the-enforcement-grade)
+the caller was told in its `Rustberg-Enforcement` header. Like any read grant,
+the record degrades rather than failing the plan.
 
 #### How the request said it got here
 

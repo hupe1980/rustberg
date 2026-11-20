@@ -142,6 +142,24 @@ pub const ROW_FILTER_ANNOTATION: &str = "row_filter";
 pub const COLUMN_MASK_ANNOTATION: &str = "column_mask";
 
 /// Authorizer backed by a Cedar policy set.
+/// How deep a policy's expressions may nest. Generous for anything a person
+/// writes, and far below the depth at which Cedar's recursive parser,
+/// validator and evaluator would exhaust the stack — the management API takes
+/// policy text from a caller, so the bound is what keeps it data.
+pub const MAX_POLICY_DEPTH: usize = 64;
+
+/// Principals a policy set names in its scopes. See
+/// [`CedarAuthorizer::named_principals`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NamedPrincipals {
+    /// Token subjects named with `principal == Rustberg::User::"…"`.
+    pub users: std::collections::BTreeSet<String>,
+    /// API keys named with `principal == Rustberg::ApiKey::"…"`.
+    pub api_keys: std::collections::BTreeSet<String>,
+    /// Groups named with `principal in Rustberg::Group::"…"`.
+    pub groups: std::collections::BTreeSet<String>,
+}
+
 pub struct CedarAuthorizer {
     engine: CedarEngine,
     policies: PolicySet,
@@ -176,7 +194,7 @@ impl CedarAuthorizer {
             .map_err(|e| AuthError::Configuration(format!("Invalid Cedar schema: {e}")))?
             .0;
 
-        let policies = PolicySet::from_str(policy_src)
+        let policies = PolicySet::from_str_with_depth_limit(policy_src, MAX_POLICY_DEPTH)
             .map_err(|e| AuthError::Configuration(format!("Invalid Cedar policy: {e}")))?;
 
         let result = Validator::new(schema.clone()).validate(&policies, ValidationMode::Strict);
@@ -336,6 +354,41 @@ impl CedarAuthorizer {
     ///
     /// Such a set denies everything, which is correct for a *fixed-answer*
     /// authorizer and a startup failure for a real deployment: it accepts
+    /// The principals this policy set scopes to by name, read from Cedar's own
+    /// policy AST — never by matching text.
+    ///
+    /// A rule written `principal == Rustberg::ApiKey::"etl"` names an exact
+    /// principal; one written `principal in Rustberg::Group::"eu"` (or
+    /// `principal is … in …`) names a group; an unconstrained or type-only
+    /// scope names nobody, which is what "anyone" stands for. Conditions in a
+    /// `when` clause are not scopes and are not read: the list is a starting
+    /// set of people to check, not a model of who matches.
+    #[must_use]
+    pub fn named_principals(&self) -> NamedPrincipals {
+        use cedar_policy::PrincipalConstraint as P;
+        let mut named = NamedPrincipals::default();
+        for policy in self.policies.policies() {
+            let uid = match policy.principal_constraint() {
+                P::Eq(uid) | P::In(uid) | P::IsIn(_, uid) => uid,
+                P::Any | P::Is(_) => continue,
+            };
+            let id = uid.id().unescaped().to_string();
+            match uid.type_name().basename() {
+                "Group" => {
+                    named.groups.insert(id);
+                }
+                "User" => {
+                    named.users.insert(id);
+                }
+                "ApiKey" => {
+                    named.api_keys.insert(id);
+                }
+                _ => {}
+            }
+        }
+        named
+    }
+
     /// nobody, including anyone trying to repair it.
     pub fn is_empty(&self) -> bool {
         self.policies.policies().count() == 0
@@ -832,6 +885,54 @@ impl Authorizer for CedarAuthorizer {
 
 #[cfg(test)]
 mod tests {
+
+    /// A policy nested deeper than any rule a person writes is refused, not
+    /// parsed: Cedar recurses once per level, and the management API accepts
+    /// policy text from a caller, so unbounded nesting is a way to abort the
+    /// process.
+    #[test]
+    fn a_policy_nested_beyond_the_limit_is_refused() {
+        let depth = MAX_POLICY_DEPTH * 4;
+        let condition = format!("{}true{}", "(".repeat(depth), ")".repeat(depth));
+        let source = format!("permit(principal, action, resource) when {{ {condition} }};");
+        let error = CedarAuthorizer::new(&source).expect_err("refused");
+        assert!(
+            error.to_string().contains("Invalid Cedar policy"),
+            "{error}"
+        );
+
+        let shallow = format!(
+            "permit(principal, action, resource) when {{ {}true{} }};",
+            "(".repeat(8),
+            ")".repeat(8)
+        );
+        assert!(
+            CedarAuthorizer::new(&shallow).is_ok(),
+            "ordinary nesting loads"
+        );
+    }
+
+    #[test]
+    fn named_principals_are_read_from_the_scopes() {
+        let authorizer = CedarAuthorizer::new(
+            r#"
+            permit(principal == Rustberg::ApiKey::"etl", action, resource);
+            permit(principal == Rustberg::User::"bob", action, resource);
+            permit(principal in Rustberg::Group::"eu", action, resource);
+            permit(principal is Rustberg::User in Rustberg::Group::"ops", action, resource);
+            permit(principal, action, resource) when { principal in Rustberg::Group::"hidden" };
+            "#,
+        )
+        .expect("valid");
+        let named = authorizer.named_principals();
+        assert_eq!(named.api_keys, ["etl".to_string()].into());
+        assert_eq!(named.users, ["bob".to_string()].into());
+        assert_eq!(
+            named.groups,
+            ["eu".to_string(), "ops".to_string()].into(),
+            "a group only in a condition is not a scope"
+        );
+    }
     use super::*;
     use crate::auth::Principal;
     use crate::auth::authz::{RequestContext, Resource};
@@ -1534,6 +1635,125 @@ mod tests {
             "expected to validate many documented policies, found {checked} — \
              has the block format changed?"
         );
+    }
+
+    /// Every policy this project ships or documents never errors, for any
+    /// well-formed request — proved by the Cedar analyser, not sampled.
+    ///
+    /// A policy that raises is denied on every request it raises for, and the
+    /// run-time answer to that is a warning from diagnostics. This replaces the
+    /// warning with a proof, for everything an operator might copy.
+    ///
+    /// Needs the cvc5 SMT solver (`CVC5=/path/to/cvc5`), so it is `#[ignore]`d
+    /// in the ordinary gate and run by the `policy-analysis` CI job. The
+    /// analyser is a dev-dependency: it is in no binary this crate builds.
+    #[tokio::test]
+    #[ignore = "needs cvc5; run by the policy-analysis CI job"]
+    async fn every_shipped_policy_never_errors() {
+        use cedar_policy_symcc::{
+            CedarSymCompiler, CompiledPolicy, CompiledSchema, solver::LocalSolver,
+        };
+
+        let schema = Schema::from_cedarschema_str(SCHEMA).expect("schema").0;
+        let mut compiler = CedarSymCompiler::new(
+            LocalSolver::cvc5()
+                .expect("cvc5 is required: set CVC5 to the path of a cvc5 1.3.1 executable"),
+        )
+        .expect("compiler");
+
+        // The analyser must be able to say no, or a green run proves nothing.
+        let fixture = PolicySet::from_str(
+            "permit(principal, action, resource) when { context.utc_hour * 9223372036854775807 > 0 };",
+        )
+        .expect("fixture parses");
+
+        let mut sources: Vec<(String, String)> = documented_policy_blocks();
+        sources.push(("DEFAULT_POLICIES".to_string(), DEFAULT_POLICIES.to_string()));
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        if let Ok(demo) = std::fs::read_to_string(root.join("examples/demo/policies.cedar")) {
+            sources.push(("examples/demo/policies.cedar".to_string(), demo));
+        }
+
+        let mut proven = 0;
+        let mut not_analysed = Vec::new();
+        let mut erroring = Vec::new();
+        let mut fixture_caught = false;
+
+        let sets: Vec<(String, PolicySet)> = sources
+            .into_iter()
+            .map(|(name, text)| (name, PolicySet::from_str(&text).expect("parses")))
+            .chain(std::iter::once(("fixture".to_string(), fixture)))
+            .collect();
+        for env in schema.request_envs() {
+            let compiled_schema = CompiledSchema::new(&schema).expect("schema compiles");
+            for (name, set) in &sets {
+                for policy in set.policies() {
+                    // Reported by name, never counted as proven.
+                    let compiled = match CompiledPolicy::compile(policy, &env, &compiled_schema) {
+                        Ok(compiled) => compiled,
+                        Err(e) => {
+                            not_analysed.push(format!("{name} {}: {e}", policy.id()));
+                            continue;
+                        }
+                    };
+                    let never_errors = compiler
+                        .check_never_errors_opt(&compiled)
+                        .await
+                        .expect("solver answers");
+                    if name == "fixture" {
+                        fixture_caught |= !never_errors;
+                    } else if never_errors {
+                        proven += 1;
+                    } else {
+                        erroring.push(format!("{name} {} in {env:?}", policy.id()));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            fixture_caught,
+            "the analyser must catch the deliberately erroring fixture"
+        );
+        assert!(proven > 0, "no policy was analysed — has discovery broken?");
+        assert!(
+            erroring.is_empty(),
+            "policies that can error: {erroring:#?}"
+        );
+        assert!(
+            not_analysed.is_empty(),
+            "policies outside the analysable fragment, by name: {not_analysed:#?}"
+        );
+    }
+
+    /// Every Cedar policy block in the published docs and the README, by file.
+    fn documented_policy_blocks() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("site/content/docs"))
+            .expect("docs")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "md"))
+            .collect();
+        files.push(root.join("README.md"));
+        files.sort();
+        let mut out = Vec::new();
+        for path in files {
+            let Ok(doc) = crate::utils::read_repo_text(&path) else {
+                continue;
+            };
+            for block in cedar_blocks(&doc) {
+                if block.contains("permit(") || block.contains("forbid(") {
+                    out.push((
+                        path.strip_prefix(root)
+                            .unwrap_or(&path)
+                            .display()
+                            .to_string(),
+                        block.to_string(),
+                    ));
+                }
+            }
+        }
+        out
     }
 
     /// Validates the Cedar sample printed on the site's landing page.

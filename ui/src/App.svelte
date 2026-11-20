@@ -4,11 +4,12 @@
   import Symbol from "./components/Symbol.svelte";
   import Palette, { type Command } from "./components/Palette.svelte";
   import Connect from "./components/Connect.svelte";
+  import ViewAs from "./components/ViewAs.svelte";
   import Outline, { type Known, type Selection } from "./components/Outline.svelte";
   import Catalog from "./places/Catalog.svelte";
   import Policies from "./places/Policies.svelte";
   import You from "./places/You.svelte";
-  import { ApiError, get, listNamespaces, listTables, listViews, nsPath, whenUnauthorized, type Ident, type Identity } from "./lib/api";
+  import { ApiError, get, listNamespaces, listTables, listViews, nsPath, whenUnauthorized, type Ident, type Identity, type Subject } from "./lib/api";
   import { credential, forget, remember } from "./lib/session";
   import { copy } from "./lib/clipboard";
   import { ident } from "./lib/format";
@@ -26,6 +27,9 @@
   let inspector = $state(true);
   let paletteOpen = $state(false);
   let connectOpen = $state(false);
+  let viewAsOpen = $state(false);
+  // A preview of another principal's view: what the server's what-if answers about them.
+  let viewAs = $state<Subject | null>(null);
   let versionsRequested = $state(0);
   let known = $state<Known[]>([]);
   let rootCount = $state<number | null>(null);
@@ -76,6 +80,7 @@
     identity = null;
     selection = undefined;
     known = [];
+    viewAs = null;
     phase = "signin";
   }
 
@@ -141,6 +146,12 @@
     { id: "p-versions", title: "Policy versions", icon: "versions", run: () => go("#/policies/versions") },
     { id: "p-you", title: "You", hint: "⌘3", icon: "person", run: () => go("#/you") },
     { id: "a-connect", title: "Connect a client", icon: "plug", run: () => (connectOpen = true) },
+    ...(dev
+      ? []
+      : [
+          { id: "a-view-as", title: "View as…", icon: "eye", run: () => (viewAsOpen = true) },
+          ...(viewAs ? [{ id: "a-end-preview", title: `End preview as ${viewAs.id}`, icon: "xmark", run: () => (viewAs = null) }] : []),
+        ]),
     ...(place === "catalog"
       ? [{ id: "a-inspector", title: inspector ? "Hide inspector" : "Show inspector", hint: "⌘I", icon: "inspector", run: () => (inspector = !inspector) }]
       : []),
@@ -235,6 +246,13 @@
         </button>
         {#if dev}
           <span class="chip dev" title="Authentication is disabled on this server"><Symbol name="warning" size={13} />Development mode — no authentication</span>
+        {:else if viewAs}
+          <span class="chip preview" role="status" title="A preview answered by the server's what-if — you are still signed in as yourself">
+            <Symbol name="eye" size={13} />
+            <span>Previewing as <strong>{viewAs.id}</strong></span>
+            {#if viewAs.roles.length}<span class="muted">· {viewAs.roles.join(", ")}</span>{/if}
+            <button class="end" onclick={() => (viewAs = null)} aria-label={`End preview as ${viewAs.id}`}><Symbol name="xmark" size={12} /></button>
+          </span>
         {:else if identity}
           <button class="chip" onclick={() => go("#/you")} title="Everything here is what this identity may see">
             <Symbol name="person" size={13} />
@@ -242,6 +260,9 @@
             <span class="muted tenant">· {identity.principal.tenant_id}</span>
             {#if identity.principal.roles.length}<span class="muted">· {identity.principal.roles.join(", ")}</span>{/if}
           </button>
+        {/if}
+        {#if !dev && identity}
+          <button class="btn plain icon" class:on={Boolean(viewAs)} aria-label="View as… — preview another principal's view" title="View as…" onclick={() => (viewAsOpen = true)}><Symbol name="eye" size={16} /></button>
         {/if}
         {#if place === "catalog" && selection}
           <button class="btn plain icon" class:on={inspector} aria-pressed={inspector} aria-label="Inspector (⌘I)" onclick={() => (inspector = !inspector)}><Symbol name="inspector" size={16} /></button>
@@ -251,7 +272,7 @@
       <main class="content">
         {#if place === "catalog"}
           {#if selection}
-            <Catalog {selection} {inspector} />
+            <Catalog {selection} {inspector} {viewAs} onviewas={(s) => (viewAs = s)} />
           {:else}
             <div class="welcome">
               <Symbol name="catalog" size={44} weight={1.2} />
@@ -279,6 +300,16 @@
 
   {#if paletteOpen}<Palette {commands} onclose={() => (paletteOpen = false)} />{/if}
   {#if connectOpen}<Connect onclose={() => (connectOpen = false)} />{/if}
+  {#if viewAsOpen}
+    <ViewAs
+      current={viewAs}
+      onclose={() => (viewAsOpen = false)}
+      onpreview={(s) => {
+        viewAs = s;
+        viewAsOpen = false;
+      }}
+    />
+  {/if}
 {/if}
 
 <style>
@@ -476,6 +507,28 @@
     color: var(--restricted);
     background: var(--restricted-soft);
     border-color: transparent;
+  }
+  .chip.preview {
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    border-color: transparent;
+    padding-right: 4px;
+  }
+  .chip .end {
+    display: grid;
+    place-items: center;
+    width: 20px;
+    height: 20px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+  .chip .end:hover,
+  .chip .end:focus-visible {
+    background: var(--accent-soft);
+    outline: none;
   }
   .icon {
     padding: 0 6px;

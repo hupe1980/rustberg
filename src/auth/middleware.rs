@@ -128,6 +128,10 @@ pub async fn auth_middleware(
         .get(REQUEST_ID_HEADER)
         .and_then(|v| v.to_str().ok())
         .and_then(sanitize_request_id);
+    let client_request_id = request
+        .extensions()
+        .get::<ClientRequestId>()
+        .map(|id| id.0.clone());
 
     // Check rate limit before authentication
     if let Some(ip) = client_ip
@@ -136,7 +140,8 @@ pub async fn auth_middleware(
         auth_state.auditor.record_lossy(
             &AuditEvent::rate_limit("ip")
                 .with_client_ip(ip)
-                .with_optional_request_id(request_id.as_deref()),
+                .with_optional_request_id(request_id.as_deref())
+                .with_optional_client_request_id(client_request_id.as_deref()),
         );
         return exceeded.into_response();
     }
@@ -171,6 +176,7 @@ pub async fn auth_middleware(
                     &AuditEvent::authentication(auth_method, false)
                         .with_optional_client_ip(client_ip)
                         .with_optional_request_id(request_id.as_deref())
+                        .with_optional_client_request_id(client_request_id.as_deref())
                         .with_detail("reason", "credential expired"),
                 );
                 return AuthError::TokenExpired.into_response();
@@ -181,7 +187,8 @@ pub async fn auth_middleware(
                     .with_principal(&principal)
                     .with_tenant_id(principal.tenant_id())
                     .with_optional_client_ip(client_ip)
-                    .with_optional_request_id(request_id.as_deref()),
+                    .with_optional_request_id(request_id.as_deref())
+                    .with_optional_client_request_id(client_request_id.as_deref()),
             );
 
             // Check per-tenant rate limit for authenticated requests
@@ -194,7 +201,8 @@ pub async fn auth_middleware(
                         .with_principal(&principal)
                         .with_tenant_id(principal.tenant_id())
                         .with_optional_client_ip(client_ip)
-                        .with_optional_request_id(request_id.as_deref()),
+                        .with_optional_request_id(request_id.as_deref())
+                        .with_optional_client_request_id(client_request_id.as_deref()),
                 );
                 return add_rate_limit_headers(exceeded.into_response(), None);
             }
@@ -212,6 +220,7 @@ pub async fn auth_middleware(
             if let Some(id) = request_id {
                 facts = facts.with_request_id(id);
             }
+            facts.client_request_id = client_request_id;
             request.extensions_mut().insert(facts);
 
             // Continue to the next handler
@@ -252,6 +261,7 @@ pub async fn auth_middleware(
                     &AuditEvent::authentication("unknown", false)
                         .with_optional_client_ip(client_ip)
                         .with_optional_request_id(request_id.as_deref())
+                        .with_optional_client_request_id(client_request_id.as_deref())
                         .with_detail("reason", e.to_string()),
                 );
             }
@@ -327,33 +337,34 @@ pub const MAX_REQUEST_ID_LEN: usize = 128;
 /// The header a request id travels in, named once.
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
-/// Removes an inbound `x-request-id` this server will not carry, so the layer
-/// that mints one replaces it.
-///
-/// An inbound id is preserved so a trace survives the hop, and bounded so a
-/// caller cannot inflate the audit trail with it. The bound has to *replace*
-/// rather than ignore: `PropagateRequestIdLayer` echoes whatever it found, so an
-/// id dropped only from the record leaves the response naming one thing and the
-/// trail naming nothing — which lets a caller unjoin its own requests from the
-/// trail by sending a two-kilobyte id.
-///
-/// Sits outside `SetRequestIdLayer`, which leaves an existing header alone and
-/// mints only when there is none.
-pub async fn strip_unusable_request_id(mut request: Request<Body>, next: Next) -> Response {
-    let unusable = request
-        .headers()
-        .get_all(REQUEST_ID_HEADER)
-        .iter()
-        // A repeat is unusable for the same reason a bad character is: which one
-        // the trail would name is then a coin toss.
-        .try_fold(0usize, |count, value| match (count, value.to_str()) {
-            (0, Ok(id)) if is_usable_request_id(id) => Ok(1),
-            _ => Err(()),
-        })
-        .is_err();
+/// The `x-request-id` a client sent, taken off the request before the server
+/// mints its own.
+#[derive(Debug, Clone)]
+pub struct ClientRequestId(pub String);
 
-    if unusable {
-        request.headers_mut().remove(REQUEST_ID_HEADER);
+/// Takes every inbound `x-request-id` off the request, so the layer beneath
+/// always mints the server's own.
+///
+/// The request id is the key an audit record is found by — the *Reference* a
+/// refused person hands an administrator. A key the caller chooses is a key a
+/// caller can make collide with somebody else's request. So the server's id is
+/// the only one in `request_id` and in the response, and a usable inbound id is
+/// kept beside it, as `client_request_id`, so a trace that started elsewhere
+/// still joins the trail.
+///
+/// Sits outside `SetRequestIdLayer`, which mints only when no header is present.
+pub async fn take_client_request_id(mut request: Request<Body>, next: Next) -> Response {
+    let mut values = request.headers().get_all(REQUEST_ID_HEADER).iter();
+    // A repeat is unusable for the same reason a bad character is: which one
+    // the trail would name is then a coin toss.
+    let client = match (values.next(), values.next()) {
+        (Some(value), None) => value.to_str().ok().and_then(sanitize_request_id),
+        _ => None,
+    };
+
+    request.headers_mut().remove(REQUEST_ID_HEADER);
+    if let Some(id) = client {
+        request.extensions_mut().insert(ClientRequestId(id));
     }
 
     next.run(request).await
@@ -362,7 +373,7 @@ pub async fn strip_unusable_request_id(mut request: Request<Body>, next: Next) -
 /// Whether an inbound `x-request-id` is one this server will carry.
 ///
 /// Read in two places, which is why it is a function rather than a check at each
-/// of them: [`strip_unusable_request_id`], which runs *outside* the layer that
+/// of them: [`take_client_request_id`], which runs *outside* the layer that
 /// mints one, and this middleware, which reads whatever survived. If those two
 /// disagreed the record and the echoed header would name different things —
 /// which is the one thing a request id exists not to do.

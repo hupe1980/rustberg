@@ -1846,16 +1846,15 @@ async fn an_unauthorized_response_carries_a_challenge() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
-/// An inbound correlation id is carried through when this server can carry it,
-/// and **replaced** when it cannot.
+/// The request id is the server's, always.
 ///
-/// Replaced rather than ignored: the response echoes whatever reached the
-/// request-id layer, so an id dropped only from the audit record would leave the
-/// echo and the record naming different things — and a caller could unjoin every
-/// one of its requests from the trail by sending an oversized id. The rule and
-/// the echo have to be the same rule.
+/// It is the key an audit record is found by and the *Reference* a refused
+/// person hands an administrator, so a caller must not be able to choose it —
+/// a chosen id can be made to collide with somebody else's request. A usable
+/// inbound id is kept, as `client_request_id` on the record, and never echoed in
+/// place of the server's.
 #[tokio::test]
-async fn an_unusable_correlation_id_is_replaced_rather_than_echoed() {
+async fn a_client_request_id_never_replaces_the_servers() {
     let (app, _state) = create_test_app_no_auth().await;
     let router = app.into_router();
 
@@ -1880,18 +1879,17 @@ async fn an_unusable_correlation_id_is_replaced_rather_than_echoed() {
         }
     };
 
-    assert_eq!(
-        echoed("trace-abc.123:x").await,
-        "trace-abc.123:x",
-        "a usable id must survive the hop"
-    );
-
-    for unusable in ["a".repeat(300), "has space".to_string(), " ".to_string()] {
-        let back = echoed(&unusable).await;
-        assert_ne!(back, unusable, "{unusable:?} must not be echoed");
+    for inbound in [
+        "trace-abc.123:x".to_string(),
+        "a".repeat(300),
+        "has space".to_string(),
+        " ".to_string(),
+    ] {
+        let back = echoed(&inbound).await;
+        assert_ne!(back, inbound, "{inbound:?} must not become the request id");
         assert!(
             uuid::Uuid::parse_str(&back).is_ok(),
-            "an unusable id must be replaced by a minted one, got {back:?}"
+            "the server mints the id, got {back:?}"
         );
     }
 }
@@ -2434,6 +2432,59 @@ async fn test_config_rejects_unknown_warehouse() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// A warehouse configured as a bare path is the same warehouse as its
+/// `file://` URL. Found by Apache's REST Compatibility Kit: the image sets
+/// `RUSTBERG_WAREHOUSE=/var/lib/rustberg/warehouse`, the client named
+/// `file:///var/lib/rustberg/warehouse`, and was refused as an unknown
+/// warehouse — while the registry laid its tables out under the URL spelling.
+#[tokio::test]
+async fn a_bare_path_warehouse_is_its_file_url() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bare = dir.path().join("wh").display().to_string();
+    let app = App::builder()
+        .with_catalog_url(rustberg::location::url_from_path(
+            dir.path().join("catalog"),
+        ))
+        .with_warehouse_location(bare.clone())
+        .with_default_tenant_id("test-tenant")
+        .build()
+        .await
+        .expect("build app");
+    let url = rustberg::location::url_from_path(&bare);
+
+    let (status, body) = make_request(&app, Method::GET, "/v1/config", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        body["overrides"]["warehouse"],
+        url.as_str(),
+        "advertised as a URL"
+    );
+
+    for spelling in [&url, &bare] {
+        let (status, body) = make_request(
+            &app,
+            Method::GET,
+            &format!("/v1/config?warehouse={}", urlencoding_component(spelling)),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{spelling}: {body}");
+    }
+}
+
+fn urlencoding_component(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 // ============================================================================
 // Prefix routing, delegation, and error-status regressions
 // ============================================================================
@@ -2634,6 +2685,119 @@ fn view_payload(name: &str) -> serde_json::Value {
             "summary": {}
         }
     })
+}
+
+/// A view whose metadata file is gone can still be dropped. Its protection
+/// flag lived in that file, so there is nothing left to protect, and refusing
+/// would leave a pointer no one can remove.
+#[tokio::test]
+async fn a_view_whose_metadata_is_gone_can_be_dropped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = App::builder()
+        .with_catalog_url(rustberg::location::url_from_path(
+            dir.path().join("catalog"),
+        ))
+        .with_warehouse_location(rustberg::location::url_from_path(dir.path().join("wh")))
+        .with_default_tenant_id("test-tenant")
+        .build()
+        .await
+        .expect("build app");
+
+    let (status, _) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces",
+        None,
+        Some(serde_json::json!({ "namespace": ["view_ns"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/view_ns/views",
+        None,
+        Some(view_payload("v")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let location = serde_json::from_str::<serde_json::Value>(&body).unwrap()["metadata-location"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::remove_file(rustberg::location::path_from_url(&location)).expect("remove metadata");
+
+    let (status, body) = make_request(
+        &app,
+        Method::DELETE,
+        "/v1/namespaces/view_ns/views/v",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, _) = make_request(
+        &app,
+        Method::GET,
+        "/v1/namespaces/view_ns/views/v",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The same for a table: a plain drop removes a pointer whose metadata is gone.
+#[tokio::test]
+async fn a_table_whose_metadata_is_gone_can_be_dropped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = App::builder()
+        .with_catalog_url(rustberg::location::url_from_path(
+            dir.path().join("catalog"),
+        ))
+        .with_warehouse_location(rustberg::location::url_from_path(dir.path().join("wh")))
+        .with_default_tenant_id("test-tenant")
+        .build()
+        .await
+        .expect("build app");
+
+    let (status, _) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces",
+        None,
+        Some(serde_json::json!({ "namespace": ["db"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = make_request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/db/tables",
+        None,
+        Some(
+            serde_json::json!({ "name": "t", "schema": { "type": "struct", "fields": [
+                { "id": 1, "name": "id", "required": true, "type": "long" }
+            ]}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let location = serde_json::from_str::<serde_json::Value>(&body).unwrap()["metadata-location"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::remove_file(rustberg::location::path_from_url(&location)).expect("remove metadata");
+
+    let (status, body) = make_request(
+        &app,
+        Method::DELETE,
+        "/v1/namespaces/db/tables/t",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 }
 
 /// The metadata location a create returns must name a file that exists.

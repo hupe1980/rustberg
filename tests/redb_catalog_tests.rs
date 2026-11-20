@@ -1859,3 +1859,45 @@ async fn purge_does_not_follow_a_write_path_outside_the_table() {
          even when the path is inside the warehouse"
     );
 }
+
+/// A warehouse written with a trailing slash — `s3://warehouse/`, as the MinIO
+/// example writes it — lays a table out at `s3://warehouse/db/t`, not
+/// `s3://warehouse//db/t`. An empty path segment is significant in an object
+/// key: readers refuse it, and a containment check that preserved it would treat
+/// the two as different prefixes.
+#[tokio::test]
+async fn a_trailing_slash_on_the_warehouse_leaves_no_empty_segment() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let warehouse = temp_dir.path().join("warehouse");
+    std::fs::create_dir_all(&warehouse).expect("warehouse dir");
+    let catalog = RedbCatalog::open(
+        temp_dir.path().join("catalog.redb"),
+        format!("{}/", rustberg::location::url_from_path(&warehouse)),
+    )
+    .await
+    .expect("catalog");
+
+    let ns = NamespaceIdent::new("db".to_string());
+    catalog
+        .create_namespace(&ns, HashMap::new())
+        .await
+        .expect("namespace");
+    let table = catalog
+        .create_table(
+            &ns,
+            TableCreation::builder()
+                .name("t".to_string())
+                .schema(test_schema())
+                .build(),
+        )
+        .await
+        .expect("table");
+
+    let location = table.metadata().location();
+    let path = location
+        .split_once("://")
+        .map(|(_, p)| p)
+        .unwrap_or(location);
+    assert!(!path.contains("//"), "an empty segment in {location}");
+    assert!(location.ends_with("/warehouse/db/t"), "{location}");
+}

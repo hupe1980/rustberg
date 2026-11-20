@@ -196,9 +196,33 @@ pub async fn plan_table_scan(
     // names files the caller has no way to fetch. Pre-signing them here is what
     // closes that loop — and it is the only delegation whose scope is *exactly*
     // the set policy permits, because the set was computed one line above.
-    presign_planned_files(&state, &authorized, &loaded, &mut tasks).await?;
+    let presigned = presign_planned_files(&state, &authorized, &loaded, &mut tasks).await?;
 
-    Ok((StatusCode::OK, axum::Json(tasks)).into_response())
+    // Graded against the snapshot this plan read, which is what the files it
+    // names were written under.
+    let snapshot = match payload.snapshot_id {
+        Some(id) => loaded.metadata().snapshot_by_id(id),
+        None => loaded.metadata().current_snapshot(),
+    };
+    let grade = super::enforcement::grade(&loaded, snapshot, &authorized.obligations).await;
+
+    // The pre-signed URLs are a grant of storage access, and the one that
+    // enforces the restriction: recorded once per plan, with how strongly it
+    // held. A read grant degrades like any other read record.
+    if presigned > 0 {
+        let event =
+            crate::auth::AuditEvent::plan_presign(&authorized.resource_path(), presigned, &grade)
+                .with_principal(authorized.principal())
+                .with_tenant_id(authorized.principal().tenant_id())
+                .with_optional_client_ip(authorized.request().source_ip)
+                .with_optional_request_id(authorized.request().request_id.as_deref())
+                .with_optional_client_request_id(authorized.request().client_request_id.as_deref());
+        state.auditor.record_lossy(&event);
+    }
+
+    let mut response = (StatusCode::OK, axum::Json(tasks)).into_response();
+    super::enforcement::insert_header(&mut response, &grade);
+    Ok(response)
 }
 
 /// Replaces each planned file's `file-path` with a pre-signed URL.
@@ -221,9 +245,9 @@ async fn presign_planned_files(
     authorized: &guard::Authorized,
     table: &iceberg::table::Table,
     plan: &mut CompletedPlan,
-) -> Result<()> {
+) -> Result<usize> {
     if authorized.obligations.is_empty() || !state.signing.enabled {
-        return Ok(());
+        return Ok(0);
     }
 
     // The same bound vending answers, asked the same way: this server pre-signs
@@ -232,7 +256,7 @@ async fn presign_planned_files(
     // for it.
     let location = table.metadata().location().to_string();
     if !crate::location::is_vendable(state.request_signer.allowed_prefixes(), &location) {
-        return Ok(());
+        return Ok(0);
     }
 
     let ttl = state.signing.presign_ttl;
@@ -242,6 +266,7 @@ async fn presign_planned_files(
         .clone()
         .unwrap_or_else(|| "us-east-1".to_string());
 
+    let mut signed_count = 0;
     for file in plan
         .file_scan_tasks
         .iter_mut()
@@ -259,9 +284,10 @@ async fn presign_planned_files(
             .await
             .map_err(|e| AppError::Internal(format!("could not pre-sign '{path}': {e}")))?;
         file["file-path"] = json!(signed);
+        signed_count += 1;
     }
 
-    Ok(())
+    Ok(signed_count)
 }
 
 /// The URL one planned file will be pre-signed at, with the two checks that have
@@ -288,13 +314,16 @@ fn planned_file_uri(
     // location. Issuing a URL for it would be that hole with a signature on it.
     if !crate::location::is_within(table_location, path) {
         return Err(AppError::Internal(format!(
-            "the plan named '{path}', which is outside this table's own storage. No URL              is issued for it."
+            "the plan named '{path}', which is outside this table's own storage. No URL \
+            is issued for it."
         )));
     }
 
     super::sign::object_url(path, region, config).ok_or_else(|| {
         AppError::NotSupported(format!(
-            "This table's files are at '{path}', which this server cannot pre-sign — only              S3 locations have a pre-signed URL form here. A restricted table on other              storage is planned but not delegated."
+            "This table's files are at '{path}', which this server cannot pre-sign — only \
+            S3 locations have a pre-signed URL form here. A restricted table on other \
+            storage is planned but not delegated."
         ))
     })
 }
@@ -969,9 +998,12 @@ fn policy_predicate(
     combined
 }
 
-/// The filter the client must still apply to the rows it reads.
+/// The filter the client must still apply to the rows it reads — sent only
+/// when policy restricts the rows.
 ///
-/// The client's own filter conjoined with what policy permits. Both halves are
+/// The client's own filter conjoined with what policy permits. Without a
+/// policy half there is nothing to send: the reader derives the residual from
+/// the filter it planned with, as the Iceberg expressions spec recommends. Both halves are
 /// needed: pruning is conservative, so a file that survives may hold rows the
 /// policy filter excludes, and an engine that applied only the half it sent
 /// would read them.
@@ -990,16 +1022,16 @@ fn residual_filter(
     obligations: &Obligations,
     schema: &iceberg::spec::Schema,
 ) -> Option<Value> {
-    let policy = super::restrictions::row_filter(schema, obligations);
+    // Without a policy half the residual would be the client's own filter,
+    // echoed on every task. The expressions spec asks a service to omit it
+    // ("Compatibility with REST catalog expressions"): a reader then derives it
+    // from the filter it sent, and a large `IN` list is not repeated per task.
+    let policy = super::restrictions::row_filter(schema, obligations)?;
 
-    match (requested, policy) {
-        (Some(requested), Some(policy)) => {
-            Some(json!({ "type": "and", "left": requested, "right": policy }))
-        }
-        (Some(only), None) => Some(only.clone()),
-        (None, Some(only)) => Some(only),
-        (None, None) => None,
-    }
+    Some(match requested {
+        Some(requested) => json!({ "type": "and", "left": requested, "right": policy }),
+        None => policy,
+    })
 }
 
 // ============================================================================
@@ -1634,6 +1666,43 @@ mod tests {
         );
     }
 
+    /// An unrestricted caller's residual would be its own filter, echoed once
+    /// per task. The expressions spec asks a service to omit it, so a reader
+    /// derives it from the filter it sent — and a large `IN` list is not
+    /// repeated across thousands of tasks.
+    #[test]
+    fn an_unrestricted_residual_is_omitted() {
+        let schema = nested_schema();
+        let requested = json!({ "type": "eq", "term": "amount", "value": 7 });
+
+        assert_eq!(
+            residual_filter(Some(&requested), &Obligations::default(), &schema),
+            None,
+            "nothing policy-relevant is carried, so nothing is sent"
+        );
+    }
+
+    /// A restricted caller's residual is where the policy half reaches a
+    /// cooperating engine, so it stays — the client's filter `and` the
+    /// published one.
+    #[test]
+    fn a_restricted_residual_keeps_the_client_filter() {
+        let schema = nested_schema();
+        let requested = json!({ "type": "eq", "term": "amount", "value": 7 });
+        let obligations = Obligations {
+            row_filters: vec![json!({ "type": "eq", "term": "amount", "value": 1 })],
+            column_masks: HashSet::new(),
+        };
+
+        let residual = residual_filter(Some(&requested), &obligations, &schema).expect("kept");
+        assert_eq!(residual["type"], "and");
+        assert_eq!(residual["left"], requested);
+        assert_eq!(
+            residual["right"],
+            super::super::restrictions::row_filter(&schema, &obligations).expect("published")
+        );
+    }
+
     fn nested_schema() -> Schema {
         Schema::builder()
             .with_fields(vec![
@@ -1843,6 +1912,7 @@ mod tests {
             enabled: true,
             url_style: Some(super::super::sign::UrlStyle::Auto),
             endpoint_host: None,
+            endpoint_tls: true,
             fallback_region: None,
             presign_ttl: std::time::Duration::from_secs(900),
         }

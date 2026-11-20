@@ -1,6 +1,6 @@
 [package]
 name = "rustberg"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "A policy-first Apache Iceberg REST catalog: Cedar authorization on every request, scoped storage access, and an audit trail — in a single binary or as a library"
@@ -162,7 +162,7 @@ subtle = "2.6"   # Constant-time comparison for API key hashes
 zeroize = { version = "1.8", features = ["derive"] }
 
 # Authorization
-cedar-policy = "4.14"
+cedar-policy = "4.15"
 
 # Caching
 moka = { version = "0.12", features = ["future", "sync"] }
@@ -249,6 +249,7 @@ tokio = { version = "1", features = ["test-util", "macros"] }
 http = "1.1"
 http-body-util = "0.1"
 testcontainers = "0.23"
+cedar-policy-symcc = "=0.9.0"
 
 [profile.release]
 lto = true

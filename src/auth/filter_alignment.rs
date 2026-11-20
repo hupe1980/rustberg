@@ -69,47 +69,235 @@ pub fn referenced_columns(
     crate::predicate::referenced_columns(filter, metadata.current_schema())
 }
 
-/// Columns a filter can be enforced on by withholding files.
+/// How strongly a caller's restrictions hold on one table.
+///
+/// The one answer the header, the signing record, the load-time warning and the
+/// administrator's what-if all read, so none of them can disagree with another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Enforcement {
+    /// No restriction applies to this caller on this table.
+    None,
+    /// Every restriction holds against any engine: each filter column is an
+    /// identity partition of every spec a live file was written under, and no
+    /// column is masked. A forbidden row is in no file the caller is handed.
+    Architectural,
+    /// The delivered files also hold what is restricted, and only a cooperating
+    /// engine applying the residual and the projections withholds it.
+    Cooperative {
+        /// Filter columns that are not identity partitions of every live spec.
+        columns: BTreeSet<String>,
+        /// Whether a column mask applies — the file always holds the raw column.
+        masked: bool,
+    },
+}
+
+impl Enforcement {
+    /// The grade's name, as the header, the audit record and the docs spell it.
+    #[must_use]
+    pub const fn grade(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Architectural => "architectural",
+            Self::Cooperative { .. } => "cooperative",
+        }
+    }
+
+    /// The `Rustberg-Enforcement` header value: an RFC 9651 structured-field
+    /// Item, with the reasons as parameters —
+    /// `cooperative;columns="region,ts";masked`.
+    ///
+    /// Column names are serialized as an sf-string when they are printable
+    /// ASCII and as a Display String (`%"…"`) otherwise, so any column name a
+    /// table may have produces a valid header value.
+    #[must_use]
+    pub fn header_value(&self) -> String {
+        match self {
+            Self::Cooperative { columns, masked } => {
+                let mut value = String::from("cooperative");
+                if !columns.is_empty() {
+                    let joined = columns.iter().cloned().collect::<Vec<_>>().join(",");
+                    value.push_str(";columns=");
+                    value.push_str(&structured_string(&joined));
+                }
+                if *masked {
+                    value.push_str(";masked");
+                }
+                value
+            }
+            other => other.grade().to_string(),
+        }
+    }
+
+    /// What would make this grade architectural, in words an operator can act
+    /// on — or `None` when there is nothing to change.
+    ///
+    /// Concrete on purpose: the partition evolution to run, and the fact that
+    /// files already written keep the grade cooperative until they are
+    /// rewritten. A remedy that only said "partition on the boundary" would let
+    /// an operator repartition, see nothing change, and stop trusting the grade.
+    #[must_use]
+    pub fn remedy(&self, table: &str) -> Option<String> {
+        let Self::Cooperative { columns, masked } = self else {
+            return None;
+        };
+
+        let mut steps = Vec::new();
+        if !columns.is_empty() {
+            let fields = columns
+                .iter()
+                .map(|column| format!("ADD PARTITION FIELD {column}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            steps.push(format!(
+                "ALTER TABLE {table} {fields} — then rewrite the files written before it. The \
+                 grade turns architectural when no live file was written under a spec that \
+                 does not partition on {}.",
+                columns.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if *masked {
+            steps.push(
+                "A column mask is always cooperative: every delivered file holds the raw \
+                 column, and only the engine masks it. To withhold a column from every \
+                 engine, deny the table and grant a view that omits it."
+                    .to_string(),
+            );
+        }
+        Some(steps.join(" "))
+    }
+}
+
+/// An RFC 9651 sf-string, or a Display String when the text is not printable
+/// ASCII.
+fn structured_string(text: &str) -> String {
+    if text.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+        let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    } else {
+        let mut out = String::from("%\"");
+        for byte in text.bytes() {
+            if byte == b'%' || byte == b'"' || !(0x20..=0x7e).contains(&byte) {
+                out.push_str(&format!("%{byte:02x}"));
+            } else {
+                out.push(byte as char);
+            }
+        }
+        out.push('"');
+        out
+    }
+}
+
+/// Grades a caller's obligations on one table.
+///
+/// `live_specs` is the set of partition spec ids the served snapshot's live
+/// manifests were written under — `None` for a table with no snapshot, which
+/// has no files and is graded by its default spec.
+///
+/// # Why the served snapshot, and not every spec the table has had
+///
+/// A filter is enforced by withholding files only if every file the caller may
+/// be handed separates rows by the filter column. That is a property of the
+/// files, so it is read from the specs files were *written* under. The table's
+/// default spec alone overclaims — files written before an evolution are still
+/// live and are not partitioned on the column. Every spec in `partition-specs`
+/// underclaims forever — that list never forgets a spec, so an operator who
+/// repartitioned and rewrote every file would still be told `cooperative`, and
+/// the remedy would be a lie.
+#[must_use]
+pub fn enforcement(
+    metadata: &TableMetadata,
+    obligations: &crate::auth::Obligations,
+    live_specs: Option<&BTreeSet<i32>>,
+) -> Enforcement {
+    if obligations.is_empty() {
+        return Enforcement::None;
+    }
+
+    let aligned = aligned_columns(metadata, live_specs);
+    let mut opaque = false;
+    let mut columns = BTreeSet::new();
+    for filter in &obligations.row_filters {
+        let referenced = referenced_columns(filter, metadata);
+        // A filter that names no column is either a constant — which selects
+        // all files or none, and is enforced by selection — or a term this
+        // catalog cannot read. The second is never graded architectural: what
+        // cannot be read cannot be shown to separate files.
+        if referenced.is_empty() && !is_constant(filter) {
+            opaque = true;
+        }
+        columns.extend(referenced.into_iter().filter(|c| !aligned.contains(c)));
+    }
+    let masked = !obligations.column_masks.is_empty();
+
+    if columns.is_empty() && !masked && !opaque {
+        Enforcement::Architectural
+    } else {
+        Enforcement::Cooperative { columns, masked }
+    }
+}
+
+/// `true`, `false`, or their object forms.
+fn is_constant(filter: &serde_json::Value) -> bool {
+    match filter {
+        serde_json::Value::Bool(_) => true,
+        serde_json::Value::Object(map) => {
+            map.len() == 1
+                && matches!(
+                    map.get("type").and_then(serde_json::Value::as_str),
+                    Some("true" | "false")
+                )
+        }
+        _ => false,
+    }
+}
+
+/// Columns every live spec partitions by identity.
 ///
 /// **Identity transforms only.** Every other transform is lossy — `days(ts)`
 /// puts a whole day in one file, `bucket(16, id)` a sixteenth of all ids — so a
-/// filter on the source column selects files whose other rows are forbidden, and
-/// the file still has to be delivered with the predicate attached. Counting
-/// those as aligned reports cooperative enforcement as architectural, which is
-/// the confusion this module exists to prevent.
+/// filter on the source column selects files whose other rows are forbidden.
 ///
 /// Conservative rather than exact: `ts >= '2024-01-01' AND ts < '2024-01-02'`
 /// against `days(ts)` *is* enforceable and is reported as unaligned anyway,
 /// because deciding that needs a predicate model over transforms `iceberg-rust`
-/// does not carry. The error runs in the safe direction.
+/// does not carry. The error runs in the safe direction, and so does a spec id
+/// the metadata does not know: it aligns nothing.
+fn aligned_columns(
+    metadata: &TableMetadata,
+    live_specs: Option<&BTreeSet<i32>>,
+) -> BTreeSet<String> {
+    let default = [metadata.default_partition_spec_id()];
+    let ids: Vec<i32> = match live_specs {
+        Some(ids) => ids.iter().copied().collect(),
+        None => default.to_vec(),
+    };
+
+    let mut per_spec = ids.iter().map(|id| identity_columns(metadata, *id));
+    let Some(first) = per_spec.next() else {
+        return identity_columns(metadata, metadata.default_partition_spec_id());
+    };
+    per_spec.fold(first, |acc, next| {
+        acc.intersection(&next).cloned().collect()
+    })
+}
+
+/// Source columns one spec partitions by identity, by full name.
 ///
 /// **Source names, and full ones.** A spec may name an identity field `reg`
 /// while the filter says `region`, so the source column is what is compared —
 /// via `Schema::name_by_field_id`, which gives the dotted path. `NestedField::
 /// name` is the leaf only, and would match a partition on `user.region` against
 /// an unrelated top-level `region` while missing the filter that named it.
-pub fn partition_source_columns(metadata: &TableMetadata) -> BTreeSet<String> {
+fn identity_columns(metadata: &TableMetadata, spec_id: i32) -> BTreeSet<String> {
     let schema = metadata.current_schema();
-
-    metadata
-        .default_partition_spec()
-        .fields()
+    let Some(spec) = metadata.partition_spec_by_id(spec_id) else {
+        return BTreeSet::new();
+    };
+    spec.fields()
         .iter()
         .filter(|field| field.transform == Transform::Identity)
         .filter_map(|field| schema.name_by_field_id(field.source_id))
         .map(str::to_string)
-        .collect()
-}
-
-/// Columns a filter references that the table does not partition on.
-///
-/// Empty means the filter is partition-aligned, and withholding files would be
-/// real enforcement. Non-empty names the columns that make it cooperative.
-pub fn unaligned_columns(filter: &serde_json::Value, metadata: &TableMetadata) -> BTreeSet<String> {
-    let partitions = partition_source_columns(metadata);
-    referenced_columns(filter, metadata)
-        .into_iter()
-        .filter(|column| !partitions.contains(column))
         .collect()
 }
 
@@ -242,25 +430,15 @@ fn reported() -> &'static moka::sync::Cache<String, ()> {
 /// Warns, once per table per policy set, when a row filter cannot be enforced
 /// by withholding files.
 ///
-/// Called from the table load path, where the filter and the partition spec are
-/// both in hand. Does nothing when there are no row filters, or when every
-/// filtered column is a partition column.
-pub fn warn_if_cooperative(
-    row_filters: &[serde_json::Value],
-    metadata: &TableMetadata,
-    table: &str,
-    policy_set_version: Option<&str>,
-) {
-    if row_filters.is_empty() {
+/// Derived from the grade rather than from a second reading of the rule, so the
+/// log line and the header a caller sees cannot disagree. Says nothing for a
+/// grade that is cooperative only because of a mask: that is stated on every
+/// response and is not a partitioning mistake an operator can fix.
+pub fn warn_if_cooperative(grade: &Enforcement, table: &str, policy_set_version: Option<&str>) {
+    let Enforcement::Cooperative { columns, .. } = grade else {
         return;
-    }
-
-    let unaligned: BTreeSet<String> = row_filters
-        .iter()
-        .flat_map(|filter| unaligned_columns(filter, metadata))
-        .collect();
-
-    if unaligned.is_empty() {
+    };
+    if columns.is_empty() {
         return;
     }
 
@@ -273,17 +451,17 @@ pub fn warn_if_cooperative(
     }
     reported().insert(key, ());
 
-    let columns: Vec<&str> = unaligned.iter().map(String::as_str).collect();
+    let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
     tracing::warn!(
         table = %table,
         columns = ?columns,
         policy_set_version = policy_set_version.unwrap_or("-"),
-        "Row filter references columns this table does not partition on by identity, so \
-         it cannot be enforced by withholding files — a transformed partition puts \
-         permitted and forbidden rows in the same file. A scan plan applies the filter \
-         and returns it as the residual, so a cooperating engine honours it, but an \
-         engine using its own storage credentials reads the table unfiltered. Partition \
-         on the security boundary to make this enforcement architectural."
+        "Row filter references columns that are not identity partitions of every spec this \
+         table's live files were written under, so it cannot be enforced by withholding \
+         files. A scan plan applies the filter and returns it as the residual, so a \
+         cooperating engine honours it, but an engine using its own storage credentials \
+         reads the table unfiltered. Partition on the security boundary and rewrite the \
+         older files to make this enforcement architectural."
     );
 }
 
@@ -360,13 +538,13 @@ mod alignment_tests {
         ] {
             let metadata = metadata_with(Some(column), transform);
             assert!(
-                partition_source_columns(&metadata).is_empty(),
+                default_identity_columns(&metadata).is_empty(),
                 "{transform:?} does not separate rows by column value"
             );
 
             let filter = json!({ "type": "eq", "term": column, "value": "EU" });
             assert_eq!(
-                unaligned_columns(&filter, &metadata)
+                unaligned_columns_for_test(&filter, &metadata)
                     .into_iter()
                     .collect::<Vec<_>>(),
                 vec![column.to_string()],
@@ -421,7 +599,7 @@ mod alignment_tests {
         let metadata = metadata_nested();
 
         assert_eq!(
-            partition_source_columns(&metadata)
+            default_identity_columns(&metadata)
                 .into_iter()
                 .collect::<Vec<_>>(),
             vec!["user.region".to_string()],
@@ -429,13 +607,13 @@ mod alignment_tests {
 
         let on_nested = json!({ "type": "eq", "term": "user.region", "value": "EU" });
         assert!(
-            unaligned_columns(&on_nested, &metadata).is_empty(),
+            unaligned_columns_for_test(&on_nested, &metadata).is_empty(),
             "the partitioned column is aligned"
         );
 
         let on_top_level = json!({ "type": "eq", "term": "region", "value": "EU" });
         assert_eq!(
-            unaligned_columns(&on_top_level, &metadata)
+            unaligned_columns_for_test(&on_top_level, &metadata)
                 .into_iter()
                 .collect::<Vec<_>>(),
             vec!["region".to_string()],
@@ -447,7 +625,7 @@ mod alignment_tests {
     /// spec may name the field `region_p` while the filter says `region`.
     #[test]
     fn partition_columns_are_source_names() {
-        let columns = partition_source_columns(&metadata(Some("region")));
+        let columns = default_identity_columns(&metadata(Some("region")));
         assert!(
             columns.contains("region"),
             "expected the source column name, got {columns:?}"
@@ -459,7 +637,7 @@ mod alignment_tests {
     #[test]
     fn a_partition_aligned_filter_reports_nothing() {
         let filter = serde_json::json!({ "type": "eq", "term": "region", "value": "EU" });
-        assert!(unaligned_columns(&filter, &metadata(Some("region"))).is_empty());
+        assert!(unaligned_columns_for_test(&filter, &metadata(Some("region"))).is_empty());
     }
 
     /// The case worth warning about: permitted and forbidden rows share files,
@@ -467,7 +645,7 @@ mod alignment_tests {
     #[test]
     fn a_filter_on_a_non_partition_column_is_reported() {
         let filter = serde_json::json!({ "type": "eq", "term": "email", "value": "a@b.c" });
-        let unaligned = unaligned_columns(&filter, &metadata(Some("region")));
+        let unaligned = unaligned_columns_for_test(&filter, &metadata(Some("region")));
         assert_eq!(
             unaligned.into_iter().collect::<Vec<_>>(),
             vec!["email".to_string()]
@@ -484,7 +662,7 @@ mod alignment_tests {
     fn a_differently_cased_column_is_not_aligned() {
         let filter = serde_json::json!({ "type": "eq", "term": "Region", "value": "EU" });
         assert_eq!(
-            unaligned_columns(&filter, &metadata(Some("region")))
+            unaligned_columns_for_test(&filter, &metadata(Some("region")))
                 .into_iter()
                 .collect::<Vec<_>>(),
             vec!["Region".to_string()],
@@ -500,7 +678,7 @@ mod alignment_tests {
             "left":  { "type": "eq", "term": "region", "value": "EU" },
             "right": { "type": "eq", "term": "email", "value": "a@b.c" }
         });
-        let unaligned = unaligned_columns(&filter, &metadata(Some("region")));
+        let unaligned = unaligned_columns_for_test(&filter, &metadata(Some("region")));
         assert_eq!(
             unaligned.into_iter().collect::<Vec<_>>(),
             vec!["email".to_string()],
@@ -512,7 +690,7 @@ mod alignment_tests {
     #[test]
     fn an_unpartitioned_table_aligns_with_nothing() {
         let filter = serde_json::json!({ "type": "eq", "term": "region", "value": "EU" });
-        let unaligned = unaligned_columns(&filter, &metadata(None));
+        let unaligned = unaligned_columns_for_test(&filter, &metadata(None));
         assert_eq!(
             unaligned.into_iter().collect::<Vec<_>>(),
             vec!["region".to_string()]
@@ -522,6 +700,189 @@ mod alignment_tests {
     /// No filters means nothing to report, and no work done.
     #[test]
     fn no_filters_reports_nothing() {
-        warn_if_cooperative(&[], &metadata(None), "db.t", Some("v1"));
+        warn_if_cooperative(&Enforcement::None, "db.t", Some("v1"));
+    }
+
+    fn default_identity_columns(metadata: &TableMetadata) -> BTreeSet<String> {
+        identity_columns(metadata, metadata.default_partition_spec_id())
+    }
+
+    fn only_filter(filter: &serde_json::Value) -> crate::auth::Obligations {
+        crate::auth::Obligations {
+            row_filters: vec![filter.clone()],
+            column_masks: Default::default(),
+        }
+    }
+
+    /// The unaligned columns of one filter against the default spec — the
+    /// grade, read for its columns.
+    fn unaligned_columns_for_test(
+        filter: &serde_json::Value,
+        metadata: &TableMetadata,
+    ) -> BTreeSet<String> {
+        match enforcement(metadata, &only_filter(filter), None) {
+            Enforcement::Cooperative { columns, .. } => columns,
+            _ => BTreeSet::new(),
+        }
+    }
+
+    /// `metadata(None)` evolved once: spec 0 unpartitioned, spec 1 (the new
+    /// default) partitioned by identity on `region`.
+    fn evolved_to_region() -> TableMetadata {
+        let base = metadata(None);
+        let spec = UnboundPartitionSpec::builder()
+            .add_partition_field(1, "region_p".to_string(), Transform::Identity)
+            .expect("partition field is valid")
+            .build();
+        TableMetadataBuilder::new_from_metadata(base, None)
+            .add_default_partition_spec(spec)
+            .expect("spec is valid")
+            .build()
+            .expect("metadata builds")
+            .metadata
+    }
+
+    /// Files written before the evolution are still live and hold every
+    /// region. Reading the default spec alone called this architectural — the
+    /// dangerous direction.
+    #[test]
+    fn a_column_partitioned_only_by_the_newest_spec_is_cooperative() {
+        let metadata = evolved_to_region();
+        let live: BTreeSet<i32> = [0, 1].into();
+        let filter = json!({ "type": "eq", "term": "region", "value": "EU" });
+
+        assert_eq!(
+            enforcement(&metadata, &only_filter(&filter), Some(&live)),
+            Enforcement::Cooperative {
+                columns: ["region".to_string()].into(),
+                masked: false
+            },
+        );
+    }
+
+    /// Once every live file was written under the new spec, the old one is
+    /// history: it stays in `partition-specs` forever, and counting it would
+    /// make the remedy impossible to follow.
+    #[test]
+    fn rewritten_under_the_new_spec_turns_architectural() {
+        let metadata = evolved_to_region();
+        let live: BTreeSet<i32> = [1].into();
+        let filter = json!({ "type": "eq", "term": "region", "value": "EU" });
+
+        assert_eq!(
+            enforcement(&metadata, &only_filter(&filter), Some(&live)),
+            Enforcement::Architectural,
+        );
+    }
+
+    /// A spec id the metadata does not carry aligns nothing.
+    #[test]
+    fn an_unknown_live_spec_aligns_nothing() {
+        let metadata = metadata(Some("region"));
+        let live: BTreeSet<i32> = [0, 42].into();
+        let filter = json!({ "type": "eq", "term": "region", "value": "EU" });
+
+        assert!(matches!(
+            enforcement(&metadata, &only_filter(&filter), Some(&live)),
+            Enforcement::Cooperative { .. }
+        ));
+    }
+
+    /// The file holds the raw column whatever the filter does.
+    #[test]
+    fn a_mask_is_never_architectural() {
+        let metadata = metadata(Some("region"));
+        let obligations = crate::auth::Obligations {
+            row_filters: vec![json!({ "type": "eq", "term": "region", "value": "EU" })],
+            column_masks: ["email".to_string()].into(),
+        };
+
+        assert_eq!(
+            enforcement(&metadata, &obligations, None),
+            Enforcement::Cooperative {
+                columns: BTreeSet::new(),
+                masked: true
+            },
+        );
+    }
+
+    /// A term this catalog cannot read names no column, and is not thereby
+    /// aligned.
+    #[test]
+    fn an_unreadable_filter_is_never_architectural() {
+        let metadata = metadata(Some("region"));
+        let filter = json!({
+            "type": "eq",
+            "term": { "type": "transform", "transform": "day", "term": "ts" },
+            "value": 1
+        });
+        assert!(matches!(
+            enforcement(&metadata, &only_filter(&filter), None),
+            Enforcement::Cooperative { .. }
+        ));
+        assert_eq!(
+            enforcement(&metadata, &only_filter(&json!(false)), None),
+            Enforcement::Architectural,
+            "a constant selects all files or none"
+        );
+    }
+
+    #[test]
+    fn no_obligations_is_none() {
+        assert_eq!(
+            enforcement(&metadata(None), &crate::auth::Obligations::default(), None),
+            Enforcement::None
+        );
+    }
+
+    /// The header is an RFC 9651 Item: a token, then parameters.
+    #[test]
+    fn the_header_is_a_structured_field() {
+        assert_eq!(Enforcement::None.header_value(), "none");
+        assert_eq!(Enforcement::Architectural.header_value(), "architectural");
+        assert_eq!(
+            Enforcement::Cooperative {
+                columns: ["region".to_string(), "ts".to_string()].into(),
+                masked: true
+            }
+            .header_value(),
+            r#"cooperative;columns="region,ts";masked"#
+        );
+        assert_eq!(
+            Enforcement::Cooperative {
+                columns: BTreeSet::new(),
+                masked: true
+            }
+            .header_value(),
+            "cooperative;masked"
+        );
+    }
+
+    /// A column name that is not printable ASCII becomes a Display String, so
+    /// the value is still a valid header.
+    #[test]
+    fn a_non_ascii_column_is_a_display_string() {
+        let value = Enforcement::Cooperative {
+            columns: ["région".to_string(), r#"a"b"#.to_string()].into(),
+            masked: false,
+        }
+        .header_value();
+        assert_eq!(value, r#"cooperative;columns=%"a%22b,r%c3%a9gion""#);
+        assert!(axum::http::HeaderValue::from_str(&value).is_ok());
+    }
+
+    /// The remedy names the statement to run and what else it takes.
+    #[test]
+    fn the_remedy_is_concrete() {
+        let remedy = Enforcement::Cooperative {
+            columns: ["region".to_string()].into(),
+            masked: true,
+        }
+        .remedy("sales.orders")
+        .expect("a remedy");
+        assert!(remedy.contains("ALTER TABLE sales.orders ADD PARTITION FIELD region"));
+        assert!(remedy.contains("rewrite the files written before it"));
+        assert!(remedy.contains("A column mask is always cooperative"));
+        assert_eq!(Enforcement::Architectural.remedy("t"), None);
     }
 }

@@ -534,12 +534,10 @@ impl App {
             .layer(PropagateRequestIdLayer::new(x_request_id.clone()))
             .layer(SetRequestIdLayer::new(x_request_id, MakeRequestUuid))
             // Outside `SetRequestIdLayer`, which leaves an existing header alone
-            // and only mints when there is none. An inbound id this server will
-            // not carry is removed here so a fresh one is minted — otherwise the
-            // response echoes the caller's and the audit record names nothing,
-            // and a caller could unjoin its own requests from the trail by
-            // sending a two-kilobyte request id.
-            .layer(middleware::from_fn(crate::auth::strip_unusable_request_id))
+            // and only mints when there is none. Every inbound id is taken off
+            // here, so the server's id is the only one a record is keyed by; a
+            // usable one is kept as the client's, beside it.
+            .layer(middleware::from_fn(crate::auth::take_client_request_id))
             // Response compression (gzip, deflate, br)
             .layer(CompressionLayer::new())
             // Security headers (applied to all responses)
@@ -1313,7 +1311,9 @@ impl AppBuilder {
         self,
         api_keys: Option<Arc<InMemoryApiKeyStore>>,
     ) -> Result<App, crate::error::AppError> {
-        let warehouse_location = self.warehouse_location.unwrap_or_else(temp_path);
+        let warehouse_location = crate::location::canonical_warehouse(
+            &self.warehouse_location.unwrap_or_else(temp_path),
+        );
         let default_tenant_id = self
             .default_tenant_id
             .unwrap_or_else(|| "default".to_string());
@@ -1491,7 +1491,14 @@ impl AppBuilder {
             url_style: Some(crate::catalog::v1::sign::UrlStyle::parse(
                 &signing_config.url_style,
             )?),
-            endpoint_host: signing_config.endpoint_host.clone(),
+            endpoint_host: crate::catalog::v1::sign::SigningEndpointConfig::split_endpoint(
+                signing_config.endpoint_host.as_deref(),
+            )
+            .0,
+            endpoint_tls: crate::catalog::v1::sign::SigningEndpointConfig::split_endpoint(
+                signing_config.endpoint_host.as_deref(),
+            )
+            .1,
             fallback_region: signing_config.region.clone(),
             presign_ttl: std::time::Duration::from_secs(signing_config.presign_ttl_seconds),
         };

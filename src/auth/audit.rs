@@ -46,6 +46,12 @@ use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+/// The record format version every [`AuditEvent`] carries.
+///
+/// Bumped when a field is renamed, removed or changes meaning. Adding a field is
+/// not a bump: a consumer ignores what it does not know.
+pub const SCHEMA_VERSION: u32 = 1;
+
 // ============================================================================
 // Audit Event Types
 // ============================================================================
@@ -138,6 +144,10 @@ impl AuditSeverity {
 /// Serialises to a single JSON object; the sink writes one per line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
+    /// The record format's version. A consumer that sees a version it does not
+    /// know can stop, rather than read a renamed field as an absent one.
+    pub schema_version: u32,
+
     /// Unique event identifier. UUIDv7, so records sort by time.
     #[serde(rename = "event_id")]
     pub id: String,
@@ -197,6 +207,17 @@ pub struct AuditEvent {
     /// application log line.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+
+    /// The `x-request-id` the client sent, when it sent one. Kept beside the
+    /// server's own id, never in place of it: a caller choosing the correlation
+    /// key could make its records collide with somebody else's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_request_id: Option<String>,
+
+    /// How strongly the restriction behind a grant held: `none`,
+    /// `architectural` or `cooperative`, with the reasons in `details`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enforcement: Option<String>,
 
     /// What kind of thing was acted on.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -271,6 +292,7 @@ impl AuditEvent {
             .to_rfc3339();
 
         Self {
+            schema_version: SCHEMA_VERSION,
             id: Uuid::now_v7().to_string(),
             timestamp: timestamp_ms,
             timestamp_iso,
@@ -284,6 +306,8 @@ impl AuditEvent {
             tenant_id: None,
             client_ip: None,
             request_id: None,
+            client_request_id: None,
+            enforcement: None,
             resource_type: None,
             resource_id: None,
             matched_policies: Vec::new(),
@@ -370,6 +394,40 @@ impl AuditEvent {
         .with_resource("table", table)
     }
 
+    /// A restricted scan plan pre-signed its files: the grant that enforces a
+    /// restriction, recorded with how strongly it held.
+    ///
+    /// One record per plan, however many files: the count and the grade are
+    /// what an auditor asks about, and a URL per file would not stay one line.
+    pub fn plan_presign(
+        table: &str,
+        files: usize,
+        grade: &crate::auth::filter_alignment::Enforcement,
+    ) -> Self {
+        let mut event = Self::new(
+            AuditCategory::StorageAccess,
+            AuditAction::SignRequest,
+            AuditOutcome::Success,
+        )
+        .with_operation("read")
+        .with_resource("table", table)
+        .with_detail("source", "scan_plan")
+        .with_detail("files", files.to_string());
+        event.enforcement = Some(grade.grade().to_string());
+        if let crate::auth::filter_alignment::Enforcement::Cooperative { columns, masked } = grade {
+            if !columns.is_empty() {
+                event = event.with_detail(
+                    "unaligned_columns",
+                    columns.iter().cloned().collect::<Vec<_>>().join(","),
+                );
+            }
+            if *masked {
+                event = event.with_detail("masked", "true");
+            }
+        }
+        event
+    }
+
     /// A request was refused by a rate limit.
     ///
     /// `scope` is `ip` or `tenant` — which bucket ran out, since the two mean
@@ -452,6 +510,13 @@ impl AuditEvent {
         }
     }
 
+    /// Records the request id the client sent, when it sent one.
+    #[must_use]
+    pub fn with_optional_client_request_id(mut self, id: Option<&str>) -> Self {
+        self.client_request_id = id.map(str::to_string);
+        self
+    }
+
     /// Records the view chain the request claimed to arrive through.
     ///
     /// An empty chain leaves the field off the record entirely rather than
@@ -512,6 +577,24 @@ impl AuditEvent {
 
 #[cfg(test)]
 mod tests {
+
+    /// A consumer can tell a renamed field from an absent one only if every
+    /// record says which format it is.
+    #[test]
+    fn every_record_names_its_schema_version() {
+        let grade = crate::auth::filter_alignment::Enforcement::Architectural;
+        for event in [
+            AuditEvent::authentication("api_key", true),
+            AuditEvent::decision("Read", "table", "db.t", true),
+            AuditEvent::credential_vend("read", "db.t", AuditOutcome::Success),
+            AuditEvent::request_sign("read", "db.t", true),
+            AuditEvent::plan_presign("db.t", 3, &grade),
+            AuditEvent::rate_limit("ip"),
+        ] {
+            let json = serde_json::to_value(&event).unwrap();
+            assert_eq!(json["schema_version"], SCHEMA_VERSION, "{json}");
+        }
+    }
     use super::*;
 
     #[test]

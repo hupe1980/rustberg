@@ -72,6 +72,54 @@ function route(method: string, path: string, body?: string, signedIn = true): [n
       { revisions: [current, ...(current.sequence > 1 ? [seeded()] : [])].map((r) => ({ ...r, source_bytes: 10 })) },
     ];
   if (path.startsWith("/management/v1/policies/revisions/")) return [200, policy(1, "permit(principal, action, resource);\n")];
+  if (path === "/management/v1/namespaces/sales/tables/orders/access")
+    return [
+      200,
+      {
+        table: "sales.orders",
+        rows: [
+          { principal: { kind: "group", id: "member of admin", roles: ["admin"] }, access: "everything", grade: { grade: "none", header: "none" }, "matched-policies": ["policy0"] },
+          { principal: { kind: "group", id: "member of eu", roles: ["eu"] }, access: "filtered-and-masked", grade: { grade: "cooperative", header: "cooperative;masked" }, "matched-policies": ["policy1"] },
+          { principal: { kind: "anyone", id: "anyone", roles: [] }, access: "nothing", "matched-policies": [] },
+        ],
+        note: "For the principals the rules in force name; not a proof for anyone else.",
+      },
+    ];
+  if (path === "/management/v1/policies/impact" && method === "POST")
+    return [
+      200,
+      {
+        checked: { principals: [{ kind: "group", id: "member of marketing", roles: ["marketing"] }], tables: 1, evaluations: 5, truncated: false, "unchecked-tables": 0 },
+        changes: [
+          {
+            principal: { kind: "group", id: "member of marketing", roles: ["marketing"] },
+            resource: "sales.orders",
+            action: "Read",
+            change: "gains",
+            after: { grade: "architectural", header: "architectural" },
+          },
+        ],
+        note: "Exact for the principals and tables listed; not a proof for anyone else.",
+      },
+    ];
+  if (path.startsWith("/management/v1/namespaces/sales/tables/orders/explain"))
+    return [
+      200,
+      {
+        principal: { id: "carol", kind: "user", tenant: "acme", roles: ["eu"] },
+        decision: "allow",
+        "matched-policies": ["policy1"],
+        "read-restrictions": orders["read-restrictions"],
+        enforcement: {
+          grade: "cooperative",
+          columns: [],
+          masked: true,
+          header: "cooperative;masked",
+          remedy: "A column mask is always cooperative: every delivered file holds the raw column.",
+        },
+        context: "Evaluated at the current UTC hour with no source address.",
+      },
+    ];
   return [404, { error: { message: `no fixture for ${method} ${path}`, type: "NotFound", code: 404 } }];
 }
 
@@ -110,7 +158,9 @@ beforeEach(async () => {
   vi.stubGlobal("fetch", async (path: string, init?: RequestInit) => {
     const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
     const [status, data] = route(init?.method ?? "GET", path, init?.body as string | undefined, !!auth);
-    return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
+    const headers: Record<string, string> = { "Content-Type": "application/json", "x-request-id": "0190-ref" };
+    if (path === "/v1/namespaces/sales/tables/orders") headers["rustberg-enforcement"] = "architectural";
+    return new Response(JSON.stringify(data), { status, headers });
   });
   vi.stubGlobal("matchMedia", (q: string) => ({ matches: false, media: q, addEventListener() {}, removeEventListener() {} }));
   location.hash = "";
@@ -168,6 +218,51 @@ describe("accessibility (axe, every place and sheet)", () => {
   });
 });
 
+describe("enforcement, seen", () => {
+  it("states the grade from the header in words", async () => {
+    await start(identity("bob", ["analyst"]));
+    await open("#/catalog/table/sales/orders");
+    expect(document.body.textContent).toContain("Holds against any engine");
+  });
+
+  it("View as previews another principal through the what-if, says so, and ends", async () => {
+    await start(identity("alice", ["admin"]));
+    await open("#/catalog/table/sales/orders");
+    const who = document.querySelector('[aria-label="Who can read this table, and in what form"]')?.textContent ?? "";
+    expect(who).toMatch(/filtered, masked\s*· cooperative/);
+    expect(who).toContain("nothing");
+    const eye = document.querySelector<HTMLButtonElement>('button[aria-label^="View as"]')!;
+    eye.click();
+    await settle();
+    expect(await violations()).toEqual([]);
+    const field = document.querySelector<HTMLInputElement>('[role="dialog"] input')!;
+    field.value = "carol";
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+    flushSync();
+    // SR-004 (enforcement-grade): a preview sends only the what-if, with the signed-in credential.
+    const seen: { path: string; auth: string | undefined }[] = [];
+    const real = globalThis.fetch;
+    vi.stubGlobal("fetch", async (path: string, init?: RequestInit) => {
+      seen.push({ path, auth: (init?.headers as Record<string, string> | undefined)?.Authorization });
+      return real(path, init);
+    });
+    await click("Preview");
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((r) => r.path.includes("/explain?principal=carol"))).toBe(true);
+    expect(seen.every((r) => r.auth === "Bearer rb_test_key")).toBe(true);
+
+    expect(document.body.textContent).toContain("Previewing as carol");
+    expect(document.body.textContent).toContain("would see");
+    expect(document.body.textContent).toContain("Holds only in an engine that applies it");
+    expect(document.body.textContent).toContain("nothing was read as carol");
+    expect(await violations()).toEqual([]);
+
+    document.querySelector<HTMLButtonElement>('button[aria-label^="End preview"]')!.click();
+    await settle();
+    expect(document.body.textContent).toContain("What you can see");
+  });
+});
+
 describe("actions a person needs", () => {
   it("⌘K finds a table the sidebar never opened, a name before an action that merely contains it", async () => {
     await start(identity("bob", ["analyst"]));
@@ -200,6 +295,12 @@ describe("actions a person needs", () => {
     flushSync();
 
     await click("Review…");
+    const consequences = document.querySelector('[aria-label="What saving would change, for whom"]')?.textContent ?? "";
+    expect(consequences).toContain("Members of marketing");
+    expect(consequences).toContain("gains");
+    expect(consequences).toContain("Read on sales.orders");
+    expect(consequences).toContain("not a proof");
+    expect(await violations()).toEqual([]);
     expect(document.querySelector('[aria-label="Changes to the policy set"]')?.textContent).toContain("// reviewed");
     expect(puts).toHaveLength(0);
     await click("Save");

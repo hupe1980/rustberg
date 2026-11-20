@@ -757,6 +757,40 @@ pub fn namespace_prefix(warehouse: &str, namespace: &[String]) -> String {
     join_segments(warehouse, namespace)
 }
 
+/// One spelling for a warehouse: a bare local path becomes its absolute
+/// `file://` URL, and anything with a scheme is left as written.
+///
+/// The registry lays tables out under the URL; the server must advertise the
+/// same string and recognise a client naming it either way, or a client that
+/// spells the warehouse the way its tables are spelled is refused as asking for
+/// an unknown one. Apache's REST Compatibility Kit found exactly that.
+#[must_use]
+pub fn canonical_warehouse(location: &str) -> String {
+    if location.contains("://") && !location.starts_with("file://") {
+        return location.to_string();
+    }
+    let path = path_from_url(location);
+    let absolute = if std::path::Path::new(path).is_absolute() {
+        std::path::PathBuf::from(path)
+    } else {
+        std::env::current_dir()
+            .map(|dir| dir.join(path))
+            .unwrap_or_else(|_| std::path::PathBuf::from(path))
+    };
+    url_from_path(absolute)
+}
+
+/// `<warehouse>/<namespace…>/<name>`: where a table is created when its
+/// creator names no location.
+///
+/// Shared by both backends for the reason [`namespace_prefix`] is: each used to
+/// format it itself, and both wrote `s3://warehouse//db/t` for a warehouse
+/// configured with a trailing slash — an empty segment, which is significant in
+/// an object key and which readers refuse.
+pub fn table_location(warehouse: &str, namespace: &[String], name: &str) -> String {
+    format!("{}/{name}", join_segments(warehouse, namespace))
+}
+
 /// `<warehouse>/<namespace…>`, with no trailing slash.
 fn join_segments(warehouse: &str, namespace: &[String]) -> String {
     let mut out = warehouse.trim_end_matches('/').to_string();
@@ -769,6 +803,15 @@ fn join_segments(warehouse: &str, namespace: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A trailing slash on the warehouse is notational; the table's location
+    /// has no empty segment either way.
+    #[test]
+    fn a_table_location_has_no_empty_segment() {
+        let ns = ["db".to_string()];
+        assert_eq!(table_location("s3://wh/", &ns, "t"), "s3://wh/db/t");
+        assert_eq!(table_location("s3://wh", &ns, "t"), "s3://wh/db/t");
+    }
     use super::*;
 
     /// A `file://` URL becomes a usable path on both platforms.

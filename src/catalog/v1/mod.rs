@@ -22,6 +22,7 @@
 //! uniformly instead of per-endpoint.
 
 pub mod delegation;
+pub mod enforcement;
 pub mod extract;
 pub mod freshness;
 pub mod guard;
@@ -38,3 +39,43 @@ mod table;
 mod view;
 
 pub use routes::create_routes;
+
+/// Serializes table or view metadata with its lists in a stable order.
+///
+/// iceberg-rust keeps snapshots and view versions in hash maps, so two loads of
+/// the same table could list them in different orders — and clients compare
+/// these lists. Snapshots are ordered by sequence number, then timestamp; view
+/// versions by version id; their logs by timestamp.
+pub(crate) fn ordered_metadata<T: serde::Serialize, S: serde::Serializer>(
+    metadata: &T,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    use serde::Serialize as _;
+    let mut value = serde_json::to_value(metadata).map_err(serde::ser::Error::custom)?;
+    let sort_by = |value: &mut serde_json::Value, field: &str, keys: &[&str]| {
+        if let Some(list) = value
+            .get_mut(field)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            list.sort_by_key(|item| {
+                keys.iter()
+                    .map(|k| {
+                        item.get(*k)
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(i64::MAX)
+                    })
+                    .collect::<Vec<_>>()
+            });
+        }
+    };
+    sort_by(
+        &mut value,
+        "snapshots",
+        &["sequence-number", "timestamp-ms", "snapshot-id"],
+    );
+    sort_by(&mut value, "snapshot-log", &["timestamp-ms"]);
+    sort_by(&mut value, "metadata-log", &["timestamp-ms"]);
+    sort_by(&mut value, "versions", &["version-id"]);
+    sort_by(&mut value, "version-log", &["timestamp-ms"]);
+    value.serialize(serializer)
+}

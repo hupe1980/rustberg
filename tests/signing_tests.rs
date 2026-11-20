@@ -34,6 +34,61 @@ const NAMESPACE: &str = "db";
 const TABLE: &str = "events";
 const WAREHOUSE: &str = "s3://wh";
 const TABLE_LOCATION: &str = "s3://wh/db/events";
+/// A table with one snapshot of three files, for the restricted-plan tests.
+const PLANNED: &str = "planned";
+const PLANNED_LOCATION: &str = "s3://wh/db/planned";
+
+/// The planned table's manifest list, written once to a local directory.
+///
+/// The table's *data* is at an `s3://` location, which is what a plan pre-signs;
+/// its manifests only have to be readable, and the planner never opens a data
+/// file. So the manifests live on disk and the files they name do not exist.
+static PLANNED_MANIFESTS: tokio::sync::OnceCell<(tempfile::TempDir, String)> =
+    tokio::sync::OnceCell::const_new();
+
+async fn planned_manifest_list(
+    schema: iceberg::spec::SchemaRef,
+    spec: iceberg::spec::PartitionSpec,
+) -> Result<String> {
+    use iceberg::spec::{
+        DataContentType, DataFileBuilder, DataFileFormat, ManifestListWriter, ManifestWriterBuilder,
+    };
+
+    let (_, path) = PLANNED_MANIFESTS
+        .get_or_try_init(|| async {
+            let dir = tempfile::tempdir()
+                .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))?;
+            let io = rustberg::catalog::file_io::build_file_io()?;
+            let base = rustberg::location::url_from_path(dir.path());
+
+            let manifest_path = format!("{base}/m0.avro");
+            let mut writer =
+                ManifestWriterBuilder::new(io.new_output(&manifest_path)?, Some(1), schema, spec)
+                    .build_v2_data();
+            for i in 0..3 {
+                let file = DataFileBuilder::default()
+                    .content(DataContentType::Data)
+                    .file_path(format!("{PLANNED_LOCATION}/data/f{i}.parquet"))
+                    .file_format(DataFileFormat::Parquet)
+                    .record_count(1)
+                    .file_size_in_bytes(10)
+                    .partition_spec_id(0)
+                    .build()
+                    .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))?;
+                writer.add_file(file, 1)?;
+            }
+            let manifest = writer.write_manifest_file().await?;
+
+            let list_path = format!("{base}/snap-1.avro");
+            let mut list =
+                ManifestListWriter::v2(io.new_output(&list_path)?.writer().await?, 1, None, 1);
+            list.add_manifests(std::iter::once(manifest))?;
+            list.close().await?;
+            Ok::<_, Error>((dir, list_path))
+        })
+        .await?;
+    Ok(path.clone())
+}
 
 /// A catalog holding exactly one namespace and one table, at an `s3://`
 /// location. Everything else is absent or unreachable, which is what keeps
@@ -111,10 +166,12 @@ impl CatalogStore for FixedCatalog {
         Self::down()
     }
     async fn load_table(&self, table: &TableIdent) -> Result<Table> {
-        if table.namespace().as_ref().as_slice() != [NAMESPACE.to_string()] || table.name() != TABLE
+        if table.namespace().as_ref().as_slice() != [NAMESPACE.to_string()]
+            || (table.name() != TABLE && table.name() != PLANNED)
         {
             return Err(Error::new(ErrorKind::TableNotFound, table.to_string()));
         }
+        let planned = table.name() == PLANNED;
 
         let schema = Schema::builder()
             .with_schema_id(0)
@@ -124,21 +181,54 @@ impl CatalogStore for FixedCatalog {
             ])
             .build()?;
 
-        let metadata = TableMetadataBuilder::from_table_creation(
+        let mut builder = TableMetadataBuilder::from_table_creation(
             TableCreation::builder()
-                .name(TABLE.to_string())
-                .location(TABLE_LOCATION.to_string())
+                .name(table.name().to_string())
+                .location(
+                    if planned {
+                        PLANNED_LOCATION
+                    } else {
+                        TABLE_LOCATION
+                    }
+                    .to_string(),
+                )
                 .schema(schema)
                 .build(),
-        )?
-        .build()?
-        .metadata;
+        )?;
+        if planned {
+            let unbuilt = builder.clone().build()?.metadata;
+            let list = planned_manifest_list(
+                unbuilt.current_schema().clone(),
+                unbuilt.default_partition_spec().as_ref().clone(),
+            )
+            .await?;
+            let snapshot = iceberg::spec::Snapshot::builder()
+                .with_snapshot_id(1)
+                .with_sequence_number(1)
+                .with_timestamp_ms(unbuilt.last_updated_ms() + 1)
+                .with_manifest_list(list)
+                .with_schema_id(0)
+                .with_summary(iceberg::spec::Summary {
+                    operation: iceberg::spec::Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .build();
+            builder = builder.set_branch_snapshot(snapshot, "main")?;
+        }
+        let metadata = builder.build()?.metadata;
 
         Table::builder()
             .runtime(iceberg::Runtime::try_current()?)
             .identifier(table.clone())
             .metadata(metadata)
-            .metadata_location(format!("{TABLE_LOCATION}/metadata/v1.metadata.json"))
+            .metadata_location(format!(
+                "{}/metadata/v1.metadata.json",
+                if planned {
+                    PLANNED_LOCATION
+                } else {
+                    TABLE_LOCATION
+                }
+            ))
             .file_io(rustberg::catalog::file_io::build_file_io()?)
             .build()
     }
@@ -264,12 +354,18 @@ permit(principal in Rustberg::Group::"writer",
        action in [Rustberg::Action::"Read", Rustberg::Action::"List",
                   Rustberg::Action::"Create", Rustberg::Action::"Update"],
        resource) when { resource.tenant == principal.tenant };
+@row_filter("{\"type\":\"eq\",\"term\":\"id\",\"value\":1}")
+permit(principal in Rustberg::Group::"restricted",
+       action in [Rustberg::Action::"Read", Rustberg::Action::"List"],
+       resource) when { resource.tenant == principal.tenant };
 "#;
 
 struct Fixture {
     app: App,
     writer: String,
     reader: String,
+    /// A caller whose permit carries a `@row_filter` on `id`.
+    restricted: String,
     /// Where the audit trail for this fixture was written, when one was asked
     /// for. Read with [`Fixture::records`].
     audit: Option<std::path::PathBuf>,
@@ -364,6 +460,7 @@ async fn unrecordable_fixture() -> Fixture {
         app,
         writer: writer.to_string(),
         reader: reader.to_string(),
+        restricted: String::new(),
         audit: None,
         _dir: None,
     }
@@ -376,13 +473,16 @@ async fn fixture_with(prefixes: Vec<String>, audited: bool) -> Fixture {
     let (reader_key, reader) = ApiKeyBuilder::new("reader", TENANT)
         .with_role("reader")
         .build();
+    let (restricted_key, restricted) = ApiKeyBuilder::new("restricted", TENANT)
+        .with_role("restricted")
+        .build();
 
     let mut builder = App::builder()
         .with_warehouse_location(WAREHOUSE)
         .with_default_tenant_id(TENANT)
         .with_catalog(Arc::new(FixedCatalog))
         .with_policies(POLICY)
-        .with_api_keys(vec![writer_key, reader_key])
+        .with_api_keys(vec![writer_key, reader_key, restricted_key])
         .with_request_signer(Arc::new(StubSigner { prefixes }));
 
     let (dir, audit) = if audited {
@@ -403,6 +503,7 @@ async fn fixture_with(prefixes: Vec<String>, audited: bool) -> Fixture {
         app,
         writer: writer.to_string(),
         reader: reader.to_string(),
+        restricted: restricted.to_string(),
         audit,
         _dir: dir,
     }
@@ -1191,4 +1292,125 @@ async fn a_refusal_is_still_a_refusal_when_it_cannot_be_recorded() {
         StatusCode::FORBIDDEN,
         "a policy denial must not surface as an outage: {body}"
     );
+}
+
+// ── A restricted plan: the grant that enforces a restriction ────────────
+
+/// Pre-signing a restricted plan's files is a grant of storage access, and it
+/// is the one that enforces the restriction — so it is recorded, once per plan,
+/// with how strongly the restriction held. Unrecorded, the trail could not say
+/// what a restricted caller was able to fetch.
+#[tokio::test]
+async fn a_restricted_plan_records_what_it_pre_signed() {
+    let f = audited_fixture().await;
+
+    let (status, body) = call_with_headers(
+        &f.app,
+        "POST",
+        &format!("/v1/namespaces/{NAMESPACE}/tables/{PLANNED}/plan"),
+        &f.restricted,
+        Some(json!({})),
+        &[("x-request-id", "trace-from-the-engine")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let plan: Value = serde_json::from_str(&body).unwrap();
+    let tasks = plan["file-scan-tasks"].as_array().expect("tasks");
+    assert_eq!(tasks.len(), 3, "{body}");
+    assert!(
+        tasks.iter().all(|t| t["data-file"]["file-path"]
+            .as_str()
+            .unwrap()
+            .contains("X-Amz-")),
+        "every planned file is pre-signed: {body}"
+    );
+
+    let grants: Vec<Value> = f
+        .signatures()
+        .into_iter()
+        .filter(|r| r["details"]["source"] == "scan_plan")
+        .collect();
+    assert_eq!(grants.len(), 1, "exactly one record per plan: {grants:?}");
+    let grant = &grants[0];
+    assert_eq!(grant["schema_version"], 1);
+    assert_eq!(grant["operation"], "read");
+    assert_eq!(grant["details"]["files"], "3");
+    assert_eq!(
+        grant["enforcement"], "cooperative",
+        "id is not a partition column"
+    );
+    assert_eq!(grant["details"]["unaligned_columns"], "id");
+    assert_eq!(grant["principal_id"], "restricted");
+    assert_eq!(grant["client_request_id"], "trace-from-the-engine");
+    assert_ne!(grant["request_id"], "trace-from-the-engine");
+}
+
+/// An unrestricted plan pre-signs nothing, so it records no grant.
+#[tokio::test]
+async fn an_unrestricted_plan_records_no_grant() {
+    let f = audited_fixture().await;
+
+    let (status, body) = call(
+        &f.app,
+        "POST",
+        &format!("/v1/namespaces/{NAMESPACE}/tables/{PLANNED}/plan"),
+        &f.reader,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        f.signatures()
+            .iter()
+            .all(|r| r["details"]["source"] != "scan_plan"),
+        "nothing was granted"
+    );
+}
+
+/// The grade a caller sees on `loadTable` and on `planTableScan` is one answer,
+/// computed once each from the same function — never two readings of the rule.
+#[tokio::test]
+async fn the_grade_is_on_load_and_plan() {
+    let f = fixture().await;
+    let path = format!("/v1/namespaces/{NAMESPACE}/tables/{PLANNED}");
+
+    let grade_of = |method: &'static str, uri: String, key: String, body: Option<Value>| {
+        let app = f.app.clone();
+        async move {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("X-API-Key", key);
+            let request = match body {
+                Some(json) => {
+                    builder = builder.header("Content-Type", "application/json");
+                    builder
+                        .body(Body::from(serde_json::to_vec(&json).unwrap()))
+                        .unwrap()
+                }
+                None => builder.body(Body::empty()).unwrap(),
+            };
+            let response = app.into_router().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response
+                .headers()
+                .get("rustberg-enforcement")
+                .map(|v| v.to_str().unwrap().to_string())
+                .expect("every load and plan carries the grade")
+        }
+    };
+
+    let load = grade_of("GET", path.clone(), f.restricted.clone(), None).await;
+    let plan = grade_of(
+        "POST",
+        format!("{path}/plan"),
+        f.restricted.clone(),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(load, r#"cooperative;columns="id""#);
+    assert_eq!(load, plan, "load and plan say the same thing");
+
+    let unrestricted = grade_of("GET", path, f.reader.clone(), None).await;
+    assert_eq!(unrestricted, "none");
 }

@@ -68,6 +68,13 @@ pub enum AppError {
     #[error("{0}")]
     BadRequest(String),
 
+    /// Metadata the request would produce is invalid — a schema, a view
+    /// version, an update the table cannot take. `400` with the type the
+    /// reference implementation uses, so a Java client raises the
+    /// `IllegalArgumentException` it would against any other catalog.
+    #[error("{0}")]
+    InvalidArgument(String),
+
     // ========================================================================
     // 401 Unauthorized errors
     // ========================================================================
@@ -142,6 +149,12 @@ pub enum AppError {
     #[error("View already exists: {0}")]
     ViewAlreadyExists(String),
 
+    /// A name already taken, worded by the caller — "Table with same name
+    /// already exists", "Cannot rename a to b. View already exists" — where the
+    /// conflict is between a table and a view and neither variant above says so.
+    #[error("{0}")]
+    AlreadyExists(String),
+
     /// Concurrent modification conflict.
     ///
     /// Carries a sentence, so it carries no prefix — see [`AppError::BadRequest`].
@@ -149,7 +162,7 @@ pub enum AppError {
     CommitConflict(String),
 
     /// Namespace is not empty (cannot be deleted).
-    #[error("Namespace not empty: {0}")]
+    #[error("{0}")]
     NamespaceNotEmpty(String),
 
     /// The resource is marked protected from deletion.
@@ -256,7 +269,7 @@ impl AppError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             // 400 Bad Request
-            AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::BadRequest(_) | AppError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
 
             // 401 Unauthorized
             AppError::Unauthenticated | AppError::InvalidCredentials => StatusCode::UNAUTHORIZED,
@@ -281,6 +294,7 @@ impl AppError {
             AppError::NamespaceAlreadyExists(_)
             | AppError::TableAlreadyExists(_)
             | AppError::ViewAlreadyExists(_)
+            | AppError::AlreadyExists(_)
             | AppError::CommitConflict(_)
             | AppError::NamespaceNotEmpty(_)
             | AppError::Protected(_) => StatusCode::CONFLICT,
@@ -303,6 +317,7 @@ impl AppError {
     pub fn error_type(&self) -> &'static str {
         match self {
             AppError::BadRequest(_) => "BadRequestException",
+            AppError::InvalidArgument(_) => "IllegalArgumentException",
             AppError::Unauthenticated | AppError::InvalidCredentials => UNAUTHORIZED_TYPE,
             AppError::Forbidden(_) => "ForbiddenException",
             AppError::NoSuchNamespace(_) => "NoSuchNamespaceException",
@@ -316,6 +331,7 @@ impl AppError {
             AppError::NamespaceAlreadyExists(_) => "AlreadyExistsException",
             AppError::TableAlreadyExists(_) => "AlreadyExistsException",
             AppError::ViewAlreadyExists(_) => "AlreadyExistsException",
+            AppError::AlreadyExists(_) => "AlreadyExistsException",
             AppError::CommitConflict(_) => "CommitFailedException",
             AppError::NamespaceNotEmpty(_) => "NamespaceNotEmptyException",
             AppError::Protected(_) => "ProtectedException",
@@ -386,7 +402,7 @@ impl From<iceberg::Error> for AppError {
             // catalog uses this for a namespace that still has children.
             ErrorKind::PreconditionFailed => AppError::NamespaceNotEmpty(err.message().to_string()),
             ErrorKind::FeatureUnsupported => AppError::NotSupported(err.message().to_string()),
-            ErrorKind::DataInvalid => AppError::BadRequest(err.message().to_string()),
+            ErrorKind::DataInvalid => AppError::InvalidArgument(err.message().to_string()),
             ErrorKind::Unexpected => AppError::Internal(err.message().to_string()),
             // ErrorKind is #[non_exhaustive]; a kind added upstream is an
             // internal error rather than a guess at its meaning.
@@ -521,8 +537,8 @@ mod tests {
             "Table does not exist: analytics.events"
         );
         assert_eq!(
-            AppError::NamespaceNotEmpty("analytics".into()).to_string(),
-            "Namespace not empty: analytics"
+            AppError::NamespaceNotEmpty("Namespace analytics is not empty".into()).to_string(),
+            "Namespace analytics is not empty"
         );
     }
 
@@ -947,5 +963,79 @@ mod tests {
         let iceberg_err = iceberg::Error::new(iceberg::ErrorKind::Unexpected, "unexpected error");
         let app_err: AppError = iceberg_err.into();
         assert_eq!(app_err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A message a client reads carries no run of stray whitespace.
+    ///
+    /// The shape this catches is a string literal reflowed across lines
+    /// without a `\` continuation: the next line's indentation becomes part of
+    /// the message, and a client sees `No URL              is issued`. The two
+    /// files that draw boxes in a terminal align with spaces on purpose.
+    #[test]
+    fn no_message_carries_its_indentation() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("readable source tree") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        assert!(files.len() > 10, "the walk found the source tree");
+
+        let mut offenders = Vec::new();
+        for file in files {
+            let relative = file
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            if relative == "main.rs" || relative.ends_with("diagnostics.rs") {
+                continue;
+            }
+            for (number, line) in std::fs::read_to_string(&file).unwrap().lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                // Inside a string literal on this line: a non-space, six or
+                // more spaces, a non-space.
+                let mut in_string = false;
+                let mut run = 0usize;
+                let mut after_text = false;
+                let mut escaped = false;
+                for ch in line.chars() {
+                    if in_string {
+                        if escaped {
+                            escaped = false;
+                        } else if ch == '\\' {
+                            escaped = true;
+                        } else if ch == '"' {
+                            in_string = false;
+                        }
+                        if ch == ' ' {
+                            run += 1;
+                        } else {
+                            if after_text && run >= 6 && in_string {
+                                offenders.push(format!("{relative}:{}", number + 1));
+                                break;
+                            }
+                            run = 0;
+                            after_text = true;
+                        }
+                    } else if ch == '"' {
+                        in_string = true;
+                        run = 0;
+                        after_text = false;
+                    }
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "reflowed literals: {offenders:?}");
     }
 }

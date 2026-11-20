@@ -1,0 +1,7 @@
+// Lets the RCK's test task finish with failures, so .github/rck.sh can judge
+// the results against the named exclusions in .github/rck.properties.
+allprojects {
+    tasks.withType(Test).configureEach {
+        ignoreFailures = true
+    }
+}

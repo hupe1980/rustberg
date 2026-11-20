@@ -1,0 +1,46 @@
+# The five-minute proof: a local S3 (RustFS), two API keys, remote signing, an audit file.
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[server.auth]
+api_key_enabled = true
+policy_file = "/etc/rustberg/policies.cedar"
+
+[[server.auth.api_keys]]
+name    = "alice"
+tenant  = "acme"
+roles   = ["admin"]
+key_env = "DEMO_ALICE_KEY"
+
+[[server.auth.api_keys]]
+name    = "bob"
+tenant  = "acme"
+roles   = ["analyst"]
+key_env = "DEMO_BOB_KEY"
+
+[storage]
+catalog_url        = "file:///var/lib/rustberg/data"
+warehouse_location = "s3://warehouse/"
+
+[storage.properties]
+"s3.endpoint"          = "http://s3:9000"
+"s3.path-style-access" = "true"
+"s3.region"            = "us-east-1"
+"s3.access-key-id"     = "env:S3_ACCESS_KEY"
+"s3.secret-access-key" = "env:S3_SECRET_KEY"
+
+[audit]
+sink        = "file"
+path        = "/var/lib/rustberg/audit.jsonl"
+fail_closed = true
+
+[credentials]
+provider = "none"
+
+[credentials.signing]
+enabled             = true
+region              = "us-east-1"
+url_style           = "path"
+endpoint_host       = "http://s3:9000"
+presign_ttl_seconds = 900

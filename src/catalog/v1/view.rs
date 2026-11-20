@@ -115,6 +115,7 @@ pub struct LoadViewResponse {
     /// Metadata file location.
     pub metadata_location: String,
     /// View metadata.
+    #[serde(serialize_with = "super::ordered_metadata")]
     pub metadata: ViewMetadata,
 }
 
@@ -169,6 +170,9 @@ pub async fn register_view(
     let (metadata_location, metadata) = state
         .catalog
         .register_view(&view_ident, payload.metadata_location.clone())
+        .await
+        .map_err(|e| e.into())
+        .or_else_view(&state, &view_ident)
         .await?;
 
     // As with a registered table, the metadata file being inside the warehouse
@@ -251,6 +255,7 @@ pub struct CommitViewResponse {
     /// Metadata file location after the commit.
     pub metadata_location: String,
     /// Updated view metadata.
+    #[serde(serialize_with = "super::ordered_metadata")]
     pub metadata: ViewMetadata,
 }
 
@@ -481,6 +486,9 @@ pub async fn create_view(
     let (metadata_location, view_metadata) = state
         .catalog
         .create_view(&view_ident, view_metadata)
+        .await
+        .map_err(|e| e.into())
+        .or_else_view(&state, &view_ident)
         .await?;
 
     tracing::info!(
@@ -537,7 +545,11 @@ pub async fn load_view(
     // The error is kept rather than flattened to "no such view": a backend that
     // is unreachable is not a view that is gone, and reporting the second sends
     // an operator after the wrong thing.
-    let (metadata_location, metadata) = state.catalog.load_view(&view_ident).await?;
+    let (metadata_location, metadata) = state
+        .catalog
+        .load_view(&view_ident)
+        .await
+        .map_err(|e| in_view_terms(e.into(), &view_ident))?;
 
     Ok(AxumJson(LoadViewResponse {
         metadata_location,
@@ -605,11 +617,31 @@ pub async fn drop_view(
 
     // Read after authorizing, so an unauthorized caller learns nothing about
     // whether the view exists or how it is configured.
-    let (_, metadata) = state.catalog.load_view(&view_ident).await?;
-    super::ownership::reject_if_protected(metadata.properties(), &format!("View '{view_ident}'"))?;
+    //
+    // The protection flag lives in the view's metadata. A view whose metadata
+    // cannot be read has nothing left to protect, and refusing would leave a
+    // pointer nobody can remove — so only a missing view stops the drop.
+    match state.catalog.load_view(&view_ident).await {
+        Ok((_, metadata)) => super::ownership::reject_if_protected(
+            metadata.properties(),
+            &format!("View '{view_ident}'"),
+        )?,
+        Err(e) => match in_view_terms(e.into(), &view_ident) {
+            missing @ AppError::NoSuchView(_) => return Err(missing),
+            unreadable => tracing::warn!(
+                view = %view_ident,
+                error = %unreadable,
+                "View metadata is unreadable; dropping the pointer without a protection check"
+            ),
+        },
+    }
 
     // Drop the view
-    state.catalog.drop_view(&view_ident).await?;
+    state
+        .catalog
+        .drop_view(&view_ident)
+        .await
+        .map_err(|e| in_view_terms(e.into(), &view_ident))?;
 
     tracing::info!(
         namespace = namespace_parts.join("."),
@@ -686,8 +718,11 @@ pub async fn commit_view(
     // updates below are applied to the document it names, so the pointer must
     // still be it when the swap happens or this commit silently overwrites one
     // that landed in between. See `CatalogStore::update_view`.
-    let (current_metadata_location, current_metadata) =
-        state.catalog.load_view(&view_ident).await?;
+    let (current_metadata_location, current_metadata) = state
+        .catalog
+        .load_view(&view_ident)
+        .await
+        .map_err(|e| in_view_terms(e.into(), &view_ident))?;
 
     // A view commit can move the view, the same way a table commit can move a
     // table, and it gets the same answer. Checked here rather than in the
@@ -847,7 +882,29 @@ pub async fn rename_view(
     let src_ident = TableIdent::new(src_namespace_ident, payload.source.name.clone());
     let dest_ident = TableIdent::new(dest_namespace_ident, payload.destination.name.clone());
 
-    state.catalog.rename_view(&src_ident, &dest_ident).await?;
+    if let Err(e) = state.catalog.rename_view(&src_ident, &dest_ident).await {
+        return Err(match AppError::from(e) {
+            AppError::NoSuchTable(_) | AppError::NoSuchView(_) => {
+                AppError::NoSuchView(src_ident.to_string())
+            }
+            AppError::TableAlreadyExists(_) | AppError::ViewAlreadyExists(_) => {
+                let taken = if state
+                    .catalog
+                    .view_exists(&dest_ident)
+                    .await
+                    .unwrap_or(false)
+                {
+                    "View"
+                } else {
+                    "Table"
+                };
+                AppError::AlreadyExists(format!(
+                    "Cannot rename {src_ident} to {dest_ident}. {taken} already exists"
+                ))
+            }
+            other => other,
+        });
+    }
 
     tracing::info!(
         source = format!(
@@ -869,3 +926,42 @@ pub async fn rename_view(
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// A catalog error from a view operation, worded as a view's.
+///
+/// The backends share table error kinds for views, so a missing view arrives as
+/// `TableNotFound`. Clients map the message and type to their own exceptions —
+/// a Java client raises `NoSuchViewException` only for "View does not exist" —
+/// so a view answers in view terms.
+fn in_view_terms(error: AppError, view: &TableIdent) -> AppError {
+    match error {
+        AppError::NoSuchTable(_) | AppError::NoSuchView(_) => {
+            AppError::NoSuchView(view.to_string())
+        }
+        other => other,
+    }
+}
+
+/// The result of creating or registering a view, with a name conflict named
+/// for what holds the name: another view, or a table.
+trait OrElseView<T> {
+    async fn or_else_view(self, state: &AppState, view: &TableIdent) -> Result<T>;
+}
+
+impl<T> OrElseView<T> for std::result::Result<T, AppError> {
+    async fn or_else_view(self, state: &AppState, view: &TableIdent) -> Result<T> {
+        match self {
+            Ok(value) => Ok(value),
+            Err(AppError::TableAlreadyExists(_) | AppError::ViewAlreadyExists(_)) => {
+                if state.catalog.table_exists(view).await.unwrap_or(false) {
+                    Err(AppError::AlreadyExists(format!(
+                        "Table with same name already exists: {view}"
+                    )))
+                } else {
+                    Err(AppError::ViewAlreadyExists(view.to_string()))
+                }
+            }
+            Err(other) => Err(in_view_terms(other, view)),
+        }
+    }
+}

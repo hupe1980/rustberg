@@ -111,6 +111,21 @@ impl Authorized {
         self.context.resource.path()
     }
 
+    /// What `subject` would be granted on the resource this caller was just
+    /// authorized for — the same authorizer, the same entities, no request
+    /// context (no source address; the current UTC hour).
+    ///
+    /// Not recorded: the subject asked nothing. What *is* recorded is the
+    /// caller's own authorization, which is what made asking legitimate.
+    pub async fn what_if(&self, state: &AppState, subject: Principal) -> crate::auth::AuthzOutcome {
+        let context = AuthzContext::new(
+            subject,
+            self.context.resource.clone(),
+            self.context.action.clone(),
+        );
+        state.authorizer.decide(&context).await
+    }
+
     /// Who the caller is.
     pub fn principal(&self) -> &Principal {
         &self.context.principal
@@ -173,8 +188,15 @@ pub async fn authorize(
 ) -> Result<Authorized> {
     let owner = match resolve_owner(state, namespace).await? {
         Some(owner) => owner,
-        // Indistinguishable from "exists but you may not see it", by design.
-        // A backend *failure* is not this case — see `resolve_owner`.
+        // Creating in a namespace that does not exist is told so; anything
+        // else answers as the target that is not there — which is how a client
+        // finds a metadata table (`ns.tbl.files`) by falling back. A namespace
+        // the caller may not see answers the same way below, so the two stay
+        // indistinguishable. A backend *failure* is not this case — see
+        // `resolve_owner`.
+        None if action == Action::Create && !matches!(target, Target::Namespace) => {
+            return Err(AppError::NoSuchNamespace(namespace.join(".")));
+        }
         None => return Err(target.not_found(namespace)),
     };
 
@@ -206,14 +228,33 @@ pub async fn authorize(
                 .await
         };
 
-        return if visible {
-            Err(AppError::Forbidden(format!(
+        if visible {
+            return Err(AppError::Forbidden(format!(
                 "Not permitted to {action} {}",
                 describe(&target, namespace)
-            )))
-        } else {
-            Err(target.not_found(namespace))
-        };
+            )));
+        }
+
+        // Not visible. Creating inside a namespace the caller cannot see either
+        // answers as a namespace that does not exist does above, so its
+        // existence is not revealed.
+        if action == Action::Create && !matches!(target, Target::Namespace) {
+            let namespace_visible = state
+                .authorizer
+                .permits(
+                    &AuthzContext::new(
+                        principal.clone(),
+                        Target::Namespace.resource(&owner, namespace),
+                        Action::Read,
+                    )
+                    .with_request(request.clone()),
+                )
+                .await;
+            if !namespace_visible {
+                return Err(AppError::NoSuchNamespace(namespace.join(".")));
+            }
+        }
+        return Err(target.not_found(namespace));
     }
 
     Ok(Authorized {
@@ -263,6 +304,7 @@ pub(super) fn record_decision(
     .with_tenant_id(context.principal.tenant_id())
     .with_optional_client_ip(context.request.source_ip)
     .with_optional_request_id(context.request.request_id.as_deref())
+    .with_optional_client_request_id(context.request.client_request_id.as_deref())
     // How the request said it got here. Recorded, never consulted: see
     // `RequestContext::referenced_by`.
     .with_referenced_by(&context.request.referenced_by)
@@ -380,7 +422,10 @@ async fn authorize_context(state: &AppState, context: AuthzContext) -> Result<Au
 /// # Errors
 ///
 /// Whatever the catalog returned, other than a genuine miss.
-async fn resolve_owner(state: &AppState, namespace: &NamespaceIdent) -> Result<Option<String>> {
+pub(crate) async fn resolve_owner(
+    state: &AppState,
+    namespace: &NamespaceIdent,
+) -> Result<Option<String>> {
     let ns = match state.catalog.get_namespace(namespace).await {
         Ok(ns) => ns,
         Err(e) if e.kind() == iceberg::ErrorKind::NamespaceNotFound => return Ok(None),

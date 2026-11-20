@@ -414,9 +414,11 @@ region = "eu-central-1"
 # what MinIO, Ceph and R2 use.
 url_style = "auto"
 
-# Host of a custom S3 endpoint, so `auto` can tell `minio:9000/bucket/key`
-# (path style) from `bucket.minio:9000/key` (virtual-host style).
-# endpoint_host = "minio:9000"
+# Host of a custom S3 endpoint, so `auto` can tell `s3:9000/bucket/key`
+# (path style) from `bucket.s3:9000/key` (virtual-host style). Write it with
+# `http://` for an endpoint without TLS: the pre-signed URLs a restricted scan
+# plan returns use that scheme. A bare host means HTTPS.
+# endpoint_host = "http://s3:9000"
 ```
 
 | Setting | Default | Meaning |
@@ -424,10 +426,13 @@ url_style = "auto"
 | `enabled` | `false` | Serve `POST …/tables/{table}/sign` |
 | `region` | `credentials.aws.region`, else `us-east-1` | Region used when a client sends none |
 | `url_style` | `auto` | `auto`, `path`, or `virtual-host` |
-| `endpoint_host` | none | Host of a custom S3 endpoint |
+| `endpoint_host` | none | Host of a custom S3 endpoint; `http://host:port` for one without TLS |
 
-- Uses the same credential chain and `allowed_prefixes` as vending; no second set
-  of secrets.
+- Signs with the **AWS SDK's default credential chain** — `AWS_ACCESS_KEY_ID` /
+  `AWS_SECRET_ACCESS_KEY`, a profile, or an instance or pod role — the same chain
+  vending uses. It does **not** read `[storage.properties]`, which configure the
+  catalog's own reads and writes. Against a local S3, set both.
+- Uses the same `allowed_prefixes` as vending.
 - A wrong `url_style` fails **closed**: the bucket is misread, containment does
   not match, and the request is refused rather than mis-signed.
 - Enabling it without the `remote-signing` Cargo feature is a startup failure.

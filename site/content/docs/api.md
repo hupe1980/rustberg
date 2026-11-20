@@ -354,7 +354,9 @@ GET /v1/namespaces/{namespace}/tables/{table}
 }
 ```
 
-The response carries an `ETag` naming this exact metadata version.
+The response carries an `ETag` naming this exact metadata version, and a
+`Rustberg-Enforcement` header saying how strongly your restrictions hold
+([grades](@/docs/authorization.md#how-strongly-it-holds-the-enforcement-grade)).
 
 #### Conditional loading
 
@@ -983,7 +985,7 @@ GET /ready
 ```json
 {
   "status": "ready",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "timestamp": 1704067200,
   "components": {
     "catalog": { "status": "ready" },
@@ -1053,7 +1055,8 @@ These are the exact `type` values the server emits.
 
 | Code | Type | Description |
 |------|------|-------------|
-| 400 | BadRequestException | Invalid request, identifier, schema, page token, or JSON body |
+| 400 | BadRequestException | Invalid request, identifier, page token, location, or JSON body |
+| 400 | IllegalArgumentException | Metadata the request would produce is invalid — a schema, a view version, an update the table cannot take |
 | 401 | NotAuthorizedException | Missing or invalid credentials — one answer for every way of failing, see [below](#every-401-is-the-same-401) |
 | 403 | ForbiddenException | Authenticated, but not permitted |
 | 404 | NoSuchNamespaceException | Namespace not found |
@@ -1179,8 +1182,8 @@ string or the stored integer.
 
 *Unsupported* terms — a transform, `apply`, a field-id reference, an operator
 from a newer spec — are **widened**, not refused: they stop contributing to
-pruning, so you get a *superset* of matching files, and `residual-filter` still
-carries the whole predicate. Widening is polarity-aware (under a `not` it widens
+pruning, so you get a *superset* of matching files, and your client still
+applies the whole predicate. Widening is polarity-aware (under a `not` it widens
 to "everything"), so a plan never returns fewer files than needed.
 
 *Malformed* filters — an unknown column, a literal that does not fit its column,
@@ -1195,10 +1198,18 @@ including unary ones, binds its column against the schema.
 > it is refused when the **policy set loads**: a misspelled `"type": "equals"` is
 > a startup failure, not a `403` at query time.
 
-Each task's `residual-filter` is your filter plus any matching permit's
-`@row_filter`; the policy half references columns by **field id**, as
-`read-restrictions` do. Apply both halves: pruning is conservative, so a
-surviving file may hold rows the policy filter excludes.
+**`residual-filter` appears only when policy restricts your rows.** Then each
+task carries your filter plus any matching permit's `@row_filter`; the policy
+half references columns by **field id**, as `read-restrictions` do. Apply both
+halves: pruning is conservative, so a surviving file may hold rows the policy
+filter excludes.
+
+For an unrestricted caller there is no residual: it would only repeat the filter
+you sent, once per task. The Iceberg expressions spec asks a server to omit it,
+and every reference client — Java, PyIceberg — then derives it from its own
+scan filter. A restricted residual is kept deliberately: it is how the policy
+half reaches a cooperating engine, and a reader that cannot parse it fails the
+query rather than reading unfiltered rows.
 
 ### Column statistics
 
@@ -1494,7 +1505,8 @@ it, except on the credentials endpoint, where the call itself is the request.
 | Header | On | Meaning |
 |---|---|---|
 | `ETag` | `loadTable`, `createTable`, commit | Names this metadata version; echo it in `If-None-Match` |
-| `X-Request-Id` | All | Request correlation ID |
+| `X-Request-Id` | All | The server's request id — the key the audit record is found by. Always minted by the server; one you send is recorded as `client_request_id` |
+| `Rustberg-Enforcement` | `loadTable`, `planTableScan` | How strongly your restrictions hold on this table: `none`, `architectural`, or `cooperative;columns="…";masked` ([grades](@/docs/authorization.md#how-strongly-it-holds-the-enforcement-grade)) |
 | `Idempotency-Key-Used` | Replayed POSTs | The response came from the idempotency cache |
 
 ---
@@ -1511,6 +1523,21 @@ which `GET /v1/config` describes completely.
 | `GET` | `/management/v1/policies/history` | `Read` on the policy set |
 | `GET` | `/management/v1/policies/revisions/{sequence}` | `Read` on the policy set |
 | `POST` | `/management/v1/policies/rollback` | `Manage` on the policy set |
+| `POST` | `/management/v1/policies/impact` | `Read` on the policy set |
+| `GET` | `/management/v1/namespaces/{namespace}/tables/{table}/explain?principal=…&kind=user\|api_key&roles=…` | `Read` on the policy set **and** on the table |
+| `GET` | `/management/v1/namespaces/{namespace}/tables/{table}/access` | `Read` on the policy set **and** on the table |
+
+`impact` takes `{ "source": "<candidate Cedar text>" }` and answers who would
+gain or lose which action on which table — and on the policy set — if it were
+installed; see [authorization](@/docs/authorization.md#before-you-save-who-gains-who-loses).
+`access` answers who of the principals the rules name may read one table, and in
+what form.
+
+`explain` answers what another principal — in your tenant — would be granted on
+a table: the decision, the matched policies, the `read-restrictions` `loadTable`
+would publish, and the enforcement grade with a concrete remedy. A table you may
+not read answers exactly as loading it would. See
+[authorization](@/docs/authorization.md#ask-before-you-ship-what-would-they-get).
 
 Policy changes take effect without a restart and reach other replicas within
 seconds. Details in

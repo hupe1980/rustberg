@@ -49,6 +49,11 @@ test-clients:
     cargo build --all-features
     RUSTBERG_BINARY=target/debug/rustberg uv run pytest tests/python -v --tb=short
 
+# Apache's REST Compatibility Kit against a running server (needs a JDK 17+).
+# Start one first: `RUSTBERG_DEV=true RUSTBERG_NO_AUTH=true cargo run --all-features -- --config .github/rck-server.toml`.
+rck uri="http://localhost:8000" warehouse="file:///tmp":
+    ./.github/rck.sh {{uri}} {{warehouse}}
+
 # The console's types, components, contrast and accessibility
 ui-test:
     cd ui && npm run check && npm test

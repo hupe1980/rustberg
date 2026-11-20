@@ -8,13 +8,12 @@
 <section class="hero">
   <div class="hero__inner">
     <p class="hero__eyebrow">Apache Iceberg REST Catalog · Rust · Apache-2.0 OR MIT</p>
-    <h1 class="hero__title">A policy-first<br><span class="grad">Iceberg REST catalog</span></h1>
+    <h1 class="hero__title">The Iceberg catalog that<br><span class="grad">enforces, and says how strongly</span></h1>
     <p class="hero__lede">
-      A whole catalog, not a proxy in front of one: an embedded file, or Postgres
-      for HA. Engines connect once, with one identity. Rustberg authenticates the
-      caller, authorizes every operation against Cedar policy, vends short-lived
-      storage credentials scoped to what that policy allows, and records the
-      decision.
+      Cedar policy on every request. A restricted reader gets no storage
+      credential, a plan naming only the files its filter selects, and a header
+      saying whether that holds against any engine or only a cooperating one.
+      Every grant is recorded with the rule that decided it. One binary.
     </p>
 
     <div class="hero__actions">
@@ -99,7 +98,9 @@
           A row filter or column mask travels to the engine as the Iceberg spec's
           <code>read-restrictions</code> — and is not merely advertised. Such a
           table is refused a broad credential, pinned to server-side planning, and
-          handed pre-signed URLs for exactly the files the filter selected.
+          handed pre-signed URLs for exactly the files the filter selected — and
+          every response says whether that is <em>architectural</em> or
+          <em>cooperative</em>.
         </p>
         <a class="pillar__link" href="{{ get_url(path='@/docs/authorization.md') }}#row-filters-and-column-masks">How restrictions work →</a>
       </article>
@@ -130,9 +131,9 @@
         <h3>Nothing required underneath</h3>
         <p>
           A useful deployment is one binary and a filesystem. Add Postgres when you
-          want several replicas, object storage when your tables live there. Pure
-          Rust, no <code>unsafe</code>, no C dependencies in the default build, so
-          it cross-compiles statically.
+          want several replicas, object storage when your tables live there. No
+          <code>unsafe</code> in the crate and no OpenSSL anywhere, so it
+          cross-compiles statically.
         </p>
         <a class="pillar__link" href="{{ get_url(path='@/docs/storage.md') }}">Catalog and warehouse →</a>
       </article>
@@ -140,9 +141,10 @@
       <article class="pillar">
         <h3>A console that shows what you may see</h3>
         <p>
-          Built into the binary at <code>/ui</code>. Every screen is drawn with your
-          own credential, so each table says whether it is restricted for you and
-          how. Policy is edited as a document: review the diff, save, undo.
+          Built into the binary at <code>/ui</code>, drawn with your own
+          credential. See how strongly each restriction holds, <em>View as</em>
+          anyone, and review a policy edit by who gains and who loses before you
+          save it.
         </p>
         <a class="pillar__link" href="{{ get_url(path='@/docs/console.md') }}">Tour the console →</a>
       </article>
@@ -195,7 +197,7 @@ forbid(
       <div class="engine"><h3>PyIceberg</h3><p>Read and write</p></div>
       <div class="engine"><h3>Apache Spark</h3><p>Read and write, including atomic <code>CTAS</code></p></div>
       <div class="engine"><h3>Trino</h3><p>Read and write</p></div>
-      <div class="engine"><h3>DuckDB</h3><p>Read</p></div>
+      <div class="engine"><h3>DuckDB</h3><p>Read; refuses a table restricted for you</p></div>
     </div>
     <p class="section__foot">
       Conformance suites for PyIceberg, DuckDB and Trino run against the built
@@ -239,8 +241,8 @@ let table = session.load_table(&amp;events).await?;</code></pre>
 
 <section class="cta">
   <div class="wrap cta__inner">
-    <h2>Start with one command</h2>
-    <p>An ephemeral catalog, an admin key printed at startup, and the <code>curl</code> that uses it.</p>
+    <h2>See it enforce in five minutes</h2>
+    <p><code>docker compose --profile demo run --build --rm demo</code> — two people, one table, every claim checked.</p>
     <div class="hero__actions">
       <a class="btn btn--primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Read the guide</a>
       <a class="btn" href="{{ get_url(path='@/docs/_index.md') }}">Browse the docs</a>

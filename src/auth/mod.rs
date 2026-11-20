@@ -57,13 +57,13 @@ pub use audit::{AuditAction, AuditCategory, AuditEvent, AuditOutcome, AuditSever
 pub use audit_sink::{AuditError, AuditSink, Auditor, FileSink, NullSink, StdoutSink};
 
 // Re-export Cedar policy-based authorization
-pub use cedar::{CedarAuthorizer, DEFAULT_POLICIES};
+pub use cedar::{CedarAuthorizer, DEFAULT_POLICIES, NamedPrincipals};
 pub use error::{AuthError, AuthErrorBody, AuthErrorResponse, Result as AuthResult};
 
 // Re-export middleware
 pub use middleware::{
-    AuthState, AuthenticatedPrincipal, MAX_REQUEST_ID_LEN, OptionalPrincipal, REQUEST_ID_HEADER,
-    RequestFacts, auth_middleware, is_usable_request_id, strip_unusable_request_id,
+    AuthState, AuthenticatedPrincipal, ClientRequestId, MAX_REQUEST_ID_LEN, OptionalPrincipal,
+    REQUEST_ID_HEADER, RequestFacts, auth_middleware, is_usable_request_id, take_client_request_id,
 };
 
 // Re-export principal types

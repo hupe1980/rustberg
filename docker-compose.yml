@@ -8,8 +8,8 @@
 # Development (no auth, for local testing only):
 #   docker-compose --profile dev up -d
 #
-# With MinIO storage (brings up MinIO, creates the bucket, and starts a
-# catalog configured against it — see examples/minio.toml):
+# With S3 storage (brings up a local S3 — RustFS — creates the bucket, and
+# starts a catalog configured against it — see examples/s3-local.toml):
 #   docker-compose --profile storage up -d
 #
 # =============================================================================
@@ -85,48 +85,43 @@ services:
       start_period: 5s
 
   # ---------------------------------------------------------------------------
-  # MinIO for S3-compatible object storage
+  # A local S3 for object storage
   # ---------------------------------------------------------------------------
-  minio:
-    image: minio/minio:latest
+  # A self-hosted S3 (RustFS). MinIO's community images are no longer on
+  # Docker Hub; any S3-compatible store works the same way.
+  s3:
+    image: rustfs/rustfs:1.0.6
     profiles:
       - storage
     ports:
       - "9000:9000"
-      - "9001:9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    command: server /data --console-address ":9001"
+      RUSTFS_ACCESS_KEY: rustberg-local
+      RUSTFS_SECRET_KEY: rustberg-local-secret
+    command: /data
     volumes:
-      - minio-data:/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
+      - s3-data:/data
 
-  # Creates the warehouse bucket, then exits. Without it the first table write
-  # fails against a bucket that does not exist, which reads as a credential
-  # problem and is not one.
-  minio-init:
-    image: minio/mc:latest
+  s3-init:
+    image: amazon/aws-cli:2.27.0
     profiles:
       - storage
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      sh -c "mc alias set local http://minio:9000 minioadmin minioadmin &&
-             mc mb --ignore-existing local/warehouse"
+    depends_on: [s3]
+    environment:
+      AWS_ACCESS_KEY_ID: rustberg-local
+      AWS_SECRET_ACCESS_KEY: rustberg-local-secret
+      AWS_REGION: us-east-1
+    entrypoint:
+      - sh
+      - -c
+      - |
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+          aws --endpoint-url http://s3:9000 s3 mb s3://warehouse 2>/dev/null && exit 0
+          aws --endpoint-url http://s3:9000 s3 ls s3://warehouse >/dev/null 2>&1 && exit 0
+          sleep 1
+        done
+        exit 1
 
-  # ---------------------------------------------------------------------------
-  # Rustberg against MinIO
-  # ---------------------------------------------------------------------------
-  #
-  # The MinIO service on its own is not a working storage deployment: the
-  # catalog has to be told the endpoint. Virtual-host addressing needs DNS MinIO
-  # does not have, so path-style is required.
   rustberg-storage:
     build:
       context: .
@@ -136,20 +131,21 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      minio-init:
+      s3-init:
         condition: service_completed_successfully
     environment:
       RUSTBERG_HOST: "0.0.0.0"
       RUSTBERG_PORT: "8000"
       RUSTBERG_INSECURE_HTTP: "true"
       RUSTBERG_CATALOG_URL: "file:///var/lib/rustberg/data"
+      RUSTBERG_WAREHOUSE: "s3://warehouse/"
       RUSTBERG_CONFIG: "/etc/rustberg/config.toml"
       # The config file names these rather than holding them, so the same file
       # is committable. A named variable that is unset is a startup failure.
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      S3_ACCESS_KEY: rustberg-local
+      S3_SECRET_KEY: rustberg-local-secret
     volumes:
-      - ./examples/minio.toml:/etc/rustberg/config.toml:ro
+      - ./examples/s3-local.toml:/etc/rustberg/config.toml:ro
       - rustberg-storage-data:/var/lib/rustberg/data
     # The image is distroless — no shell, no curl — so the binary probes itself.
     # `healthcheck` reads /ready, which reports whether the catalog store and the
@@ -161,13 +157,102 @@ services:
       retries: 3
       start_period: 5s
 
+  # ── The five-minute proof ────────────────────────────────────────────────
+  #   docker compose --profile demo run --build --rm demo
+  # Two people, one table: what the catalog withholds, plans and records.
+  demo-s3:
+    image: rustfs/rustfs:1.0.6
+    profiles: [demo]
+    environment:
+      RUSTFS_ACCESS_KEY: rustberg-demo
+      RUSTFS_SECRET_KEY: rustberg-demo-secret
+    command: /data
+    networks:
+      default:
+        aliases: [s3]
+
+  demo-s3-init:
+    image: amazon/aws-cli:2.27.0
+    profiles: [demo]
+    depends_on: [demo-s3]
+    environment:
+      AWS_ACCESS_KEY_ID: rustberg-demo
+      AWS_SECRET_ACCESS_KEY: rustberg-demo-secret
+      AWS_REGION: us-east-1
+    entrypoint:
+      - sh
+      - -c
+      - |
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+          aws --endpoint-url http://s3:9000 s3 mb s3://warehouse 2>/dev/null && exit 0
+          aws --endpoint-url http://s3:9000 s3 ls s3://warehouse >/dev/null 2>&1 && exit 0
+          sleep 1
+        done
+        exit 1
+
+  demo-rustberg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: [demo]
+    ports:
+      - "8000:8000"
+    depends_on:
+      demo-s3-init:
+        condition: service_completed_successfully
+    environment:
+      RUSTBERG_CONFIG: "/etc/rustberg/config.toml"
+      RUSTBERG_INSECURE_HTTP: "true"
+      RUSTBERG_CATALOG_URL: "file:///var/lib/rustberg/data"
+      RUSTBERG_WAREHOUSE: "s3://warehouse/"
+      # The signer uses the AWS credential chain; storage.properties configure FileIO.
+      AWS_ACCESS_KEY_ID: rustberg-demo
+      AWS_SECRET_ACCESS_KEY: rustberg-demo-secret
+      AWS_REGION: us-east-1
+      S3_ACCESS_KEY: rustberg-demo
+      S3_SECRET_KEY: rustberg-demo-secret
+      DEMO_ALICE_KEY: rb_demo_alice_admin_key_000000000000000000
+      DEMO_BOB_KEY: rb_demo_bob_analyst_key_0000000000000000000
+    volumes:
+      - ./examples/demo/config.toml:/etc/rustberg/config.toml:ro
+      - ./examples/demo/policies.cedar:/etc/rustberg/policies.cedar:ro
+      - demo-state:/var/lib/rustberg
+    networks:
+      default:
+        aliases: [rustberg]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/rustberg", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  demo:
+    build:
+      context: ./examples/demo
+    profiles: [demo]
+    depends_on:
+      demo-rustberg:
+        condition: service_healthy
+    environment:
+      RUSTBERG_URL: "http://rustberg:8000"
+      CONSOLE_URL: "http://localhost:8000/ui/"
+      S3_URL: "http://s3:9000"
+      S3_ACCESS_KEY: rustberg-demo
+      S3_SECRET_KEY: rustberg-demo-secret
+      DEMO_ALICE_KEY: rb_demo_alice_admin_key_000000000000000000
+      DEMO_BOB_KEY: rb_demo_bob_analyst_key_0000000000000000000
+      AUDIT_FILE: /var/lib/rustberg/audit.jsonl
+    volumes:
+      - demo-state:/var/lib/rustberg:ro
+
 volumes:
   rustberg-data:
+  demo-state:
   rustberg-dev-data:
   rustberg-warehouse:
   rustberg-dev-warehouse:
   rustberg-storage-data:
-  minio-data:
+  s3-data:
 
 # =============================================================================
 # Usage Examples:
@@ -178,15 +263,17 @@ volumes:
 # 2. Start development server (no authentication):
 #    docker-compose --profile dev up -d
 #
-# 3. Start with MinIO storage:
+# 3. Start with S3 storage (RustFS on :9000, rustberg-local / rustberg-local-secret):
 #    docker-compose --profile storage up -d
-#    MinIO console: http://localhost:9001 (minioadmin/minioadmin)
 #
-# 4. Generate an API key (production). The image is distroless, so there is no
+# 4. See enforcement in five minutes — two people, one table, every claim checked:
+#    docker compose --profile demo run --build --rm demo
+#
+# 5. Generate an API key (production). The image is distroless, so there is no
 #    shell — `exec` runs the binary directly:
 #    docker compose exec rustberg rustberg generate-key --name admin --roles admin
 #
-# 5. Back up the catalog. There is no backup subcommand: the redb file is one
+# 6. Back up the catalog. There is no backup subcommand: the redb file is one
 #    file, so a copy taken while nothing is writing to it is the backup. Stop
 #    the container first — redb holds an exclusive lock and a copy taken during
 #    a commit is a copy of a half-written file:
@@ -195,10 +282,10 @@ volumes:
 #      cp /data/catalog.redb /out/catalog.redb && docker compose start rustberg
 #    A Postgres-backed deployment uses `pg_dump`, which needs no downtime.
 #
-# 6. View logs:
+# 7. View logs:
 #    docker compose logs -f rustberg
 #
-# 7. Check health. The container checks itself every ten seconds
+# 8. Check health. The container checks itself every ten seconds
 #    (`docker compose ps` shows the result); from outside:
 #    curl http://localhost:8000/health   # the process is up
 #    curl http://localhost:8000/ready    # the catalog and policy set are usable

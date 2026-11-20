@@ -4,16 +4,50 @@
   import Symbol from "../components/Symbol.svelte";
   import CodeView from "../components/CodeView.svelte";
   import type { Selection } from "../components/Outline.svelte";
-  import { ApiError, loadTable, loadView, type LoadTable, type LoadView, type Schema } from "../lib/api";
+  import { ApiError, explain, loadTableGraded, tableAccess, type AccessRow, loadView, type Explain, type LoadTable, type LoadView, type Schema, type Subject } from "../lib/api";
+  import { strength, type Grade } from "../lib/grade";
   import { ago, ident, typeName, when } from "../lib/format";
   import { describe } from "../lib/predicate";
   import { copy } from "../lib/clipboard";
 
-  let { selection, inspector }: { selection: Selection; inspector: boolean } = $props();
+  let {
+    selection,
+    inspector,
+    viewAs = null,
+    onviewas,
+  }: { selection: Selection; inspector: boolean; viewAs?: Subject | null; onviewas?: (s: Subject) => void } = $props();
 
   let table = $state<LoadTable | null>(null);
   let view = $state<LoadView | null>(null);
   let error = $state<ApiError | null>(null);
+  let ownGrade = $state<Grade | undefined>();
+  let preview = $state<Explain | null>(null);
+  let previewError = $state<ApiError | null>(null);
+  let copiedReference = $state(false);
+  // Who may read this table, and in what form — shown only to someone who may read the policy set.
+  let access = $state<AccessRow[] | null>(null);
+  $effect(() => {
+    const s = selection;
+    access = null;
+    if (s.kind !== "table") return;
+    tableAccess(s.namespace, s.name)
+      .then((a) => (access = a.rows))
+      .catch(() => (access = null));
+  });
+  const accessWords: Record<AccessRow["access"], string> = {
+    everything: "everything",
+    filtered: "filtered rows",
+    masked: "masked columns",
+    "filtered-and-masked": "filtered, masked",
+    nothing: "nothing",
+  };
+  const label = (r: AccessRow) =>
+    r.principal.kind === "group" ? r.principal.roles[0]! : r.principal.kind === "anyone" ? "no group" : r.principal.id;
+  const asSubject = (r: AccessRow): Subject => ({
+    id: r.principal.kind === "group" ? `a member of ${r.principal.roles[0]}` : r.principal.id,
+    kind: r.principal.kind === "api_key" ? "api_key" : "user",
+    roles: r.principal.roles,
+  });
   let loading = $state(true);
   let allSnapshots = $state(false);
 
@@ -24,7 +58,14 @@
     error = null;
     loading = true;
     allSnapshots = false;
-    const load = s.kind === "table" ? loadTable(s.namespace, s.name).then((t) => (table = t)) : loadView(s.namespace, s.name).then((v) => (view = v));
+    ownGrade = undefined;
+    const load =
+      s.kind === "table"
+        ? loadTableGraded(s.namespace, s.name).then((r) => {
+            table = r.table;
+            ownGrade = r.grade;
+          })
+        : loadView(s.namespace, s.name).then((v) => (view = v));
     load.catch((e) => (error = e)).finally(() => (loading = false));
   });
 
@@ -38,11 +79,36 @@
   });
   const names = $derived(new Map((schema?.fields ?? []).map((f) => [f.id, f.name])));
 
-  const restrictions = $derived(table?.["read-restrictions"]);
+  // A preview is the server's what-if about another principal; the console renders it and computes nothing.
+  $effect(() => {
+    const s = selection;
+    const who = viewAs;
+    preview = null;
+    previewError = null;
+    if (!who || s.kind !== "table") return;
+    explain(s.namespace, s.name, who)
+      .then((p) => (preview = p))
+      .catch((e) => (previewError = e));
+  });
+
+  const previewing = $derived(Boolean(viewAs) && selection.kind === "table");
+  const restrictions = $derived(previewing ? preview?.["read-restrictions"] : table?.["read-restrictions"]);
   const masked = $derived(new Set((restrictions?.["required-column-projections"] ?? []).map((p) => p["field-id"])));
   const filter = $derived(restrictions?.["required-row-filter"]);
-  const serverPlanning = $derived(table?.config?.["scan-planning-mode"] === "server");
+  const serverPlanning = $derived(previewing ? Boolean(restrictions) : table?.config?.["scan-planning-mode"] === "server");
   const restricted = $derived(Boolean(restrictions) || serverPlanning);
+  const grade = $derived.by((): Grade | undefined => {
+    if (!previewing) return ownGrade;
+    const e = preview?.enforcement;
+    return e ? { grade: e.grade, columns: e.columns ?? [], masked: e.masked } : undefined;
+  });
+  const told = $derived(grade && grade.grade !== "none" ? strength(grade) : undefined);
+  const remedy = $derived(previewing ? preview?.enforcement?.remedy : undefined);
+
+  async function copyReference(reference: string) {
+    copiedReference = await copy(reference);
+    setTimeout(() => (copiedReference = false), 1600);
+  }
 
   const snapshots = $derived(
     [...(table?.metadata.snapshots ?? [])].sort((a, b) => b["timestamp-ms"] - a["timestamp-ms"]),
@@ -73,17 +139,50 @@
         <div>
           <strong>{error.status === 404 || error.status === 403 ? "Not visible to you" : "Could not load this"}</strong>
           <p class="muted">{error.message}</p>
+          {#if error.reference}
+            <p class="reference small">
+              <span class="muted">Reference</span>
+              <button class="ref mono" title="Copy — an administrator finds the decision in the audit trail by it" onclick={() => copyReference(error!.reference!)}>
+                {error.reference}<Symbol name={copiedReference ? "check" : "copy"} size={12} />
+              </button>
+            </p>
+          {/if}
         </div>
       </div>
     {:else}
       {#if table}
-        <div class="card see" class:restricted aria-labelledby="see-title">
-          <h2 id="see-title" class="section-title">What you can see</h2>
-          {#if restricted}
+        <div class="card see" class:restricted class:previewing aria-labelledby="see-title">
+          <h2 id="see-title" class="section-title">
+            {#if previewing}What <span class="who">{viewAs!.id}</span> would see{:else}What you can see{/if}
+          </h2>
+          {#if previewing && previewError}
+            <p class="lede">
+              <span class="state denied"><Symbol name="lock" size={13} />Preview unavailable</span>
+              {previewError.status === 403 || previewError.status === 501
+                ? "Previewing another person's view needs permission to read the policy set."
+                : previewError.message}
+            </p>
+          {:else if previewing && !preview}
+            <span class="skeleton" style="width: 60%"></span>
+          {:else if previewing && preview?.decision === "deny"}
+            <p class="lede">
+              <span class="state denied"><Symbol name="lock" size={13} />Denied</span>
+              {viewAs!.id} cannot read this table.
+              {preview["matched-policies"].length ? "A forbid matched." : "No policy permits it, so it is denied by default."}
+            </p>
+            {#if preview["matched-policies"].length}
+              <dl><dt><Symbol name="policy" size={14} />Forbidden by</dt><dd>{#each preview["matched-policies"] as id (id)}<code class="pill">{id}</code>{/each}</dd></dl>
+            {/if}
+          {:else if previewing && preview?.refused}
+            <p class="lede">
+              <span class="state denied"><Symbol name="warning" size={13} />Refused</span>
+              Permitted, but loading would be refused: {preview.refused}
+            </p>
+          {:else if restricted}
             <p class="lede">
               <span class="state restricted"><Symbol name="shield" size={13} />Restricted</span>
-              This table is narrowed for you. The server withholds storage credentials and plans your reads, so you
-              receive only the files your filter selects.
+              This table is narrowed for {previewing ? "them" : "you"}. The server withholds storage credentials and plans
+              reads itself, handing over only the files the filter selects.
             </p>
             <dl>
               <dt><Symbol name="filter" size={14} />Rows</dt>
@@ -96,12 +195,30 @@
               </dd>
               <dt><Symbol name="catalog" size={14} />Planning</dt>
               <dd>{serverPlanning ? "Server-side — required" : "Client-side allowed"}</dd>
+              {#if told && grade}
+                <dt><Symbol name={grade.grade === "architectural" ? "shield-check" : "shield"} size={14} />Strength</dt>
+                <dd class="strength" class:strong={grade.grade === "architectural"}>
+                  <strong>{told.title}</strong>
+                  <span class="muted">{told.detail}</span>
+                </dd>
+              {/if}
+              {#if remedy}
+                <dt><Symbol name="info" size={14} />To strengthen</dt>
+                <dd class="muted remedy">{remedy}</dd>
+              {/if}
+              {#if previewing && preview?.["matched-policies"].length}
+                <dt><Symbol name="policy" size={14} />Granted by</dt>
+                <dd>{#each preview["matched-policies"] as id (id)}<code class="pill">{id}</code>{/each}</dd>
+              {/if}
             </dl>
           {:else}
             <p class="lede">
               <span class="state allowed"><Symbol name="shield-check" size={13} />Unrestricted</span>
-              No row filter or mask applies to you on this table.
+              No row filter or mask applies to {previewing ? "them" : "you"} on this table.
             </p>
+          {/if}
+          {#if previewing && preview}
+            <p class="fine muted small">{preview.context} Answered by the server; nothing was read as {viewAs!.id}.</p>
           {/if}
         </div>
       {/if}
@@ -136,6 +253,23 @@
 
   {#if inspector && (table || view)}
     <aside class="inspector" aria-label="Inspector">
+      {#if access?.length}
+        <h2 class="section-title">Who can read this</h2>
+        <ul class="access" aria-label="Who can read this table, and in what form">
+          {#each access as r (r.principal.kind + r.principal.id)}
+            <li>
+              <Symbol name={r.principal.kind === "group" ? "person" : r.principal.kind === "api_key" ? "key" : "person"} size={12} />
+              <span class="name" title={r["matched-policies"].join(", ")}>{label(r)}</span>
+              <span class="state tiny" class:allowed={r.access === "everything"} class:restricted={r.access !== "everything" && r.access !== "nothing"} class:denied={r.access === "nothing"}>
+                {accessWords[r.access]}{#if r.grade?.grade === "cooperative"}{" · cooperative"}{/if}
+              </span>
+              {#if onviewas && r.access !== "nothing"}
+                <button class="btn plain icon" aria-label={`View as ${label(r)}`} title="View as" onclick={() => onviewas!(asSubject(r))}><Symbol name="eye" size={12} /></button>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
       <h2 class="section-title">Overview</h2>
       <dl class="facts">
         {#if table}<dt>Format</dt><dd>v{table.metadata["format-version"]}</dd>{/if}
@@ -257,6 +391,74 @@
   }
   .see.restricted {
     box-shadow: var(--shadow), inset 3px 0 0 var(--restricted);
+  }
+  .access {
+    list-style: none;
+    margin: 0 0 var(--s4);
+    padding: 0;
+    display: grid;
+    gap: 6px;
+  }
+  .access li {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+  }
+  .access .name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .see.previewing {
+    box-shadow: var(--shadow), inset 3px 0 0 var(--accent);
+  }
+  .see.previewing.restricted {
+    box-shadow: var(--shadow), inset 3px 0 0 var(--accent), inset 6px 0 0 var(--restricted);
+  }
+  .who {
+    color: var(--accent-ink);
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .strength {
+    display: grid;
+    gap: 2px;
+  }
+  .strength strong {
+    color: var(--restricted);
+  }
+  .strength.strong strong {
+    color: var(--allowed);
+  }
+  .remedy {
+    font-size: 13px;
+    line-height: 1.45;
+  }
+  .fine {
+    margin: var(--s3) 0 0;
+  }
+  .reference {
+    display: flex;
+    gap: var(--s2);
+    align-items: center;
+    margin-top: var(--s2);
+  }
+  .ref {
+    display: inline-flex;
+    gap: 6px;
+    align-items: center;
+    padding: 2px 8px;
+    border: 1px solid var(--line, var(--faint));
+    border-radius: var(--r-sm);
+    background: transparent;
+    color: var(--text-2);
+    cursor: copy;
+  }
+  .ref:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   dl {
     display: grid;

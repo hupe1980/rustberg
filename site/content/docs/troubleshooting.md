@@ -396,26 +396,32 @@ curl -H "Authorization: Bearer $API_KEY" \
 # If exists, use it or choose different name
 ```
 
-### "Row filter references columns this table does not partition on by identity"
+### "Row filter references columns that are not identity partitions" / `Rustberg-Enforcement: cooperative`
 
-**Symptom:** a `WARN` at table load naming a table and some columns.
+**Symptom:** a `WARN` at table load naming a table and some columns, and the
+same table answering `Rustberg-Enforcement: cooperative;columns="…"`.
 
 **Cause:** Not an error. Row filters are enforced by withholding files, which
-separates rows only on **identity**-partitioned columns. Transformed partitions
-are *not* aligned: `days(ts)` puts a whole day in one file, so forbidden rows
-remain. Range filters on a transform's exact boundaries warn too.
+separates rows only on columns **every live file** is identity-partitioned on.
+Transformed partitions are *not* aligned (`days(ts)` puts a whole day in one
+file), and neither are files written before you added the partition field.
 
 ```bash
-# Which columns is the table partitioned on, and with which transform?
-curl -H "Authorization: Bearer $API_KEY" \
-     http://localhost:8000/v1/namespaces/analytics/tables/events \
-  | jq '.metadata."partition-specs"'
+# The grade, and why
+curl -sI -H "Authorization: Bearer $API_KEY" \
+     http://localhost:8000/v1/namespaces/analytics/tables/events | grep -i rustberg-enforcement
+# Or ask for the remedy, as an administrator
+curl -H "Authorization: Bearer $ADMIN_KEY" \
+  "http://localhost:8000/management/v1/namespaces/analytics/tables/events/explain?principal=bob&roles=analyst" \
+  | jq .enforcement.remedy
 ```
 
-**Fix:** Partition on the filter's column with `identity`, or accept that only
-credential withholding protects the table (an engine with its own storage
-credentials reads it unfiltered). See
-[authorization](@/docs/authorization.md#partition-on-the-security-boundary).
+**Fix:** Add the filter column as an `identity` partition field, then rewrite
+the files written before it (compaction does). The grade turns `architectural`
+when no live file was written under the old spec. Or accept that only credential
+withholding protects the table: an engine with its own storage credentials reads
+it unfiltered. A `@column_mask` is always cooperative. See
+[authorization](@/docs/authorization.md#how-strongly-it-holds-the-enforcement-grade).
 
 The warning appears once per table per policy set.
 

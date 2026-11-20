@@ -6,7 +6,9 @@
 //! client can interpret or leave undocumented routes inside a namespace that
 //! says it has none.
 
-pub mod policies;
+pub mod explain;
+pub mod impact;
+mod policies;
 
 use axum::Router;
 use axum::routing::{get, post};
@@ -21,10 +23,19 @@ pub fn create_routes(app_state: AppState) -> Router {
             get(policies::get_policies).put(policies::update_policies),
         )
         .route("/v1/policies/history", get(policies::policy_history))
+        .route("/v1/policies/impact", post(impact::impact))
         .route("/v1/policies/rollback", post(policies::rollback_policies))
         .route(
             "/v1/policies/revisions/{sequence}",
             get(policies::get_revision),
+        )
+        .route(
+            "/v1/namespaces/{namespace}/tables/{table}/explain",
+            get(explain::explain),
+        )
+        .route(
+            "/v1/namespaces/{namespace}/tables/{table}/access",
+            get(impact::access),
         )
         .with_state(app_state)
 }

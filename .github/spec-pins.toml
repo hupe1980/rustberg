@@ -37,15 +37,15 @@
 [[pin]]
 name = "iceberg/rest-catalog-open-api.yaml"
 url = "https://raw.githubusercontent.com/apache/iceberg/main/open-api/rest-catalog-open-api.yaml"
-sha256 = "7dc224264eed59656c28122fe7e5c872d5a9e8e4f5fc4321e8a333b307997d6f"
-retrieved = "2026-09-18"
+sha256 = "3caaaaddb481a3d7bd8a744511792c18c14c5e214850aee7e193394ed7059e66"
+retrieved = "2026-11-20"
 governs = "The wire protocol. Every endpoint, request and response shape, and every capability /v1/config advertises."
 
 [[pin]]
 name = "iceberg/table-spec.md"
 url = "https://raw.githubusercontent.com/apache/iceberg/main/format/spec.md"
-sha256 = "e94c6a2efbbd8cb49eae4c688a16f5b6468441a0d0e9ce52f8310ed16e63f030"
-retrieved = "2026-09-18"
+sha256 = "35fb833fdf8661828f1bf05c3ad457e5404d11047e25b0aecf1c487fa13f5ed0"
+retrieved = "2026-11-20"
 governs = "Format versions 1/2/3, row lineage, partition specs and transforms, and the JSON single-value serialization a scan plan encodes partition values with."
 
 [[pin]]
@@ -61,3 +61,10 @@ url = "https://raw.githubusercontent.com/apache/iceberg/main/format/puffin-spec.
 sha256 = "f70a4ef5ce49966bc4f49a0fc4b445a9d0f3eead9fc7506b041b996a4092d2ce"
 retrieved = "2026-09-18"
 governs = "The statistics blobs SetStatistics and SetPartitionStatistics point at, and a purge deletes."
+
+[[pin]]
+name = "iceberg/expressions-spec.md"
+url = "https://raw.githubusercontent.com/apache/iceberg/main/format/expressions-spec.md"
+sha256 = "41cf5dfa197f5136974027defa7b6a5c888a1a531946aa244ecb2a8a53451a80"
+retrieved = "2026-11-20"
+governs = "The predicate form a scan task's residual-filter and a table's required-row-filter are written in, and when a service should omit a residual."

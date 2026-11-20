@@ -183,8 +183,11 @@ pub struct SigningEndpointConfig {
     pub enabled: bool,
     /// How to read a bucket out of a URI.
     pub url_style: Option<UrlStyle>,
-    /// Host of a custom S3 endpoint, when one is used.
+    /// Host of a custom S3 endpoint, when one is used — bare, without a scheme.
     pub endpoint_host: Option<String>,
+    /// Whether that endpoint speaks TLS. `false` only when the configuration
+    /// spelled it `http://…`; a pre-signed URL is fetched with this scheme.
+    pub endpoint_tls: bool,
     /// Region used when a client sends none.
     pub fallback_region: Option<String>,
     /// How long a pre-signed URL in a scan plan stays valid.
@@ -203,13 +206,34 @@ impl Default for SigningEndpointConfig {
             enabled: false,
             url_style: None,
             endpoint_host: None,
+            endpoint_tls: true,
             fallback_region: None,
             presign_ttl: std::time::Duration::from_secs(900),
         }
     }
 }
 
-/// The HTTPS URL an `s3://bucket/key` location is fetched at.
+impl SigningEndpointConfig {
+    /// Splits a configured endpoint into its host and whether it speaks TLS.
+    ///
+    /// `http://minio:9000` is a plain-HTTP endpoint; `https://…` and a bare
+    /// host are TLS, so a configuration written before the scheme was accepted
+    /// means what it always meant.
+    #[must_use]
+    pub fn split_endpoint(configured: Option<&str>) -> (Option<String>, bool) {
+        match configured.map(str::trim) {
+            None | Some("") => (None, true),
+            Some(value) => match value.split_once("://") {
+                Some(("http", host)) => (Some(host.trim_end_matches('/').to_string()), false),
+                Some((_, host)) => (Some(host.trim_end_matches('/').to_string()), true),
+                None => (Some(value.trim_end_matches('/').to_string()), true),
+            },
+        }
+    }
+}
+
+/// The URL an `s3://bucket/key` location is fetched at — HTTPS, unless the
+/// configured endpoint said `http://`.
 ///
 /// The inverse of what this endpoint does to a client's URI, and it has to agree
 /// with it: a plan hands back a URL the client fetches directly, so a spelling
@@ -239,9 +263,12 @@ pub fn object_url(location: &str, region: &str, config: &SigningEndpointConfig) 
         .collect::<Vec<_>>()
         .join("/");
 
+    let scheme = if config.endpoint_tls { "https" } else { "http" };
     let url = match (config.endpoint_host.as_deref(), config.url_style) {
-        (Some(host), Some(UrlStyle::VirtualHost)) => format!("https://{bucket}.{host}/{encoded}"),
-        (Some(host), _) => format!("https://{host}/{bucket}/{encoded}"),
+        (Some(host), Some(UrlStyle::VirtualHost)) => {
+            format!("{scheme}://{bucket}.{host}/{encoded}")
+        }
+        (Some(host), _) => format!("{scheme}://{host}/{bucket}/{encoded}"),
         (None, _) => format!("https://{bucket}.s3.{region}.amazonaws.com/{encoded}"),
     };
     Some(url)
@@ -1254,6 +1281,7 @@ fn record_signature(
         .with_tenant_id(authorized.principal().tenant_id())
         .with_optional_client_ip(authorized.request().source_ip)
         .with_optional_request_id(authorized.request().request_id.as_deref())
+        .with_optional_client_request_id(authorized.request().client_request_id.as_deref())
         .with_detail("locations", locations)
         .with_detail("location_count", addressed.locations.len().to_string());
 
@@ -1278,6 +1306,7 @@ mod tests {
             enabled: true,
             url_style: Some(UrlStyle::Auto),
             endpoint_host: None,
+            endpoint_tls: true,
             fallback_region: None,
             presign_ttl: std::time::Duration::from_secs(900),
         }
@@ -1309,6 +1338,29 @@ mod tests {
         assert_eq!(
             object_url("s3://wh/db/t/f.parquet", "us-east-1", &config).as_deref(),
             Some("https://wh.minio.internal:9000/db/t/f.parquet")
+        );
+    }
+
+    /// An endpoint without TLS — MinIO or RustFS on a compose network — is
+    /// fetched over plain HTTP. A URL that always said `https` would be one the
+    /// caller cannot open, which made a restricted plan unreadable there.
+    #[test]
+    fn a_plain_http_endpoint_is_fetched_over_http() {
+        let mut config = config();
+        config.endpoint_host = Some("minio:9000".to_string());
+        config.endpoint_tls = false;
+        assert_eq!(
+            object_url("s3://wh/db/t/f.parquet", "us-east-1", &config).as_deref(),
+            Some("http://minio:9000/wh/db/t/f.parquet")
+        );
+        assert_eq!(
+            SigningEndpointConfig::split_endpoint(Some("http://minio:9000")),
+            (Some("minio:9000".to_string()), false)
+        );
+        assert_eq!(
+            SigningEndpointConfig::split_endpoint(Some("minio.internal:9000")),
+            (Some("minio.internal:9000".to_string()), true),
+            "no scheme means TLS, as before"
         );
     }
 

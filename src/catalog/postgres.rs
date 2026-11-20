@@ -520,11 +520,10 @@ impl PostgresCatalog {
     }
 
     fn table_location(&self, ident: &TableIdent) -> String {
-        format!(
-            "{}/{}/{}",
-            self.warehouse_location,
-            ident.namespace().as_ref().join("/"),
-            ident.name()
+        crate::location::table_location(
+            &self.warehouse_location,
+            ident.namespace().as_ref(),
+            ident.name(),
         )
     }
 
@@ -600,12 +599,7 @@ impl PostgresCatalog {
         // no table, and any other requirement correctly fails against `None`.
         let current = if exists { Some(&metadata) } else { None };
         for requirement in requirements {
-            requirement.check(current).map_err(|e| {
-                Error::new(
-                    e.kind(),
-                    format!("Requirement failed for table {ident}: {}", e.message()),
-                )
-            })?;
+            super::store::check_requirement(requirement, current)?;
         }
 
         // The staged metadata is the base, and the client's updates are applied
@@ -630,7 +624,9 @@ impl PostgresCatalog {
 
         let mut builder = metadata
             .clone()
-            .into_builder(Some(current_location.clone()));
+            // A create has no previous metadata file: the staged document was
+            // never the table's, so it does not belong in the metadata log.
+            .into_builder(exists.then(|| current_location.clone()));
         for update in updates {
             builder = update.clone().apply(builder)?;
         }
@@ -1249,6 +1245,9 @@ impl CatalogStore for PostgresCatalog {
             // Phase 3 — swap every pointer in one transaction.
             let mut tx = self.pool.begin().await.map_err(sql_err)?;
             let mut conflict = false;
+            // A name another table or a view holds is not a race to retry:
+            // re-reading cannot free it.
+            let mut taken: Option<TableIdent> = None;
 
             for entry in lock_order.iter().map(|&i| &staged[i]) {
                 // A namespace dropped between staging and commit is caught by
@@ -1272,7 +1271,7 @@ impl CatalogStore for PostgresCatalog {
                     )
                     .await?
                     {
-                        conflict = true;
+                        taken = Some(entry.ident.clone());
                         break;
                     }
 
@@ -1332,6 +1331,15 @@ impl CatalogStore for PostgresCatalog {
                     .await
                     .map_err(sql_err)?;
                 }
+            }
+
+            if let Some(ident) = taken {
+                tx.rollback().await.map_err(sql_err)?;
+                self.discard_written_metadata(&staged).await;
+                return Err(Error::new(
+                    ErrorKind::TableAlreadyExists,
+                    format!("{ident} was created while this staged commit was in flight"),
+                ));
             }
 
             if conflict {

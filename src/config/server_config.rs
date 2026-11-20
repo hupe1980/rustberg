@@ -658,7 +658,10 @@ pub struct SigningConfig {
     #[serde(default = "default_url_style")]
     pub url_style: String,
 
-    /// Host of a custom S3 endpoint, when one is used.
+    /// Host of a custom S3 endpoint, when one is used. Prefix it with
+    /// `http://` for an endpoint without TLS (MinIO or RustFS on a private
+    /// network): the pre-signed URLs a restricted scan plan returns use that
+    /// scheme. A bare host means HTTPS.
     ///
     /// Lets `auto` tell `minio:9000/bucket/key` (path style) from
     /// `bucket.minio:9000/key` (virtual-host style) on the same endpoint.

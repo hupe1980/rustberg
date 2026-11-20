@@ -5,6 +5,7 @@
   import Sheet from "../components/Sheet.svelte";
   import CodeView from "../components/CodeView.svelte";
   import Diff from "../components/Diff.svelte";
+  import Consequences from "../components/Consequences.svelte";
   import { ApiError, call, get, type PolicyRevision, type RevisionSummary } from "../lib/api";
   import { ago, when } from "../lib/format";
 
@@ -182,6 +183,7 @@
 
 {#if reviewing && current}
   <Sheet title="Review changes" wide onclose={() => (reviewing = false)}>
+    <Consequences source={draft} label="What saving would change, for whom" />
     <Diff before={current.source} after={draft} label="Changes to the policy set" />
     <label class="note">
       <span>Note</span>
@@ -215,6 +217,7 @@
       <div class="compare">
         {#if picked}
           <p class="muted">Restoring revision {picked.sequence} would change what is in force:</p>
+          <Consequences source={picked.source} label={`What restoring revision ${picked.sequence} would change, for whom`} />
           <Diff before={current.source} after={picked.source} label={`Restoring revision ${picked.sequence}`} />
         {:else if history.length <= 1}
           <p class="muted">There is only one revision.</p>

@@ -402,6 +402,7 @@ async fn apply(
             // request id.
             .with_optional_client_ip(request.source_ip)
             .with_optional_request_id(request.request_id.as_deref())
+            .with_optional_client_request_id(request.client_request_id.as_deref())
             .with_detail("policy_sequence", revision.sequence.to_string())
             .with_detail("policy_version", revision.version.clone());
     state.auditor.record(&event).map_err(|_| {

@@ -103,7 +103,10 @@ pub(crate) fn reject_stale_row_lineage(
             return Err(iceberg::Error::new(
                 iceberg::ErrorKind::CatalogCommitConflicts,
                 format!(
-                    "Commit conflict on table {ident}: the snapshot assigns row ids from                      {first_row_id}, but another writer has already taken them — this table                      is at {}. Refresh the table and commit again; the new snapshot must                      start at the table's current next-row-id.",
+                    "Commit conflict on table {ident}: the snapshot assigns row ids from \
+                    {first_row_id}, but another writer has already taken them — this table \
+                    is at {}. Refresh the table and commit again; the new snapshot must \
+                    start at the table's current next-row-id.",
                     base.next_row_id()
                 ),
             ));
@@ -694,6 +697,94 @@ impl CatalogStore for UnreachableStore {
     async fn storage_health_check(&self) -> Result<StorageHealthStatus> {
         Ok(StorageHealthStatus::unhealthy("unreachable", "test double"))
     }
+}
+
+/// Checks one commit requirement, and words a failure as the reference
+/// implementation does — `Requirement failed: current schema changed: expected
+/// id 1 != 2` — because Java clients and Apache's compatibility kit read it.
+///
+/// A failed requirement is never retried by the catalog: it was checked against
+/// committed state, and re-reading that state cannot make it pass. Only a lost
+/// race on the pointer swap is retryable.
+///
+/// # Errors
+///
+/// [`iceberg::ErrorKind::CatalogCommitConflicts`] when the requirement fails.
+pub(crate) fn check_requirement(
+    requirement: &iceberg::TableRequirement,
+    current: Option<&iceberg::spec::TableMetadata>,
+) -> iceberg::Result<()> {
+    use iceberg::TableRequirement as R;
+
+    if requirement.check(current).is_ok() {
+        return Ok(());
+    }
+    let message = match (requirement, current) {
+        (R::NotExist, _) => "Requirement failed: table already exists".to_string(),
+        (_, None) => "Requirement failed: table does not exist".to_string(),
+        (R::UuidMatch { uuid }, Some(m)) => {
+            format!(
+                "Requirement failed: UUID does not match: expected {} != {uuid}",
+                m.uuid()
+            )
+        }
+        (R::RefSnapshotIdMatch { r#ref, snapshot_id }, Some(m)) => {
+            match (snapshot_id, m.snapshot_for_ref(r#ref)) {
+                (Some(expected), None) => format!(
+                    "Requirement failed: branch or tag {ref} is missing, expected {expected}",
+                    ref = r#ref
+                ),
+                (Some(expected), Some(actual)) => format!(
+                    "Requirement failed: {ref} has changed: expected id {expected} != {}",
+                    actual.snapshot_id(),
+                    ref = r#ref
+                ),
+                (None, _) => format!(
+                    "Requirement failed: {ref} was created concurrently",
+                    ref = r#ref
+                ),
+            }
+        }
+        (
+            R::LastAssignedFieldIdMatch {
+                last_assigned_field_id,
+            },
+            Some(m),
+        ) => format!(
+            "Requirement failed: last assigned field id changed: expected id {last_assigned_field_id} != {}",
+            m.last_column_id()
+        ),
+        (R::CurrentSchemaIdMatch { current_schema_id }, Some(m)) => format!(
+            "Requirement failed: current schema changed: expected id {current_schema_id} != {}",
+            m.current_schema_id()
+        ),
+        (
+            R::LastAssignedPartitionIdMatch {
+                last_assigned_partition_id,
+            },
+            Some(m),
+        ) => format!(
+            "Requirement failed: last assigned partition id changed: expected id {last_assigned_partition_id} != {}",
+            m.last_partition_id()
+        ),
+        (R::DefaultSpecIdMatch { default_spec_id }, Some(m)) => format!(
+            "Requirement failed: default partition spec changed: expected id {default_spec_id} != {}",
+            m.default_partition_spec_id()
+        ),
+        (
+            R::DefaultSortOrderIdMatch {
+                default_sort_order_id,
+            },
+            Some(m),
+        ) => format!(
+            "Requirement failed: default sort order changed: expected id {default_sort_order_id} != {}",
+            m.default_sort_order_id()
+        ),
+    };
+    Err(iceberg::Error::new(
+        iceberg::ErrorKind::CatalogCommitConflicts,
+        message,
+    ))
 }
 
 #[cfg(test)]

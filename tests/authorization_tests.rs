@@ -176,7 +176,7 @@ async fn a_forbidden_table_is_indistinguishable_from_a_missing_one() {
         None,
     )
     .await;
-    let (fake, _) = request(
+    let (fake, fake_body) = request(
         &app,
         Method::GET,
         "/v1/namespaces/shared_ns/tables/imaginary_table",
@@ -184,16 +184,67 @@ async fn a_forbidden_table_is_indistinguishable_from_a_missing_one() {
         None,
     )
     .await;
+    let (absent, absent_body) = request(
+        &app,
+        Method::GET,
+        "/v1/namespaces/no_such_ns/tables/real_table",
+        &outsider_secret,
+        None,
+    )
+    .await;
 
     assert_eq!(real, StatusCode::NOT_FOUND, "body: {real_body}");
     assert_eq!(fake, StatusCode::NOT_FOUND);
+    assert_eq!(absent, StatusCode::NOT_FOUND);
 
     // The error type must match too — a client branches on it, and a differing
-    // type reopens the oracle one level down.
-    assert!(
-        real_body.contains("NoSuchTableException"),
-        "body: {real_body}"
-    );
+    // type reopens the oracle one level down — and a namespace that does not
+    // exist at all answers the same way.
+    for body in [&real_body, &fake_body, &absent_body] {
+        assert!(body.contains("NoSuchTableException"), "body: {body}");
+    }
+}
+
+/// Creating a table in a namespace that does not exist is told so, as the
+/// spec's clients expect — and creating in a namespace the caller cannot see
+/// answers identically, so the namespace's existence is not revealed.
+#[tokio::test]
+async fn creating_in_a_missing_or_hidden_namespace_is_no_such_namespace() {
+    let policies = r#"
+        permit(principal in Rustberg::Group::"admin", action, resource)
+          when { resource.tenant == principal.tenant };
+    "#;
+    let (admin_key, admin_secret) = key("admin", "acme", &["admin"]);
+    let (outsider_key, outsider_secret) = key("outsider", "other", &["admin"]);
+    let (app, _store) = app_with(policies, vec![admin_key, outsider_key]).await;
+    seed(&app, &admin_secret, "shared_ns", &["real_table"]).await;
+
+    let create = |ns: &'static str| {
+        let app = app.clone();
+        let secret = outsider_secret.clone();
+        async move {
+            request(
+                &app,
+                Method::POST,
+                &format!("/v1/namespaces/{ns}/tables"),
+                &secret,
+                Some(serde_json::json!({
+                    "name": "t",
+                    "schema": { "type": "struct", "fields": [
+                        { "id": 1, "name": "id", "required": true, "type": "long" }
+                    ]}
+                })),
+            )
+            .await
+        }
+    };
+    let (hidden, hidden_body) = create("shared_ns").await;
+    let (missing, missing_body) = create("no_such_ns").await;
+    assert_eq!(hidden, StatusCode::NOT_FOUND, "{hidden_body}");
+    assert_eq!(missing, StatusCode::NOT_FOUND, "{missing_body}");
+    for body in [&hidden_body, &missing_body] {
+        assert!(body.contains("NoSuchNamespaceException"), "body: {body}");
+    }
 }
 
 /// A caller that *can* see a resource but lacks the specific action still gets

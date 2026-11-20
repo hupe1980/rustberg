@@ -228,7 +228,7 @@ short-lived credential scoped to the requested table. See
 | Encryption | SSE-S3 or SSE-KMS | At-rest protection; see [encryption](@/docs/encryption.md) |
 | Lifecycle | Expire old noncurrent versions | Versioning is not free |
 
-### MinIO and other S3-compatible stores
+### Self-hosted S3: RustFS, MinIO, Ceph, Garage
 
 Name the endpoint explicitly and use path-style addressing (virtual-host style
 needs DNS the store lacks):
@@ -238,40 +238,61 @@ needs DNS the store lacks):
 warehouse_location = "s3://warehouse/"
 
 [storage.properties]
-"s3.endpoint"          = "http://minio:9000"
+"s3.endpoint"          = "http://s3:9000"
 "s3.path-style-access" = "true"
 "s3.region"            = "us-east-1"
-"s3.access-key-id"     = "env:MINIO_ACCESS_KEY"
-"s3.secret-access-key" = "env:MINIO_SECRET_KEY"
+"s3.access-key-id"     = "env:S3_ACCESS_KEY"
+"s3.secret-access-key" = "env:S3_SECRET_KEY"
 ```
+
+`docker compose --profile storage up` runs exactly this against
+[RustFS](https://github.com/rustfs/rustfs), with the bucket created for you
+(`examples/s3-local.toml`). Any S3-compatible store works the same way.
 
 ```yaml
 services:
-  minio:
-    image: minio/minio
-    command: server /data --console-address ":9001"
+  s3:
+    image: rustfs/rustfs:1.0.6
+    command: /data
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      RUSTFS_ACCESS_KEY: rustberg-local
+      RUSTFS_SECRET_KEY: rustberg-local-secret
 
   rustberg:
     image: ghcr.io/hupe1980/rustberg:latest
     ports: ["8000:8000"]
     environment:
       RUSTBERG_CONFIG: /etc/rustberg/config.toml
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      S3_ACCESS_KEY: rustberg-local
+      S3_SECRET_KEY: rustberg-local-secret
     volumes:
       - ./config.toml:/etc/rustberg/config.toml:ro
       - rustberg-data:/var/lib/rustberg/data
-    depends_on: [minio]
+    depends_on: [s3]
 
 volumes:
   rustberg-data:
 ```
 
 The volume is required: without it the catalog file lives in the container's
-writable layer and disappears with the container.
+writable layer and disappears with the container. Create the bucket once (`aws
+--endpoint-url http://localhost:9000 s3 mb s3://warehouse`).
+
+**Remote signing and restricted plans against a local S3** need two more things:
+the signer's own credentials — it uses the AWS SDK's default chain
+(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`), not `[storage.properties]` — and
+the endpoint's scheme, so the pre-signed URLs a restricted caller downloads are
+reachable:
+
+```toml
+[credentials.signing]
+enabled       = true
+url_style     = "path"
+endpoint_host = "http://s3:9000"
+```
+
+The [five-minute proof](@/docs/getting-started.md) is this setup with two people
+and one restricted table.
 
 Cloudflare R2, Ceph RADOS Gateway and Wasabi work the same way with a different
 endpoint.
